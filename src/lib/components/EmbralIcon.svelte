@@ -1,0 +1,47 @@
+<script lang="ts">
+    let { size = 18 }: { size?: number } = $props();
+</script>
+
+<svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 100 100"
+    width={size}
+    height={size}
+    aria-hidden="true"
+>
+    <circle
+        cx="50"
+        cy="50"
+        r="40"
+        stroke="currentColor"
+        stroke-width="7"
+        fill="none"
+    />
+    <line
+        x1="31"
+        y1="69"
+        x2="69"
+        y2="31"
+        stroke="currentColor"
+        stroke-width="7"
+        stroke-linecap="round"
+    />
+    <line
+        x1="23"
+        y1="49"
+        x2="49"
+        y2="23"
+        stroke="currentColor"
+        stroke-width="7"
+        stroke-linecap="round"
+    />
+    <line
+        x1="51"
+        y1="77"
+        x2="77"
+        y2="51"
+        stroke="currentColor"
+        stroke-width="7"
+        stroke-linecap="round"
+    />
+</svg>

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "embral",
+  "version": "0.2.0",
+  "identifier": "app.embral",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "node scripts/prepare-sidecar.mjs && pnpm build",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "embral",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 840,
+        "minHeight": 560,
+        "center": true,
+        "visible": false,
+        "resizable": true,
+        "decorations": false,
+        "alwaysOnTop": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": ["$HOME/**/*", "$DOCUMENT/**/*", "$AUDIO/**/*"]
+        }
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5NzYzNzI3OTE4NTk2RjEKUldUeGxvV1JKemQycVJmZnJuU0twSmNqeUpxdnhHREJDSFpRWFBoNENIOGs0WCszbnpzYjF0eDUK",
+      "endpoints": [
+        "https://github.com/avirut/embral-core/releases/latest/download/latest.json"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "externalBin": ["binaries/embral-mcp"],
+    "publisher": "embral",
+    "copyright": "© 2026 embral",
+    "shortDescription": "Meeting transcription and notes, on your machine.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

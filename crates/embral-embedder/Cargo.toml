@@ -1,0 +1,19 @@
+[package]
+name = "embral-embedder"
+version = "0.1.0"
+edition = "2021"
+description = "Text embedding for embral's retrieval engine: multilingual-e5-small over ONNX Runtime."
+
+# This crate is linked ONLY by binaries without sherpa-onnx (embral-mcp).
+# ort's prebuilt onnxruntime objects are /MD and cannot share an exe with
+# sherpa's /MT static build (LNK2038, proven) — the app therefore reaches
+# embedding through the `embral-mcp embed` child process instead of
+# linking this crate.
+
+[dependencies]
+embral-search = { path = "../embral-search" }
+anyhow = { workspace = true }
+ort = "=2.0.0-rc.12"
+# Pure-Rust feature set (fancy-regex instead of oniguruma, rust esaxx):
+# tokenizers' default C++ deps would open a second C++-runtime front.
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }

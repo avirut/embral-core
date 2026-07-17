@@ -1,0 +1,15 @@
+[package]
+name = "embral-types"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# The cloud edition: adds the Cloud transcription provider and its config
+# fields. Off by default — the offline core must always build without it.
+cloud = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }

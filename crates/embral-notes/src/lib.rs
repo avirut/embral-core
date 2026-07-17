@@ -1,0 +1,60 @@
+//! Provider-agnostic meeting-note generation for Embral.
+//!
+//! This crate owns everything between "we have a transcript" and "we have
+//! structured markdown notes", independent of the Tauri app so it can be
+//! unit-tested without GTK/WebKit:
+//!
+//! - [`prompt`]     — the shared system prompt + user-message builder.
+//! - [`providers`]  — the OpenAI-protocol transport (sidecar + custom).
+//! - [`text`]       — title extraction/replacement + filename sanitization.
+//! - [`integrations`] — post-meeting Obsidian export + webhook payloads.
+//!
+//! The Tauri crate builds a [`providers::NotesConfig`] from its `AppConfig` and
+//! calls [`refine_notes`]; everything else stays here.
+
+pub mod integrations;
+pub mod prompt;
+pub mod providers;
+pub mod text;
+pub mod transcript;
+
+pub use providers::NotesConfig;
+pub use text::{apply_title, extract_title, sanitize_filename};
+
+use anyhow::Result;
+
+/// Generate structured meeting notes from a transcript (and optional live user
+/// notes) using the provider selected in `cfg`. `custom_prompt` is the user's
+/// full replacement prompt body ("" = the built-in default; the output
+/// contract is appended either way).
+#[allow(clippy::too_many_arguments)]
+pub async fn refine_notes(
+    cfg: &NotesConfig,
+    meeting_id: &str,
+    start_time: &str,
+    duration_minutes: u32,
+    meeting_title: Option<&str>,
+    transcript: &str,
+    user_notes: Option<&str>,
+    custom_prompt: &str,
+) -> Result<String> {
+    let user_message = prompt::build_user_message(
+        meeting_id,
+        start_time,
+        duration_minutes,
+        meeting_title,
+        transcript,
+        user_notes,
+    );
+    providers::generate(cfg, &prompt::system_prompt(custom_prompt), &user_message).await
+}
+
+/// Clean up (or execute the instruction inside) a raw dictation transcript.
+pub async fn clean_dictation(cfg: &NotesConfig, raw: &str) -> Result<String> {
+    providers::generate(
+        cfg,
+        prompt::DICTATION_SYSTEM_PROMPT,
+        &prompt::build_dictation_message(raw),
+    )
+    .await
+}

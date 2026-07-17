@@ -1,0 +1,12 @@
+# Keep host build products and dev clutter out of the image build
+# context (the Dockerfile lives in /deploy, context = repo root).
+node_modules
+web/node_modules
+web/build
+web/.svelte-kit
+target
+server/target
+src-tauri/target
+.git
+docs
+deploy/.env

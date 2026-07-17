@@ -1,0 +1,67 @@
+[package]
+name = "embral"
+version = "0.2.0"
+description = "Meeting transcription and notes, on your machine."
+authors = ["avirut"]
+edition = "2021"
+
+[lib]
+name = "embral_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+# The cloud edition. Everything cloud-only lives in `src/cloud/` behind
+# this flag; the offline build must stay green without it.
+cloud = ["embral-types/cloud"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-ico", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+dirs = { workspace = true }
+anyhow = { workspace = true }
+embral-types = { path = "../crates/embral-types" }
+embral-notes = { path = "../crates/embral-notes" }
+embral-db = { path = "../crates/embral-db" }
+embral-engine = { path = "../crates/embral-engine" }
+embral-search = { path = "../crates/embral-search" }
+cpal = "0.15"
+hound = "3.5"
+rubato = "0.15"
+mp3lame-encoder = "0.2"
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+async-trait = "0.1"
+futures-util = "0.3"
+url = "2"
+base64 = "0.22"
+windows = { version = "0.62", features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+arboard = { version = "3", default-features = false }
