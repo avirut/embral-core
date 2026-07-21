@@ -14,6 +14,7 @@
     import SpeechModelPicker from "./SpeechModelPicker.svelte";
     import * as Select from "$lib/components/ui/select";
     import { CLOUD_ENABLED } from "$lib/cloud";
+    import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
 
     let {
         providerLabel,
@@ -62,15 +63,21 @@
             type="single"
             value={provider}
             onValueChange={(v) => {
-                if (v === "local" || v === "cloud") onProviderChange(v);
+                if (v === "local") onProviderChange(v);
+                // Switching to cloud needs an account; refuse and prompt when
+                // signed out, leaving the provider on its current value.
+                else if (v === "cloud" && cloudAuth.requireSignedIn())
+                    onProviderChange(v);
             }}
         >
             <Select.Trigger class="w-56"
-                >{provider === "cloud" ? "embral cloud" : "This device"}</Select.Trigger
+                >{provider === "cloud" ? "embral cloud" : "local model"}</Select.Trigger
             >
             <Select.Content>
-                <Select.Item value="local" label="This device" />
+                <!-- Cloud first — the one order every engine select shares
+                     ([shell.md](../../../../docs/shell.md)). -->
                 <Select.Item value="cloud" label="embral cloud" />
+                <Select.Item value="local" label="local model" />
             </Select.Content>
         </Select.Root>
     </SettingRow>

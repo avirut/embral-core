@@ -81,7 +81,7 @@ pub fn parse_response(_provider: LlmProvider, body: &Value) -> Result<String> {
 
 /// Small local models (Qwen3 in particular) may emit `<think>…</think>`
 /// reasoning before the answer; keep only what follows.
-fn strip_reasoning(text: &str) -> String {
+pub(crate) fn strip_reasoning(text: &str) -> String {
     match (text.find("<think>"), text.find("</think>")) {
         (Some(open), Some(close)) if open < close => {
             let mut out = String::new();
@@ -102,6 +102,29 @@ fn apply_headers(cfg: &NotesConfig, req: reqwest::RequestBuilder) -> reqwest::Re
     } else {
         req.header("Authorization", format!("Bearer {}", cfg.api_key))
     }
+}
+
+/// The request for [`prime`]: the normal body capped to a single token —
+/// the point is the engine processing (and caching) the prompt, not the
+/// reply.
+pub fn prime_body(cfg: &NotesConfig, system: &str, user: &str) -> Value {
+    let mut body = request_body(cfg, system, user);
+    body["max_tokens"] = json!(1);
+    body
+}
+
+/// Fire a one-token request so the engine caches the prompt prefix; the
+/// reply is discarded.
+pub async fn prime(cfg: &NotesConfig, system: &str, user: &str) -> Result<()> {
+    let url = endpoint(cfg)?;
+    let body = prime_body(cfg, system, user);
+    let client = reqwest::Client::new();
+    apply_headers(cfg, client.post(&url))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 /// Call the configured engine and return the generated text.
@@ -188,6 +211,19 @@ mod tests {
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][0]["content"], "SYS");
         assert_eq!(b["messages"][1]["role"], "user");
+        assert_eq!(b["messages"][1]["content"], "USR");
+    }
+
+    #[test]
+    fn prime_body_is_the_request_capped_to_one_token() {
+        let c = NotesConfig {
+            provider: LlmProvider::Builtin,
+            endpoint: "http://127.0.0.1:8641/v1".into(),
+            ..Default::default()
+        };
+        let b = prime_body(&c, "SYS", "USR");
+        assert_eq!(b["max_tokens"], 1);
+        assert_eq!(b["messages"][0]["content"], "SYS");
         assert_eq!(b["messages"][1]["content"], "USR");
     }
 

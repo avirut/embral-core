@@ -12,6 +12,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { sendNotification } from '@tauri-apps/plugin-notification';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { check, type Update } from '@tauri-apps/plugin-updater';
+import { CLOUD_ENABLED } from '$lib/cloud';
 import { configStore } from './config.svelte';
 
 class UpdaterStore {
@@ -93,10 +94,26 @@ class UpdaterStore {
     this._installing = true;
     try {
       await this.update.downloadAndInstall();
+      // The closest observable "installed" moment — there is no
+      // post-restart hook, so this fires just before the relaunch
+      // ([telemetry.md]). Cloud-edition only, best-effort like all
+      // telemetry.
+      if (CLOUD_ENABLED) {
+        await invoke('telemetry_track', {
+          name: 'update_installed',
+          props: {},
+        }).catch(() => {});
+      }
       await relaunch();
     } catch (e) {
       this._error = e instanceof Error ? e.message : String(e);
       this._installing = false;
+      if (CLOUD_ENABLED) {
+        void invoke('telemetry_track', {
+          name: 'error',
+          props: { category: 'update_failed' },
+        }).catch(() => {});
+      }
     }
   }
 }

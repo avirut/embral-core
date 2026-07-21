@@ -10,6 +10,11 @@
 /// Live in-flight utterance. `text` is the stable committed portion, while
 /// `tentative_text` (when present) is an unstable trailing hypothesis that
 /// may change on the next update — render it with reduced emphasis.
+///
+/// The tail's LEADING space is meaningful: present means it opens a new
+/// word; absent means it continues `text`'s last word (the vendor splits
+/// mid-word — "keep tal" + "king"). Concatenate verbatim; never insert a
+/// separator.
 export interface InterimSegment {
   speaker: string | null;
   text: string;
@@ -45,7 +50,8 @@ export interface MeetingDetail {
   attendees: string[];
   // Structured transcript; empty for legacy meetings (raw editor fallback).
   segments: TranscriptionSegment[];
-  speaker_suggestions: SpeakerSuggestion[];
+  /** Pending "Speaker N looks like X" suggestions from the user's notes. */
+  name_suggestions: NameSuggestion[];
   /** User-starred moments. */
   stars: MeetingStar[];
   /** The user's raw live notes, verbatim (the Notes tab). */
@@ -59,19 +65,10 @@ export interface MeetingStar {
   note_block: number | null;
 }
 
-// A pending "Speaker N sounds like X" match awaiting confirmation.
-export interface SpeakerSuggestion {
+// A pending notes-derived name suggestion awaiting approval.
+export interface NameSuggestion {
   label: string;
-  speaker_id: string;
   name: string;
-  score: number;
-}
-
-// One enrolled voice-reference slot on the Speakers page.
-export interface VoiceSlot {
-  slot: number;
-  ref_id: number | null;
-  clip_path: string | null;
 }
 
 // A registry person (mirrors src-tauri SpeakerProfile).
@@ -79,9 +76,6 @@ export interface SpeakerProfile {
   id: string;
   name: string;
   notes: string;
-  is_you: boolean;
-  voice_slots: VoiceSlot[];
-  learned_refs: number;
   created_at: string;
   /** The newest meeting they were in; null if never seen in one. The profiles
    * list sorts and groups on this, falling back to created_at. */
@@ -162,8 +156,8 @@ export interface LibrarySearchResults {
 
 export type Theme = 'system' | 'light' | 'dark';
 export type AutoStartPolicy = 'always' | 'selective' | 'prompt' | 'manual';
-export type SpeakerMatchMode = 'off' | 'suggest' | 'automatic';
 export type DiarizationSensitivity = 'low' | 'medium' | 'high';
+export type NotesNamingMode = 'off' | 'suggest' | 'automatic';
 export type LlmProvider = 'builtin' | 'custom';
 // The three documents a meeting carries. A meeting with no summary opens on
 // notes whatever this says (its Summary tab doesn't exist).
@@ -184,6 +178,8 @@ export interface LlmProfile {
 }
 
 export const BUILTIN_PROFILE_ID = 'builtin';
+/** The cloud summaries engine's id (cloud builds only). */
+export const CLOUD_PROFILE_ID = 'cloud';
 
 // One saved dictation (mirrors embral-db::DictationRow).
 export interface DictationRow {
@@ -194,7 +190,6 @@ export interface DictationRow {
   created_at: string;
 }
 export type ExportMetadataFormat = 'frontmatter' | 'inline';
-export type WebhookMethod = 'post' | 'put';
 
 // Device names reported by list_audio_devices.
 export interface AudioDevices {
@@ -218,12 +213,15 @@ export interface AppConfig {
   // Post-meeting integrations
   obsidian_export_enabled: boolean;
   obsidian_vault_dir: string;
-  webhook_url: string;
-  webhook_method: WebhookMethod;
   export_filename_template: string;
   export_metadata_format: ExportMetadataFormat;
+  export_include_summary: boolean;
+  export_include_notes: boolean;
+  export_include_transcript: boolean;
   // Appearance & app behavior
   theme: Theme;
+  /** Tray recording-disc color as #RRGGBB; empty = Windows accent color. */
+  tray_recording_color: string;
   mic_device: string;
   output_device: string;
   notify_summary_ready: boolean;
@@ -232,6 +230,12 @@ export interface AppConfig {
   audio_retention_days: number;
   meeting_retention_days: number;
   onboarding_completed: boolean;
+  // Telemetry (telemetry.md) — cloud edition only, absent from the offline
+  // build's config: opt-in flag, per-install id (minted on enable, cleared
+  // on opt-out), and the daily config_snapshot date gate.
+  telemetry_enabled?: boolean;
+  telemetry_install_id?: string;
+  telemetry_last_snapshot?: string;
   // Meeting detection & automation
   auto_start_policy: AutoStartPolicy;
   auto_detect_apps: string[];
@@ -243,7 +247,7 @@ export interface AppConfig {
   // Speakers
   diarization_enabled: boolean;
   diarization_sensitivity: DiarizationSensitivity;
-  speaker_match_mode: SpeakerMatchMode;
+  notes_naming_mode: NotesNamingMode;
   // Synthesis
   summaries_enabled: boolean;
   // The engine: "builtin", or "cloud" in cloud builds. Only consulted while

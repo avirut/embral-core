@@ -179,6 +179,21 @@ const MIGRATIONS: &[&str] = &[
     DROP TRIGGER meetings_au;
     DROP TABLE meetings_fts;
     "#,
+    // v9 — voice matching is gone: no more voice-reference embeddings,
+    // "sounds like" suggestions, or the is_you flag (whose only consumer was
+    // the mic-dominance "you" prior). Diarization, the registry of named
+    // people, and segment speaker links all stay.
+    r#"
+    DROP TABLE voice_refs;
+    ALTER TABLE meetings DROP COLUMN speaker_suggestions;
+    ALTER TABLE speakers DROP COLUMN is_you;
+    "#,
+    // v10 — pending notes-based name suggestions ("Speaker 1 looks like
+    // John", derived from the user's typed notes) as a per-meeting JSON
+    // array, kept until confirmed or dismissed.
+    r#"
+    ALTER TABLE meetings ADD COLUMN name_suggestions TEXT NOT NULL DEFAULT '[]';
+    "#,
 ];
 
 #[cfg(test)]
@@ -212,17 +227,11 @@ mod tests {
             .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, MIGRATIONS.len().to_string());
-        // Old data intact; new column defaults to NULL / '[]'.
-        let (speaker_id, suggestions): (Option<String>, String) = conn
-            .query_row(
-                "SELECT s.speaker_id, m.speaker_suggestions
-                 FROM segments s JOIN meetings m ON m.id = s.meeting_id",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+        // Old data intact; the v2 registry link defaults to NULL.
+        let speaker_id: Option<String> = conn
+            .query_row("SELECT speaker_id FROM segments", [], |r| r.get(0))
             .unwrap();
         assert_eq!(speaker_id, None);
-        assert_eq!(suggestions, "[]");
         // New tables usable.
         conn.execute(
             "INSERT INTO speakers (id, name, created_at, updated_at)
@@ -263,21 +272,104 @@ mod tests {
         assert_eq!(version, MIGRATIONS.len().to_string());
 
         // The person survived, with everything that was not an email.
-        let (name, notes, is_you): (String, String, i64) = conn
+        let (name, notes): (String, String) = conn
             .query_row(
-                "SELECT name, notes, is_you FROM speakers WHERE id = 'sp_a'",
+                "SELECT name, notes FROM speakers WHERE id = 'sp_a'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(name, "Alice");
         assert_eq!(notes, "note");
-        assert_eq!(is_you, 1);
 
         // And the column is really gone.
         assert!(conn
             .query_row("SELECT emails FROM speakers", [], |r| r.get::<_, String>(0))
             .is_err());
+    }
+
+    /// v9 drops voice matching. A registry with voice references, pending
+    /// suggestions, and a "you" flag keeps its people and segment links; only
+    /// the matching machinery disappears.
+    #[test]
+    fn v9_drops_voice_matching_and_keeps_the_registry() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        // Stand the database up at v8, the version before the drop.
+        for migration in &MIGRATIONS[..8] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '8')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO speakers (id, name, notes, is_you, created_at, updated_at)
+             VALUES ('sp_a', 'Alice', 'note', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO voice_refs (speaker_id, kind, slot, embedding, dim, created_at)
+             VALUES ('sp_a', 'enrolled', 0, x'00000000', 1, '2026-01-01T00:00:00Z');
+             INSERT INTO meetings (id, title, started_at, duration_seconds, speaker_suggestions, created_at, updated_at)
+             VALUES ('m1', 'Old', '2026-01-01T00:00:00Z', 60,
+                     '[{\"label\":\"Speaker 1\",\"speaker_id\":\"sp_a\"}]',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO segments (meeting_id, idx, speaker, speaker_id, text, start_secs, end_secs)
+             VALUES ('m1', 0, 'Alice', 'sp_a', 'hi', 0.0, 1.0);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The person and the segment's registry link survived.
+        let name: String = conn
+            .query_row("SELECT name FROM speakers WHERE id = 'sp_a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "Alice");
+        let speaker_id: Option<String> = conn
+            .query_row("SELECT speaker_id FROM segments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(speaker_id, Some("sp_a".into()));
+
+        // The matching machinery is really gone.
+        assert!(conn
+            .query_row("SELECT COUNT(*) FROM voice_refs", [], |r| r.get::<_, i64>(0))
+            .is_err());
+        assert!(conn
+            .query_row("SELECT speaker_suggestions FROM meetings", [], |r| r
+                .get::<_, String>(0))
+            .is_err());
+        assert!(conn
+            .query_row("SELECT is_you FROM speakers", [], |r| r.get::<_, i64>(0))
+            .is_err());
+    }
+
+    /// v10 adds the pending name-suggestion column with an empty default.
+    #[test]
+    fn v10_adds_name_suggestions_with_empty_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for migration in &MIGRATIONS[..9] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '9')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, started_at, duration_seconds, created_at, updated_at)
+             VALUES ('m1', 'Old', '2026-01-01T00:00:00Z', 60, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let suggestions: String = conn
+            .query_row("SELECT name_suggestions FROM meetings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(suggestions, "[]");
     }
 }
 

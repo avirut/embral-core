@@ -66,7 +66,12 @@ fn forward_events(
 ) {
     for ev in events {
         match ev {
-            SessionEvent::Interim { text, start, end } => {
+            SessionEvent::Interim {
+                text,
+                tentative,
+                start,
+                end,
+            } => {
                 let _ = event_tx.send(TranscriptionEvent::Interim {
                     segment: TranscriptionSegment {
                         speaker: None,
@@ -75,7 +80,10 @@ fn forward_events(
                         start,
                         end,
                     },
-                    tentative: None,
+                    // Diff-derived (words agreeing with the previous decode
+                    // are stable); already carries the seam's leading-space
+                    // word-boundary convention.
+                    tentative,
                 });
             }
             SessionEvent::Final {

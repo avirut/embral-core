@@ -1,17 +1,15 @@
-//! Post-meeting integrations: mirror notes into an Obsidian vault (or any
-//! folder) and send a JSON summary to a webhook. Both are best-effort side
-//! effects the Tauri app fires after a meeting's index entry is written;
-//! neither may block or fail the core save (mirroring the existing non-fatal
-//! MP3/LLM handling).
+//! The post-meeting Markdown export: mirror notes into an Obsidian vault (or
+//! any folder). A best-effort side effect the Tauri app fires after a
+//! meeting's index entry is written; it may not block or fail the core save
+//! (mirroring the existing non-fatal MP3/LLM handling).
 //!
 //! Wire concerns are kept pure where possible: [`render_filename`],
-//! [`to_inline_metadata`], and [`webhook_payload`] are unit-tested; the
-//! IO/network wrappers ([`export_to_obsidian`], [`post_webhook`]) are thin.
+//! [`compose_export`], and [`to_inline_metadata`] are unit-tested; the IO
+//! wrapper ([`export_to_obsidian`]) is thin.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use embral_types::{ExportMetadataFormat, MeetingRecord, WebhookMethod};
-use serde_json::{json, Value};
+use embral_types::{ExportMetadataFormat, MeetingRecord};
 use std::path::{Path, PathBuf};
 
 use crate::text::sanitize_filename;
@@ -77,19 +75,19 @@ fn strip_leading_h1(markdown: &str) -> &str {
     .trim_start_matches('\n')
 }
 
-/// The document that leaves the app: everything the meeting produced, not just
-/// the summary. A meeting with summaries off would otherwise export an empty
-/// file, and even a summarized meeting is worth more in a vault with the user's
-/// own notes and the transcript beside it.
-///
-/// `summary_body` and `user_notes` may be empty; their sections then disappear
-/// rather than exporting a heading with nothing under it.
+/// The document that leaves the app: what the meeting produced, filtered by
+/// the user's include switches ([configuration.md]). Each content argument is
+/// `None` when its switch is off — no section at all — and `Some` when
+/// included; an included-but-empty summary or notes section still disappears
+/// rather than exporting a heading with nothing under it, while an included
+/// empty transcript says so. All three off yields a metadata stub
+/// (frontmatter + title), deliberately.
 pub fn compose_export(
     frontmatter: &str,
     title: &str,
-    summary_body: &str,
-    user_notes: &str,
-    transcript_text: &str,
+    summary_body: Option<&str>,
+    user_notes: Option<&str>,
+    transcript_text: Option<&str>,
 ) -> String {
     let mut out = String::new();
     let frontmatter = frontmatter.trim_end();
@@ -105,23 +103,29 @@ pub fn compose_export(
     };
     out.push_str(&format!("# {title}\n"));
 
-    let summary = strip_leading_h1(summary_body).trim();
-    if !summary.is_empty() {
-        out.push_str(&format!("\n{summary}\n"));
+    if let Some(body) = summary_body {
+        let summary = strip_leading_h1(body).trim();
+        if !summary.is_empty() {
+            out.push_str(&format!("\n{summary}\n"));
+        }
     }
 
-    let notes = user_notes.trim();
-    if !notes.is_empty() {
-        out.push_str(&format!("\n## My notes\n\n{notes}\n"));
+    if let Some(notes) = user_notes {
+        let notes = notes.trim();
+        if !notes.is_empty() {
+            out.push_str(&format!("\n## My notes\n\n{notes}\n"));
+        }
     }
 
-    let transcript = transcript_text.trim();
-    let transcript = if transcript.is_empty() {
-        "_No transcript segments were captured._"
-    } else {
-        transcript
-    };
-    out.push_str(&format!("\n## Transcript\n\n{transcript}\n"));
+    if let Some(transcript) = transcript_text {
+        let transcript = transcript.trim();
+        let transcript = if transcript.is_empty() {
+            "_No transcript segments were captured._"
+        } else {
+            transcript
+        };
+        out.push_str(&format!("\n## Transcript\n\n{transcript}\n"));
+    }
 
     out
 }
@@ -222,50 +226,6 @@ pub fn export_to_obsidian(
     Ok(path)
 }
 
-/// The JSON body sent to the configured webhook when a meeting finishes.
-/// Stable, self-describing shape so downstream automations (Zapier, n8n, a
-/// homelab script) can consume it without scraping files. `notes_markdown` is
-/// the summary and is empty when summaries are off; the user's own notes ride
-/// beside it, so a consumer always gets everything the meeting produced.
-pub fn webhook_payload(
-    record: &MeetingRecord,
-    notes_md: &str,
-    user_notes_md: &str,
-    transcript_md: &str,
-) -> Value {
-    json!({
-        "event": "meeting.finished",
-        "meeting": {
-            "id": record.id,
-            "title": record.title,
-            "date": record.date,
-            "duration_seconds": record.duration_seconds,
-        },
-        "notes_markdown": notes_md,
-        "user_notes_markdown": user_notes_md,
-        "transcript_markdown": transcript_md,
-    })
-}
-
-/// Send the webhook payload. Best-effort: the caller logs and swallows errors.
-pub async fn post_webhook(
-    url: &str,
-    method: WebhookMethod,
-    record: &MeetingRecord,
-    notes_md: &str,
-    user_notes_md: &str,
-    transcript_md: &str,
-) -> Result<()> {
-    let payload = webhook_payload(record, notes_md, user_notes_md, transcript_md);
-    let client = reqwest::Client::new();
-    let request = match method {
-        WebhookMethod::Post => client.post(url),
-        WebhookMethod::Put => client.put(url),
-    };
-    request.json(&payload).send().await?.error_for_status()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,18 +313,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn payload_has_stable_shape() {
-        let p = webhook_payload(&record(), "# N", "my notes", "T");
-        assert_eq!(p["event"], "meeting.finished");
-        assert_eq!(p["meeting"]["id"], "260326T143000_a3f9b2");
-        assert_eq!(p["meeting"]["title"], "Q3: Pipeline Review");
-        assert_eq!(p["meeting"]["duration_seconds"], 3480);
-        assert_eq!(p["notes_markdown"], "# N");
-        assert_eq!(p["user_notes_markdown"], "my notes");
-        assert_eq!(p["transcript_markdown"], "T");
-    }
-
     const FRONTMATTER: &str = "---\nstart_time: 2026-03-26T14:30:00Z\n---\n";
 
     #[test]
@@ -372,9 +320,9 @@ mod tests {
         let out = compose_export(
             FRONTMATTER,
             "Weekly Sync",
-            "# Weekly Sync\n\n## Decisions\n\nShip it.",
-            "John: ship on Friday",
-            "Alice: are we ready?",
+            Some("# Weekly Sync\n\n## Decisions\n\nShip it."),
+            Some("John: ship on Friday"),
+            Some("Alice: are we ready?"),
         );
 
         // Frontmatter first (Obsidian reads it as note properties), one title.
@@ -391,7 +339,13 @@ mod tests {
     fn export_without_a_summary_is_still_worth_having() {
         // Summaries off: the export is the user's notes and the transcript,
         // not an empty file.
-        let out = compose_export(FRONTMATTER, "Weekly Sync", "", "my notes", "the words");
+        let out = compose_export(
+            FRONTMATTER,
+            "Weekly Sync",
+            Some(""),
+            Some("my notes"),
+            Some("the words"),
+        );
         assert!(out.contains("# Weekly Sync"));
         assert!(out.contains("## My notes\n\nmy notes"));
         assert!(out.contains("## Transcript\n\nthe words"));
@@ -400,13 +354,34 @@ mod tests {
     #[test]
     fn export_omits_empty_sections() {
         // No summary and no user notes: no headings with nothing under them.
-        let out = compose_export(FRONTMATTER, "T", "", "   ", "the words");
+        let out = compose_export(FRONTMATTER, "T", Some(""), Some("   "), Some("the words"));
         assert!(!out.contains("## My notes"));
         assert!(out.contains("## Transcript"));
 
         // An empty transcript still says so rather than trailing off.
-        let empty = compose_export(FRONTMATTER, "T", "", "", "");
+        let empty = compose_export(FRONTMATTER, "T", Some(""), Some(""), Some(""));
         assert!(empty.contains("_No transcript segments were captured._"));
+    }
+
+    #[test]
+    fn export_honors_the_include_switches() {
+        // Transcript excluded: no section, no placeholder — unlike an
+        // included-but-empty transcript.
+        let out = compose_export(FRONTMATTER, "T", Some("Summary."), Some("notes"), None);
+        assert!(!out.contains("## Transcript"));
+        assert!(!out.contains("_No transcript segments were captured._"));
+        assert!(out.contains("Summary."));
+        assert!(out.contains("## My notes"));
+
+        // Summary and notes excluded: the export is just the transcript.
+        let out = compose_export(FRONTMATTER, "T", None, None, Some("the words"));
+        assert!(out.contains("## Transcript\n\nthe words"));
+        assert!(!out.contains("## My notes"));
+
+        // All three off: a metadata stub, deliberately.
+        let stub = compose_export(FRONTMATTER, "Weekly Sync", None, None, None);
+        assert!(stub.starts_with("---\nstart_time:"));
+        assert!(stub.trim_end().ends_with("# Weekly Sync"));
     }
 
     #[test]
@@ -416,9 +391,9 @@ mod tests {
         let composed = compose_export(
             "---\nstart_time: 2026-05-03T10:30:00Z\nduration_minutes: 45\nattendees: [\"Alice\"]\n---\n",
             "Weekly Sync",
-            "Body.",
-            "",
-            "words",
+            Some("Body."),
+            Some(""),
+            Some("words"),
         );
         let inline = to_inline_metadata(&composed);
         assert!(!inline.starts_with("---"));

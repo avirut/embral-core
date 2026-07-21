@@ -1,10 +1,8 @@
 <script lang="ts">
     import { onMount } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
-    import * as Tabs from "$lib/components/ui/tabs";
-    import ClaudeTab from "./mcp/ClaudeTab.svelte";
-    import CodexTab from "./mcp/CodexTab.svelte";
-    import OtherClientsTab from "./mcp/OtherClientsTab.svelte";
+    import ClientCard from "./mcp/ClientCard.svelte";
+    import CodeSnippet from "./mcp/CodeSnippet.svelte";
     import type {
         McpAction,
         McpClientId,
@@ -61,19 +59,16 @@
 
 <div class="space-y-6">
     <p class="px-1 text-sm text-muted-foreground">
-        embral ships a local MCP server so AI assistants can list, search, and
-        read your meeting notes. It reads your library directly, so the app
-        doesn't need to be running.
+        Give your AI assistants read and search access to your
+        meeting notes
     </p>
 
     {#if info && !info.exists}
         <div
             class="rounded-lg border border-border bg-muted/40 px-4 py-3 text-xs text-muted-foreground"
         >
-            The server binary isn't built yet. Run
-            <code class="font-mono">cargo build --release -p embral-mcp</code>
-            in the project folder first; installed builds include it
-            automatically.
+            A part of embral this feature needs is missing (embral-mcp.exe).
+            Reinstalling the app should fix this.
         </div>
     {/if}
 
@@ -81,31 +76,82 @@
         <div
             class="rounded-lg border border-border bg-muted/40 px-4 py-3 text-xs text-muted-foreground"
         >
-            Assistants currently search by keywords only. Download the
+            Assistants search by keywords only until the
             <button
                 type="button"
                 class="underline underline-offset-2 transition-colors hover:text-foreground"
                 onclick={() => appState.openSettings("synthesis")}
                 >Semantic search</button
             >
-            model and they'll search by meaning too.
+            model is downloaded — then they search by meaning too.
         </div>
     {/if}
 
-    <Tabs.Root value="claude">
-        <Tabs.List>
-            <Tabs.Trigger value="claude">Claude</Tabs.Trigger>
-            <Tabs.Trigger value="codex">ChatGPT & Codex</Tabs.Trigger>
-            <Tabs.Trigger value="other">Other clients</Tabs.Trigger>
-        </Tabs.List>
-        <Tabs.Content value="claude" class="pt-4">
-            <ClaudeTab {info} {status} {act} />
-        </Tabs.Content>
-        <Tabs.Content value="codex" class="pt-4">
-            <CodexTab {info} {status} {act} />
-        </Tabs.Content>
-        <Tabs.Content value="other" class="pt-4">
-            <OtherClientsTab {info} />
-        </Tabs.Content>
-    </Tabs.Root>
+    <div class="flex flex-col gap-3">
+        <ClientCard
+            title="Claude Desktop"
+            status={status?.claude_desktop}
+            serverExists={status?.server_exists ?? false}
+            action={act("claude_desktop")}
+        >
+            {#snippet fallback()}
+                {#if info}
+                    <p class="text-xs text-muted-foreground">
+                        Add this to
+                        <code class="font-mono break-all"
+                            >{info.claude_desktop_config_path}</code
+                        >, then restart Claude Desktop:
+                    </p>
+                    <CodeSnippet text={info.config_json} block />
+                {/if}
+            {/snippet}
+        </ClientCard>
+
+        <ClientCard
+            title="Claude Code"
+            status={status?.claude_code}
+            serverExists={status?.server_exists ?? false}
+            action={act("claude_code")}
+        >
+            {#snippet fallback()}
+                {#if info}
+                    <p class="text-xs text-muted-foreground">
+                        Run this once in your terminal:
+                    </p>
+                    <CodeSnippet text={info.claude_code_command} />
+                {/if}
+            {/snippet}
+        </ClientCard>
+
+        <ClientCard
+            title="Codex"
+            status={status?.codex}
+            serverExists={status?.server_exists ?? false}
+            action={act("codex")}
+        >
+            {#snippet fallback()}
+                {#if info}
+                    <p class="text-xs text-muted-foreground">
+                        Run this once in your terminal:
+                    </p>
+                    <CodeSnippet text={info.codex_command} />
+                {/if}
+            {/snippet}
+        </ClientCard>
+
+        <ClientCard title="Other clients" subtitle="Connect any client by hand">
+            {#snippet fallback()}
+                {#if info}
+                    <p class="text-xs text-muted-foreground">
+                        Point the client at this server:
+                    </p>
+                    <CodeSnippet text={info.path} />
+                    <p class="text-xs text-muted-foreground">
+                        Or add this configuration:
+                    </p>
+                    <CodeSnippet text={info.config_json} block />
+                {/if}
+            {/snippet}
+        </ClientCard>
+    </div>
 </div>

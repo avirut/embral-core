@@ -187,31 +187,21 @@ pub fn available_profiles() -> Vec<LlmProfile> {
 }
 
 /// How dictations are cleaned up after transcription.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DictationCleanup {
-    /// The cleanup relay (a server-pinned model chain). Degrades to the
-    /// on-device model while signed out — "cloud when signed in" is the
-    /// default behavior, resolved at use, not a stored mode of its own.
+    /// The cleanup relay (a server-pinned model chain). A signed-in
+    /// choice: signing in adopts it, signing out reverts to on-device
+    /// ([cloud-seam.md]); the resolve-at-use degrade to the on-device
+    /// model survives only as a safety net for stale configs.
     #[cfg(feature = "cloud")]
     Cloud,
-    /// The built-in on-device model.
+    /// The built-in on-device model. The default in every build — cloud
+    /// engines are adopted at sign-in, never presumed.
+    #[default]
     OnDevice,
     /// Raw transcription, verbatim.
     Off,
-}
-
-impl Default for DictationCleanup {
-    fn default() -> Self {
-        #[cfg(feature = "cloud")]
-        {
-            DictationCleanup::Cloud
-        }
-        #[cfg(not(feature = "cloud"))]
-        {
-            DictationCleanup::OnDevice
-        }
-    }
 }
 
 /// Which tab a meeting opens on. Named for the three documents a meeting
@@ -262,25 +252,17 @@ pub enum ExportMetadataFormat {
     Inline,
 }
 
-/// HTTP method used for the finished-meeting webhook.
+/// Whether the post-meeting pass names diarized speakers from the notes
+/// the user typed during the meeting ([speakers.md]).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum WebhookMethod {
-    #[default]
-    Post,
-    Put,
-}
-
-/// How diarized speakers are matched against the saved-speaker registry.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SpeakerMatchMode {
-    /// Never compare against the registry; meetings keep "Speaker 1/2/…".
+pub enum NotesNamingMode {
+    /// Never look at the notes; labels stay "Speaker 1/2/…".
     Off,
-    /// Compare and surface "sounds like …" suggestions for confirmation.
+    /// Surface "looks like …" suggestions for approval.
     #[default]
     Suggest,
-    /// Assign matching names without asking.
+    /// Apply names without asking.
     Automatic,
 }
 
@@ -318,14 +300,13 @@ pub struct ProviderCapabilities {
     pub max_session_minutes: u32,
 }
 
-/// The cloud backend every release build talks to. `cloud_api_url` in
-/// config.json overrides it (the development escape hatch).
+/// The cloud backend release builds talk to.
 #[cfg(feature = "cloud")]
 pub const DEFAULT_CLOUD_URL: &str = "https://cloud.embral.app";
+/// Where dev builds look instead: the local server's default bind
+/// (`server` listens on 0.0.0.0:8080).
 #[cfg(feature = "cloud")]
-fn default_cloud_url() -> String {
-    DEFAULT_CLOUD_URL.to_string()
-}
+pub const DEV_CLOUD_URL: &str = "http://localhost:8080";
 
 /// Application configuration stored at ~/embral/config.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,10 +321,12 @@ pub struct AppConfig {
     #[cfg(feature = "cloud")]
     #[serde(default)]
     pub cloud_out_of_hours: CloudOutOfHours,
-    /// Cloud-edition only: the backend's base URL (https; the relay
-    /// WebSocket derives from it).
+    /// Cloud-edition only: a backend base-URL override; empty = this
+    /// build's default (release: [`DEFAULT_CLOUD_URL`], dev:
+    /// [`DEV_CLOUD_URL`]). Read through [`AppConfig::cloud_url`], never
+    /// directly. The relay WebSocket derives from it.
     #[cfg(feature = "cloud")]
-    #[serde(default = "default_cloud_url")]
+    #[serde(default)]
     pub cloud_api_url: String,
     /// The signed-in device's session token; empty = signed out.
     #[cfg(feature = "cloud")]
@@ -372,12 +355,6 @@ pub struct AppConfig {
     /// Absolute path to an Obsidian vault (or any folder) to mirror notes into.
     #[serde(default)]
     pub obsidian_vault_dir: String,
-    /// When non-empty, a JSON summary is sent here after each meeting finishes.
-    #[serde(default)]
-    pub webhook_url: String,
-    /// HTTP method for the webhook.
-    #[serde(default)]
-    pub webhook_method: WebhookMethod,
     /// Filename template for exported copies (auto-export/Obsidian), with
     /// tokens {date} {time} {year} {month} {day} {hour} {minute} {title}.
     /// Internal library filenames are unaffected.
@@ -386,11 +363,24 @@ pub struct AppConfig {
     /// Metadata style for exported copies.
     #[serde(default)]
     pub export_metadata_format: ExportMetadataFormat,
+    /// Whether the exported markdown carries the AI summary.
+    #[serde(default = "default_true")]
+    pub export_include_summary: bool,
+    /// Whether it carries the user's own typed notes.
+    #[serde(default = "default_true")]
+    pub export_include_notes: bool,
+    /// Whether it carries the full transcript.
+    #[serde(default = "default_true")]
+    pub export_include_transcript: bool,
 
     // --- Appearance & app behavior ---
     /// UI color scheme.
     #[serde(default)]
     pub theme: Theme,
+    /// Color of the tray's recording disc as `#RRGGBB`; empty = follow the
+    /// Windows accent color.
+    #[serde(default)]
+    pub tray_recording_color: String,
     /// Microphone device name; empty = system default.
     #[serde(default)]
     pub mic_device: String,
@@ -414,6 +404,23 @@ pub struct AppConfig {
     /// Whether the first-run setup wizard has been completed.
     #[serde(default)]
     pub onboarding_completed: bool,
+
+    // --- Telemetry (cloud edition only, [telemetry.md]) ---
+    /// Opt-in usage telemetry. Off by default; the onboarding checkbox and
+    /// the General-settings toggle are the only writers.
+    #[cfg(feature = "cloud")]
+    #[serde(default)]
+    pub telemetry_enabled: bool,
+    /// Persistent per-install id (random UUID): minted when telemetry is
+    /// first enabled, cleared on opt-out — re-enabling mints a fresh one.
+    /// Empty while disabled.
+    #[cfg(feature = "cloud")]
+    #[serde(default)]
+    pub telemetry_install_id: String,
+    /// Date (YYYY-MM-DD) the daily `config_snapshot` event last fired.
+    #[cfg(feature = "cloud")]
+    #[serde(default)]
+    pub telemetry_last_snapshot: String,
 
     // --- Meeting detection & automation ---
     /// What to do when a meeting app starts using the microphone.
@@ -452,9 +459,9 @@ pub struct AppConfig {
     /// How eagerly diarization splits voices apart.
     #[serde(default)]
     pub diarization_sensitivity: DiarizationSensitivity,
-    /// Whether diarized speakers are matched against the saved registry.
+    /// Whether speakers get named from the user's typed notes.
     #[serde(default)]
-    pub speaker_match_mode: SpeakerMatchMode,
+    pub notes_naming_mode: NotesNamingMode,
 
     // --- Synthesis ---
     /// Whether meetings are summarized at all. Off: no summary is written and
@@ -590,6 +597,24 @@ impl AppConfig {
         }
     }
 
+    /// The cloud backend this build talks to: the `cloud_api_url` override
+    /// when set, else the production URL — or, in dev builds, the local
+    /// server (`DEV_CLOUD_URL`), so `tauri dev` tests against
+    /// `pnpm dev` on 8080 without touching config.
+    #[cfg(feature = "cloud")]
+    pub fn cloud_url(&self) -> String {
+        let configured = self.cloud_api_url.trim();
+        if configured.is_empty() {
+            if cfg!(debug_assertions) {
+                DEV_CLOUD_URL.to_string()
+            } else {
+                DEFAULT_CLOUD_URL.to_string()
+            }
+        } else {
+            configured.to_string()
+        }
+    }
+
     /// The Soniox language hint for cloud sessions: a hint for English, and
     /// none at all for multilingual (the vendor then auto-detects).
     pub fn language_hints(&self) -> Option<Vec<String>> {
@@ -617,7 +642,7 @@ impl Default for AppConfig {
             #[cfg(feature = "cloud")]
             cloud_out_of_hours: CloudOutOfHours::default(),
             #[cfg(feature = "cloud")]
-            cloud_api_url: default_cloud_url(),
+            cloud_api_url: String::new(),
             #[cfg(feature = "cloud")]
             cloud_session_token: String::new(),
             #[cfg(feature = "cloud")]
@@ -628,11 +653,13 @@ impl Default for AppConfig {
             vocabulary: Vec::new(),
             obsidian_export_enabled: false,
             obsidian_vault_dir: String::new(),
-            webhook_url: String::new(),
-            webhook_method: WebhookMethod::default(),
             export_filename_template: default_export_filename_template(),
             export_metadata_format: ExportMetadataFormat::default(),
+            export_include_summary: true,
+            export_include_notes: true,
+            export_include_transcript: true,
             theme: Theme::default(),
+            tray_recording_color: String::new(),
             mic_device: String::new(),
             output_device: String::new(),
             notify_summary_ready: true,
@@ -640,6 +667,12 @@ impl Default for AppConfig {
             notify_update_available: true,
             audio_retention_days: 0,
             onboarding_completed: false,
+            #[cfg(feature = "cloud")]
+            telemetry_enabled: false,
+            #[cfg(feature = "cloud")]
+            telemetry_install_id: String::new(),
+            #[cfg(feature = "cloud")]
+            telemetry_last_snapshot: String::new(),
             auto_start_policy: AutoStartPolicy::default(),
             auto_detect_apps: default_auto_detect_apps(),
             detection_delay_secs: default_detection_delay_secs(),
@@ -650,7 +683,7 @@ impl Default for AppConfig {
             meeting_retention_days: 0,
             diarization_enabled: true,
             diarization_sensitivity: DiarizationSensitivity::default(),
-            speaker_match_mode: SpeakerMatchMode::default(),
+            notes_naming_mode: NotesNamingMode::default(),
             summaries_enabled: true,
             summaries_profile_id: default_summaries_profile_id(),
             summary_prompt: String::new(),
@@ -733,6 +766,28 @@ mod language_tests {
         assert_eq!(config.summaries_profile_id, "builtin");
         // The renamed notification toggle defaults on rather than vanishing.
         assert!(config.notify_summary_ready);
+        // The export-include switches default on: an export that used to
+        // carry everything keeps carrying everything.
+        assert!(config.export_include_summary);
+        assert!(config.export_include_notes);
+        assert!(config.export_include_transcript);
+    }
+
+    #[test]
+    #[cfg(feature = "cloud")]
+    fn cloud_url_prefers_the_override_and_resolves_per_build() {
+        let mut config = AppConfig::default();
+        // The stored field is a pure override — empty by default.
+        assert!(config.cloud_api_url.is_empty());
+        let expected = if cfg!(debug_assertions) {
+            DEV_CLOUD_URL
+        } else {
+            DEFAULT_CLOUD_URL
+        };
+        assert_eq!(config.cloud_url(), expected);
+
+        config.cloud_api_url = "http://192.168.1.5:9999".into();
+        assert_eq!(config.cloud_url(), "http://192.168.1.5:9999");
     }
 
     #[test]

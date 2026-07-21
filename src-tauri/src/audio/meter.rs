@@ -1,66 +1,11 @@
-//! Pre-mix channel loudness metering.
+//! Live spectrum metering over the recorder's pre-mix audio blocks.
 //!
-//! The recorder mixes mic + system loopback into one stream before the ASR
-//! ever sees it, so channel identity is gone downstream. This meter runs at
-//! the one point where both blocks still exist separately (the mic callback,
-//! just before summing) and folds them into ~half-second
-//! [`ChannelWindow`]s. The speaker pipeline later asks "was this diarized
-//! cluster's time mic-dominant?" to attribute clusters to the user.
-//!
+//! Runs in the mic callback, where the mic and system-loopback blocks still
+//! exist separately, and feeds the recording view's per-band level meter.
 //! Timing is derived from consumed sample counts, exactly like the WAV and
-//! transcript timelines, so windows and segments share a clock.
-
-use embral_engine::speakers::ChannelWindow;
+//! transcript timelines.
 
 const SAMPLE_RATE: u64 = 16_000;
-/// Nominal window length. Real windows close on the first block boundary at
-/// or past this, so they can run a block long — times stay sample-exact.
-const WINDOW_SAMPLES: u64 = SAMPLE_RATE / 2;
-
-#[derive(Default)]
-pub struct ChannelMeter {
-    windows: Vec<ChannelWindow>,
-    window_start: u64,
-    mic_sq: f64,
-    loop_sq: f64,
-    n: u64,
-}
-
-impl ChannelMeter {
-    /// Consume one mic block and the loopback samples mixed against it.
-    /// `lb` may be shorter than `mic` (loopback buffer ran dry) — the missing
-    /// tail is silence, which contributes nothing to the sum of squares.
-    pub fn push_block(&mut self, mic: &[f32], lb: &[f32]) {
-        self.mic_sq += mic.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
-        self.loop_sq += lb.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
-        self.n += mic.len() as u64;
-        if self.n >= WINDOW_SAMPLES {
-            self.close_window();
-        }
-    }
-
-    /// Close any partial window and hand back the full timeline.
-    pub fn finish(mut self) -> Vec<ChannelWindow> {
-        if self.n > 0 {
-            self.close_window();
-        }
-        self.windows
-    }
-
-    fn close_window(&mut self) {
-        let end = self.window_start + self.n;
-        self.windows.push(ChannelWindow {
-            start: self.window_start as f64 / SAMPLE_RATE as f64,
-            end: end as f64 / SAMPLE_RATE as f64,
-            mic_rms: (self.mic_sq / self.n as f64).sqrt() as f32,
-            loop_rms: (self.loop_sq / self.n as f64).sqrt() as f32,
-        });
-        self.window_start = end;
-        self.mic_sq = 0.0;
-        self.loop_sq = 0.0;
-        self.n = 0;
-    }
-}
 
 /// Frequency bands for the live spectrum meter, log-spaced across the
 /// vocal fundamental range. The frontend renders one stationary bar per
@@ -190,54 +135,5 @@ mod tests {
         assert_eq!(*count.lock().unwrap(), 0, "under one slice → nothing");
         tap.push_block(&vec![0.3f32; 1000], &[]);
         assert_eq!(*count.lock().unwrap(), 1);
-    }
-
-    #[test]
-    fn windows_are_contiguous_and_sample_timed() {
-        let mut m = ChannelMeter::default();
-        // 1024-sample blocks (the resampler's real chunk size) for 2 seconds.
-        let block = vec![0.5f32; 1024];
-        for _ in 0..(32_000 / 1024 + 1) {
-            m.push_block(&block, &block);
-        }
-        let windows = m.finish();
-        assert!(windows.len() >= 4);
-        assert_eq!(windows[0].start, 0.0);
-        for pair in windows.windows(2) {
-            assert_eq!(pair[0].end, pair[1].start, "no gaps or overlap");
-        }
-        // Constant 0.5 amplitude → RMS 0.5 on both channels.
-        assert!((windows[0].mic_rms - 0.5).abs() < 1e-6);
-        assert!((windows[0].loop_rms - 0.5).abs() < 1e-6);
-        // Nominal length respected within one block.
-        let len = windows[0].end - windows[0].start;
-        assert!((0.5..0.6).contains(&len), "window length {len}");
-    }
-
-    #[test]
-    fn short_loopback_block_reads_as_silence() {
-        let mut m = ChannelMeter::default();
-        let mic = vec![0.4f32; 8000];
-        m.push_block(&mic, &mic[..2000]); // loopback ran dry after a quarter
-        let windows = m.finish();
-        assert_eq!(windows.len(), 1);
-        assert!((windows[0].mic_rms - 0.4).abs() < 1e-6);
-        // Quarter of the energy → half the RMS.
-        assert!((windows[0].loop_rms - 0.2).abs() < 1e-6);
-    }
-
-    #[test]
-    fn trailing_partial_window_is_flushed() {
-        let mut m = ChannelMeter::default();
-        m.push_block(&vec![0.1f32; 3000], &[]);
-        let windows = m.finish();
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].end, 3000.0 / 16_000.0);
-        assert_eq!(windows[0].loop_rms, 0.0);
-    }
-
-    #[test]
-    fn empty_meter_yields_no_windows() {
-        assert!(ChannelMeter::default().finish().is_empty());
     }
 }

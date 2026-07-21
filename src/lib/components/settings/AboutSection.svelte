@@ -145,8 +145,7 @@
         <div class="min-w-0">
             <p class="text-base font-semibold tracking-tight">embral</p>
             <p class="mt-0.5 text-xs text-muted-foreground">
-                Meetings, transcripts, and dictation that stay on your
-                computer.
+                Privacy forward meeting transcripts and dictation
             </p>
             <p class="mt-1 font-mono text-[11px] text-muted-foreground/80">
                 version {version}
@@ -228,11 +227,7 @@
 
     <SettingsGroup label="On the shoulders of">
         <div class="px-4 py-3">
-            <p class="text-xs text-muted-foreground">
-                Everything embral does on your machine runs on openly shared
-                models and runtimes:
-            </p>
-            <div class="mt-2.5 space-y-1.5">
+            <div class="space-y-1.5">
                 {#each credits as c (c.name)}
                     <div class="flex items-baseline justify-between gap-3 text-xs">
                         <button

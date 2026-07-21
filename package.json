@@ -1,6 +1,6 @@
 {
   "name": "embral",
-  "version": "0.2.0",
+  "version": "0.4.1",
   "description": "Meeting transcription and notes, on your machine.",
   "type": "module",
   "scripts": {
@@ -13,7 +13,8 @@
     "tauri": "tauri",
     "dev:cloud": "cross-env VITE_EMBRAL_CLOUD=1 tauri dev --features cloud",
     "build:cloud": "cross-env VITE_EMBRAL_CLOUD=1 tauri build --features cloud",
-    "build:mcpb": "node scripts/build-mcpb.mjs"
+    "build:mcpb": "node scripts/build-mcpb.mjs",
+    "render:icons": "node scripts/render-icons.mjs"
   },
   "license": "MIT",
   "dependencies": {
@@ -37,6 +38,7 @@
     "@anthropic-ai/mcpb": "^2.1.2",
     "@internationalized/date": "^3.12.2",
     "@lucide/svelte": "^1.23.0",
+    "@resvg/resvg-js": "^2.6.2",
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.9.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",

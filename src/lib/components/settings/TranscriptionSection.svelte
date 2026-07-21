@@ -79,7 +79,7 @@
         <SettingsGroup label="Vocabulary boost">
             <SettingRow
                 title="Custom vocabulary"
-                description="Names and terms the transcriber should listen for more carefully."
+                description="Names and jargon to listen for more carefully"
                 vertical
             >
                 <Input

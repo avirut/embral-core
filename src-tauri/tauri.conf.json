@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "embral",
-  "version": "0.2.0",
+  "version": "0.4.1",
   "identifier": "app.embral",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -52,7 +52,8 @@
     "shortDescription": "Meeting transcription and notes, on your machine.",
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "installer-hooks.nsh"
       }
     },
     "icon": [

@@ -41,7 +41,7 @@
         ["{day}", "DD"],
         ["{hour}", "HH"],
         ["{minute}", "MM"],
-        ["{title}", "meeting title (slugified)"],
+        ["{title}", "meeting title"],
     ] as const;
 </script>
 
@@ -49,7 +49,7 @@
     <SettingsGroup label="Auto-export">
         <SettingRow
             title="Export notes when a recording ends"
-            description="Saves a markdown copy into a folder of your choice, like an Obsidian vault."
+            description="Saves a markdown copy into a folder of your choice, like an Obsidian vault"
         >
             <Switch bind:checked={draft.obsidian_export_enabled} />
         </SettingRow>
@@ -69,10 +69,21 @@
         {/if}
     </SettingsGroup>
 
+    <SettingsGroup label="Include">
+        <SettingRow title="AI summary">
+            <Switch bind:checked={draft.export_include_summary} />
+        </SettingRow>
+        <SettingRow title="Your notes">
+            <Switch bind:checked={draft.export_include_notes} />
+        </SettingRow>
+        <SettingRow title="Transcript">
+            <Switch bind:checked={draft.export_include_transcript} />
+        </SettingRow>
+    </SettingsGroup>
+
     <SettingsGroup label="Filename">
         <SettingRow
             title="Filename template"
-            description="Applies to exported copies only."
             vertical
         >
             <Input
@@ -97,7 +108,6 @@
 
         <SettingRow
             title="Metadata format"
-            description="Frontmatter suits Obsidian; Inline writes a readable block under the heading."
         >
             <Select.Root
                 type="single"

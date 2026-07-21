@@ -29,3 +29,7 @@ docs/.obsidian/
 /target-test
 /src-tauri/binaries
 /secrets
+# Built installers staged for a release
+/release/
+# Local opencore mirror checkout (the .git of the open-core export)
+/opencore/out/

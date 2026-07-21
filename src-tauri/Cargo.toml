@@ -1,6 +1,6 @@
 [package]
 name = "embral"
-version = "0.2.0"
+version = "0.4.1"
 description = "Meeting transcription and notes, on your machine."
 authors = ["avirut"]
 edition = "2021"
@@ -28,6 +28,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -61,7 +62,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Registry",
+    "Win32_System_JobObjects",
+    "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 arboard = { version = "3", default-features = false }
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }

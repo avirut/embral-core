@@ -235,14 +235,9 @@ fn relay_provider(
     config: &AppConfig,
     language_hints: Option<Vec<String>>,
 ) -> Arc<dyn TranscriptionProvider> {
-    let url = if config.cloud_api_url.is_empty() {
-        embral_types::DEFAULT_CLOUD_URL.to_string()
-    } else {
-        config.cloud_api_url.clone()
-    };
     Arc::new(crate::cloud::transcription::RelayProvider::new(
         config.cloud_session_token.clone(),
-        url,
+        config.cloud_url(),
         language_hints,
     ))
 }

@@ -31,7 +31,7 @@ pub enum FileRole {
     Vad,
     /// Pyannote speaker-segmentation model (who talks when).
     Segmentation,
-    /// Speaker-embedding extractor (voice fingerprints for matching).
+    /// Speaker-embedding extractor (voice fingerprints for live labels).
     SpeakerEmbedding,
     /// The llama-server executable (built-in LLM runtime).
     LlamaServer,
@@ -52,8 +52,7 @@ pub enum ModelKind {
     /// with interims produced by periodic partial decodes.
     OfflineAsr,
     Punctuation,
-    /// Speaker diarization + voice-embedding models (who spoke, and matching
-    /// voices across meetings).
+    /// Speaker diarization + voice-embedding models (who spoke when).
     SpeakerId,
     /// Built-in language model pieces (llama-server runtime, GGUF weights).
     Llm,
@@ -124,7 +123,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "English fast",
         kind: ModelKind::StreamingAsr,
         languages: &["en"],
-        note: "Lowest CPU use for older machines; slightly less accurate.",
+        note: "Lowest CPU use for older machines; worse accuracy",
         supports_hotwords: true,
         native_punctuation: false,
         source: ModelSource::Files(&[
@@ -159,7 +158,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "English balanced",
         kind: ModelKind::StreamingAsr,
         languages: &["en"],
-        note: "Good accuracy at low CPU use — the default.",
+        note: "Lower CPU use; balanced accuracy",
         supports_hotwords: true,
         native_punctuation: false,
         source: ModelSource::Files(&[
@@ -194,7 +193,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "English accurate",
         kind: ModelKind::OfflineAsr,
         languages: &["en"],
-        note: "Highest accuracy; text lands a moment after each pause.",
+        note: "Higher CPU use; best accuracy",
         supports_hotwords: true,
         native_punctuation: true,
         source: ModelSource::Files(&[
@@ -235,7 +234,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "Multilingual",
         kind: ModelKind::OfflineAsr,
         languages: &["*"],
-        note: "25 European languages, including English; text lands a moment after each pause.",
+        note: "25 languages incl. English; high CPU use & accuracy",
         supports_hotwords: true,
         native_punctuation: true,
         source: ModelSource::Files(&[
@@ -276,7 +275,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "Speaker identification",
         kind: ModelKind::SpeakerId,
         languages: &["*"],
-        note: "Tells speakers apart in recordings and recognizes saved voices across meetings.",
+        note: "Tells speakers apart in recordings",
         supports_hotwords: false,
         native_punctuation: false,
         source: ModelSource::Files(&[
@@ -306,7 +305,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "English punctuation",
         kind: ModelKind::Punctuation,
         languages: &["en"],
-        note: "Adds punctuation and capitalization to transcripts from the fast and balanced English models.",
+        note: "Adds grammar to fast & balanced models",
         supports_hotwords: false,
         native_punctuation: false,
         source: ModelSource::Archive {
@@ -325,7 +324,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "Summary engine",
         kind: ModelKind::Llm,
         languages: &["*"],
-        note: "The on-device runtime that powers built-in summaries and dictation cleanup (llama.cpp).",
+        note: "Local runtime for summaries and dictation cleanup",
         supports_hotwords: false,
         native_punctuation: false,
         source: ModelSource::ZipAll {
@@ -339,7 +338,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "Built-in language model",
         kind: ModelKind::Llm,
         languages: &["*"],
-        note: "Qwen3 4B — writes summaries and cleans up dictations entirely on this computer.",
+        note: "Local LLM for summaries and dictation clean-up",
         supports_hotwords: false,
         native_punctuation: false,
         source: ModelSource::Files(&[ModelFile {
@@ -357,7 +356,7 @@ pub const MODELS: &[KnownModel] = &[
         display_name: "Semantic search",
         kind: ModelKind::Embedding,
         languages: &["*"],
-        note: "Lets search understand meaning, not just keywords — in any language. Used by in-app search and connected AI tools.",
+        note: "Search by meaning, in app and via MCP",
         supports_hotwords: false,
         native_punctuation: false,
         source: ModelSource::Files(&[
@@ -434,9 +433,9 @@ impl KnownModel {
             }),
             // Extracted members' exact sizes aren't published; extraction is
             // atomic per-member (tmp+rename), so existence suffices.
-            ModelSource::Archive { members, .. } => members
-                .iter()
-                .all(|(_, name)| dir.join(name).is_file()),
+            ModelSource::Archive { members, .. } => {
+                members.iter().all(|(_, name)| dir.join(name).is_file())
+            }
             ModelSource::ZipAll { exe, .. } => {
                 dir.join(exe.1).is_file() && dir.join(ZIP_COMPLETE_MARKER).is_file()
             }
@@ -625,11 +624,14 @@ fn extract_zip_all(archive: &Path, dir: &Path) -> Result<()> {
         };
         let tmp = dir.join(format!("{base}.extract.tmp"));
         {
-            let mut out = std::fs::File::create(&tmp)
-                .with_context(|| format!("create {}", tmp.display()))?;
-            std::io::copy(&mut entry, &mut out)?;
+            let mut out =
+                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            std::io::copy(&mut entry, &mut out)
+                .with_context(|| format!("write {}", tmp.display()))?;
         }
-        std::fs::rename(&tmp, dir.join(&base))?;
+        let dest = dir.join(&base);
+        std::fs::rename(&tmp, &dest)
+            .with_context(|| format!("replace {} (is it held open?)", dest.display()))?;
     }
     Ok(())
 }
@@ -653,7 +655,9 @@ async fn stream_to_file(
         .await
         .and_then(|r| r.error_for_status())?;
 
-    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .with_context(|| format!("create {}", tmp.display()))?;
     let mut written: u64 = 0;
     let mut last_emit: u64 = 0;
     let mut stream = resp.bytes_stream();
@@ -668,7 +672,9 @@ async fn stream_to_file(
     }
     file.flush().await?;
     drop(file);
-    tokio::fs::rename(&tmp, dest).await?;
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .with_context(|| format!("replace {} (is it held open?)", dest.display()))?;
     progress(written);
     Ok(())
 }
@@ -692,11 +698,14 @@ fn extract_members(archive: &Path, dir: &Path, members: &[(FileRole, &'static st
         }
         let tmp = dir.join(format!("{base}.extract.tmp"));
         {
-            let mut out = std::fs::File::create(&tmp)
-                .with_context(|| format!("create {}", tmp.display()))?;
-            std::io::copy(&mut entry, &mut out)?;
+            let mut out =
+                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            std::io::copy(&mut entry, &mut out)
+                .with_context(|| format!("write {}", tmp.display()))?;
         }
-        std::fs::rename(&tmp, dir.join(&base))?;
+        let dest = dir.join(&base);
+        std::fs::rename(&tmp, &dest)
+            .with_context(|| format!("replace {} (is it held open?)", dest.display()))?;
     }
     Ok(())
 }
@@ -775,7 +784,11 @@ mod tests {
         assert_eq!(runtime.kind, ModelKind::Llm);
         assert!(!runtime.kind.is_asr());
         assert_eq!(
-            runtime.role_path(FileRole::LlamaServer).unwrap().file_name().unwrap(),
+            runtime
+                .role_path(FileRole::LlamaServer)
+                .unwrap()
+                .file_name()
+                .unwrap(),
             "llama-server.exe"
         );
         let weights = find("qwen3-4b").unwrap();

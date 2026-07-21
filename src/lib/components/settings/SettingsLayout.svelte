@@ -8,7 +8,6 @@
         Network,
         Info,
         FileText,
-        Webhook,
         Speech,
         Brain,
         CircleUser,
@@ -17,16 +16,17 @@
     import type { AppConfig } from "$lib/types";
     import { appState } from "$lib/stores/app-state.svelte";
     import { settingsForm } from "$lib/stores/settings-form.svelte";
+    import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
     import { cn } from "$lib/utils";
     import GeneralSection from "./GeneralSection.svelte";
     import MeetingsSection from "./MeetingsSection.svelte";
     import DictationSection from "./DictationSection.svelte";
     import AboutSection from "./AboutSection.svelte";
     import MarkdownSection from "./MarkdownSection.svelte";
-    import WebhooksSection from "./WebhooksSection.svelte";
     import McpSection from "./McpSection.svelte";
     import TranscriptionSection from "./TranscriptionSection.svelte";
     import SynthesisSection from "./SynthesisSection.svelte";
+    import CloudSignInDialog from "./CloudSignInDialog.svelte";
 
     type SectionId =
         | "account"
@@ -35,7 +35,6 @@
         | "dictation"
         | "about"
         | "markdown"
-        | "webhooks"
         | "mcp"
         | "transcription"
         | "synthesis";
@@ -67,7 +66,6 @@
             label: "Integrations",
             items: [
                 { id: "markdown", label: "Markdown", icon: FileText },
-                { id: "webhooks", label: "Webhooks", icon: Webhook },
                 { id: "mcp", label: "MCP", icon: Network },
             ],
         },
@@ -79,6 +77,15 @@
 
     onMount(() => {
         settingsForm.reset();
+        // Know the cloud sign-in state before the user reaches a provider
+        // selector, and keep it current when they sign in or out on the
+        // Account page (which dispatches this event).
+        if (!CLOUD_ENABLED) return;
+        void cloudAuth.refresh();
+        const onCloudChanged = () => void cloudAuth.refresh();
+        window.addEventListener("embral:cloud-changed", onCloudChanged);
+        return () =>
+            window.removeEventListener("embral:cloud-changed", onCloudChanged);
     });
 
     // Palette deep links: land on the requested page (also fires when a
@@ -155,8 +162,6 @@
                     <AboutSection />
                 {:else if active === "markdown"}
                     <MarkdownSection draft={settingsForm.draft} />
-                {:else if active === "webhooks"}
-                    <WebhooksSection draft={settingsForm.draft} />
                 {:else if active === "mcp"}
                     <McpSection />
                 {:else if active === "transcription"}
@@ -167,6 +172,10 @@
             </div>
         </div>
     </div>
+
+    {#if CLOUD_ENABLED}
+        <CloudSignInDialog />
+    {/if}
 {:else}
     <div class="flex flex-1 items-center justify-center">
         <p class="text-sm text-muted-foreground">Loading…</p>

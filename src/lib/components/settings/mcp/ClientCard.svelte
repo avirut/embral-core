@@ -1,4 +1,8 @@
 <script lang="ts">
+    // One MCP client as a card, styled like the model library: a colored left
+    // edge for status (green registered, amber installed, red not installed —
+    // gray for the informational "other clients" card), the name, a one-word
+    // status, the Register/Remove action, and a collapsed manual fallback.
     import type { Snippet } from "svelte";
     import { ChevronDown, ChevronRight } from "lucide-svelte";
     import { Button } from "$lib/components/ui/button";
@@ -6,16 +10,19 @@
 
     let {
         title,
+        subtitle,
         status = null,
-        serverExists,
-        action,
+        serverExists = false,
+        action = null,
         fallbackLabel = "Manual setup",
         fallback,
     }: {
         title: string;
+        // Shown as the status line on the informational card (no detection).
+        subtitle?: string;
         status?: ClientStatus | null;
-        serverExists: boolean;
-        action: McpAction;
+        serverExists?: boolean;
+        action?: McpAction | null;
         fallbackLabel?: string;
         fallback?: Snippet;
     } = $props();
@@ -25,13 +32,40 @@
     let error = $state<string | null>(null);
     let fallbackOpen = $state(false);
 
-    // A client we can't automate leads with the manual path, not a dead
-    // button; so does a failed action.
+    // A card with no detection and no action is purely informational (Other
+    // clients): its manual setup is the whole point, so it stays open.
+    let informational = $derived(!status && !action);
+
+    // Lead with the manual path when the client isn't installed or an action
+    // failed; the informational card is always open.
     $effect(() => {
-        if (status && !status.installed) fallbackOpen = true;
+        if ((status && !status.installed) || informational) fallbackOpen = true;
     });
 
+    let edge = $derived(
+        status?.registered
+            ? "border-l-emerald-500"
+            : status?.installed
+              ? "border-l-amber-500"
+              : status
+                ? "border-l-destructive"
+                : "border-l-muted-foreground/40",
+    );
+
+    let statusText = $derived(
+        status
+            ? status.registered
+                ? "Registered"
+                : status.installed
+                  ? "Installed"
+                  : "Not installed"
+            : informational
+              ? (subtitle ?? "")
+              : "Checking…",
+    );
+
     async function run(kind: "register" | "unregister") {
+        if (!action) return;
         busy = true;
         message = null;
         error = null;
@@ -46,26 +80,20 @@
     }
 </script>
 
-<div class="rounded-lg border border-border p-4">
+<div
+    class="flex flex-col rounded-lg border border-border border-l-2 {edge} bg-card p-4"
+>
     <div class="flex items-start justify-between gap-3">
         <div class="min-w-0">
-            <div class="flex items-center gap-2">
-                <span class="text-sm font-medium">{title}</span>
-                {#if status?.registered}
-                    <span
-                        class="text-[10px] font-semibold tracking-widest text-primary uppercase"
-                        >Registered</span
-                    >
-                {/if}
-            </div>
+            <p class="text-sm font-medium">{title}</p>
             <p
                 class="mt-0.5 truncate text-xs text-muted-foreground"
                 title={status?.detail}
             >
-                {status?.detail ?? "Checking…"}
+                {statusText}
             </p>
         </div>
-        {#if status?.installed}
+        {#if status?.installed && action}
             {#if status.registered}
                 <Button
                     variant="outline"
@@ -95,20 +123,22 @@
     {/if}
 
     {#if fallback}
-        <button
-            type="button"
-            class="mt-3 flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
-            onclick={() => (fallbackOpen = !fallbackOpen)}
-        >
-            {#if fallbackOpen}<ChevronDown size={12} />{:else}<ChevronRight
-                    size={12}
-                />{/if}
-            {fallbackLabel}
-        </button>
-        {#if fallbackOpen}
-            <div class="mt-2 space-y-2">
-                {@render fallback()}
-            </div>
+        {#if informational}
+            <div class="mt-3 space-y-2">{@render fallback()}</div>
+        {:else}
+            <button
+                type="button"
+                class="mt-3 flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+                onclick={() => (fallbackOpen = !fallbackOpen)}
+            >
+                {#if fallbackOpen}<ChevronDown size={12} />{:else}<ChevronRight
+                        size={12}
+                    />{/if}
+                {fallbackLabel}
+            </button>
+            {#if fallbackOpen}
+                <div class="mt-2 space-y-2">{@render fallback()}</div>
+            {/if}
         {/if}
     {/if}
 </div>

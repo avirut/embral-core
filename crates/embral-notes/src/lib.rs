@@ -7,12 +7,14 @@
 //! - [`prompt`]     — the shared system prompt + user-message builder.
 //! - [`providers`]  — the OpenAI-protocol transport (sidecar + custom).
 //! - [`text`]       — title extraction/replacement + filename sanitization.
-//! - [`integrations`] — post-meeting Obsidian export + webhook payloads.
+//! - [`matching`]   — naming diarized speakers from the user's typed notes.
+//! - [`integrations`] — the post-meeting Obsidian/Markdown export.
 //!
 //! The Tauri crate builds a [`providers::NotesConfig`] from its `AppConfig` and
 //! calls [`refine_notes`]; everything else stays here.
 
 pub mod integrations;
+pub mod matching;
 pub mod prompt;
 pub mod providers;
 pub mod text;
@@ -55,6 +57,18 @@ pub async fn clean_dictation(cfg: &NotesConfig, raw: &str) -> Result<String> {
         cfg,
         prompt::DICTATION_SYSTEM_PROMPT,
         &prompt::build_dictation_message(raw),
+    )
+    .await
+}
+
+/// Load the cleanup prompt into the engine's cache with a one-token call
+/// (the built-in engine caches by prompt prefix, and the cleanup prompt is
+/// constant) so the first real cleanup pays generation time only.
+pub async fn prime_dictation(cfg: &NotesConfig) -> Result<()> {
+    providers::prime(
+        cfg,
+        prompt::DICTATION_SYSTEM_PROMPT,
+        &prompt::build_dictation_message(""),
     )
     .await
 }

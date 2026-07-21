@@ -228,14 +228,15 @@ export const meetingsStore = {
     }
   },
 
-  async confirmSuggestion(id: string, label: string, speakerId: string) {
+  /** Apply a notes-derived name suggestion ("Speaker N is this person"). */
+  async confirmNameSuggestion(id: string, label: string, name: string) {
     if (!isTauri()) return;
     _error = null;
     try {
-      const detail = await invoke<MeetingDetail>('confirm_speaker_suggestion', {
+      const detail = await invoke<MeetingDetail>('confirm_name_suggestion', {
         meetingId: id,
         label,
-        speakerId
+        name
       });
       upsertDetail(detail);
       return detail;
@@ -245,14 +246,13 @@ export const meetingsStore = {
     }
   },
 
-  async dismissSuggestion(id: string, label: string, speakerId: string) {
+  async dismissNameSuggestion(id: string, label: string) {
     if (!isTauri()) return;
     _error = null;
     try {
-      const detail = await invoke<MeetingDetail>('dismiss_speaker_suggestion', {
+      const detail = await invoke<MeetingDetail>('dismiss_name_suggestion', {
         meetingId: id,
-        label,
-        speakerId
+        label
       });
       upsertDetail(detail);
       return detail;

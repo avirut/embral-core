@@ -2,7 +2,6 @@
     import { onMount } from "svelte";
     import { Plus, Trash2, Users } from "lucide-svelte";
     import { speakersStore } from "$lib/stores/speakers.svelte";
-    import { modelsStore } from "$lib/stores/models.svelte";
     import { appState } from "$lib/stores/app-state.svelte";
     import SpeakerProfilePane from "./SpeakerProfilePane.svelte";
     import ResizableSplit from "$lib/components/ResizableSplit.svelte";
@@ -25,7 +24,6 @@
 
     onMount(() => {
         void speakersStore.refresh();
-        void modelsStore.refresh();
     });
 
     let speakers = $derived(speakersStore.speakers);
@@ -41,7 +39,6 @@
     let selected = $derived(
         selectedId ? (speakersStore.byId(selectedId) ?? null) : null,
     );
-    let speakerIdModel = $derived(modelsStore.status("speaker-id"));
 
     let visibleOrder = $derived(groups.flatMap((g) => g.items.map((s) => s.id)));
     const multi = $derived(selection.count > 1);
@@ -140,24 +137,17 @@
                                     )}
                                     onclick={(e) => onRowClick(s.id, e)}
                                 >
-                                    <div class="flex items-center justify-between gap-2">
-                                        <span class="font-display min-w-0 truncate text-sm"
-                                            >{s.name}</span
-                                        >
-                                        {#if s.is_you}
-                                            <span
-                                                class="shrink-0 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary"
-                                            >
-                                                you
-                                            </span>
-                                        {/if}
-                                    </div>
+                                    <span class="font-display block min-w-0 truncate text-sm"
+                                        >{s.name}</span
+                                    >
                                 </button>
                             {/each}
                         {/each}
                         {#if speakers.length === 0 && speakersStore.loaded && !creating}
-                            <p class="px-3 py-2 text-xs text-muted-foreground">
-                                No profiles yet.
+                            <!-- Same treatment as the meeting list's empty
+                                 state — the two pages are the same object. -->
+                            <p class="px-3 py-4 text-sm text-muted-foreground">
+                                No profiles yet...
                             </p>
                         {/if}
                     </div>
@@ -198,15 +188,10 @@
                         <p class="text-xs text-muted-foreground">Or press Delete.</p>
                     </div>
                 {:else if creating}
-                    <SpeakerProfilePane
-                        speaker={null}
-                        {speakerIdModel}
-                        onSaved={onSaved}
-                    />
+                    <SpeakerProfilePane speaker={null} onSaved={onSaved} />
                 {:else if selected}
                     <SpeakerProfilePane
                         speaker={selected}
-                        {speakerIdModel}
                         onSaved={onSaved}
                         onDeleted={() => (selectedId = null)}
                     />
@@ -219,23 +204,14 @@
                             <p class="text-sm font-medium">Know who said what</p>
                             <p class="text-xs leading-relaxed text-muted-foreground">
                                 Save the people you meet with. embral tells speakers
-                                apart in every recording, and voice references let it
-                                recognize the same people across meetings — by
-                                suggestion or automatically, your choice in Settings.
+                                apart in every recording; name a speaker once in a
+                                transcript and their profile keeps notes and history
+                                in one place.
                             </p>
                         </div>
                         <Button size="sm" onclick={startCreate}>
                             <Plus size={15} class="mr-1" /> Add a profile
                         </Button>
-                        {#if speakerIdModel && !speakerIdModel.present}
-                            <button
-                                class="text-xs text-primary underline-offset-2 hover:underline"
-                                onclick={() => appState.openSettings("transcription")}
-                            >
-                                Download the speaker identification models in Settings
-                                first
-                            </button>
-                        {/if}
                     </div>
                 {/if}
             </div>
@@ -250,7 +226,7 @@
     title={selection.count === 1
         ? "Delete profile?"
         : `Delete ${selection.count} profiles?`}
-    body="Their saved voice clips are deleted too. Transcripts keep the names already written into them."
+    body="Transcripts keep the names already written into them."
     confirmLabel={selection.count === 1 ? "Delete" : `Delete ${selection.count}`}
     busy={deleting}
     onConfirm={deleteSelected}

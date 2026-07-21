@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { ArrowDown, Check, Play, Scissors, Star, Trash2, UserPen, X } from 'lucide-svelte';
+  import { ArrowDown, Play, Scissors, Star, Trash2, UserPen, X } from 'lucide-svelte';
   import type { MeetingDetail, TranscriptionSegment } from '$lib/types';
   import { meetingsStore } from '$lib/stores/meetings.svelte';
   import { speakersStore } from '$lib/stores/speakers.svelte';
@@ -206,13 +206,12 @@
     editingLabel = null;
     if (!from || !to || to === from) return;
     // A real name that isn't in the registry yet becomes a profile on the
-    // spot, so the rename also links the segments (and future matching).
+    // spot, so the rename also links the segments.
     let speakerId = registryIdFor(to);
     if (!speakerId && !isGenericLabel(to)) {
       const created = await speakersStore.save({
         name: to,
-        notes: '',
-        is_you: false
+        notes: ''
       });
       speakerId = created?.id ?? null;
     }
@@ -231,12 +230,12 @@
     await apply(() => meetingsStore.editSegments(meetingId, { kind: 'clear_label', label }));
   }
 
-  async function confirmSuggestion(label: string, speakerId: string) {
-    await apply(() => meetingsStore.confirmSuggestion(meetingId, label, speakerId));
+  async function confirmName(label: string, name: string) {
+    await apply(() => meetingsStore.confirmNameSuggestion(meetingId, label, name));
   }
 
-  async function dismissSuggestion(label: string, speakerId: string) {
-    await apply(() => meetingsStore.dismissSuggestion(meetingId, label, speakerId));
+  async function dismissName(label: string) {
+    await apply(() => meetingsStore.dismissNameSuggestion(meetingId, label));
   }
 </script>
 
@@ -263,34 +262,32 @@
 {/snippet}
 
 <div class="flex h-full min-h-0 flex-col">
-  {#if detail.speaker_suggestions.length > 0}
+  {#if detail.name_suggestions.length > 0}
     <div class="mb-2 shrink-0 space-y-1.5">
-      {#each detail.speaker_suggestions as sug (sug.label + sug.speaker_id)}
+      {#each detail.name_suggestions as sug (sug.label)}
         <div
           class="flex items-center justify-between gap-3 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2"
         >
           <p class="min-w-0 truncate text-xs">
             <span class="font-medium">{sug.label}</span>
-            <span class="text-muted-foreground"> sounds like </span>
+            <span class="text-muted-foreground"> looks like </span>
             <span class="font-medium">{sug.name}</span>
-            <span class="text-muted-foreground">
-              ({Math.round(sug.score * 100)}% match)</span
-            >
+            <span class="text-muted-foreground"> (from your notes)</span>
           </p>
           <div class="flex shrink-0 items-center gap-1">
             <button
               class="inline-flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-[11px] font-medium text-primary-foreground transition-colors hover:bg-primary/90"
               disabled={busy}
-              onclick={() => confirmSuggestion(sug.label, sug.speaker_id)}
+              onclick={() => confirmName(sug.label, sug.name)}
             >
-              <Check size={11} /> It's them
+              Apply
             </button>
             <button
               class="rounded-md px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
               disabled={busy}
-              onclick={() => dismissSuggestion(sug.label, sug.speaker_id)}
+              onclick={() => dismissName(sug.label)}
             >
-              Not them
+              Dismiss
             </button>
           </div>
         </div>

@@ -3,6 +3,10 @@
 //! plus the copy-paste setup info for everything else. Detection reports
 //! disk/CLI truth, never UI state: the frontend refetches after every
 //! action instead of assuming success ([integrations.md](../../docs/integrations.md)).
+//! Claude Desktop's config dir is *resolved* across install types (standalone
+//! `%APPDATA%\Claude` vs. the MSIX build's virtualized `Packages\Claude_*`
+//! path), since a bare `%APPDATA%\Claude` check misses every Store/WinGet
+//! install.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -87,13 +91,124 @@ fn dunce_simplify(path: &Path) -> String {
     s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
 }
 
-/// `%APPDATA%\Claude` — present iff Claude Desktop is installed.
-fn claude_desktop_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("Claude"))
+/// The MSIX build of Claude Desktop (Microsoft Store / WinGet / the current
+/// official Windows installer) runs in a virtualized filesystem: its
+/// `%APPDATA%\Claude` is redirected under this package folder in
+/// `%LOCALAPPDATA%\Packages`. `pzs8sxrjxfjjc` is Anthropic's stable publisher
+/// hash; the `Claude_*` glob in [`desktop_config_candidates`] covers a change.
+const CLAUDE_MSIX_PACKAGE: &str = "Claude_pzs8sxrjxfjjc";
+
+const DESKTOP_CONFIG_FILE: &str = "claude_desktop_config.json";
+
+/// Every directory Claude Desktop might keep `claude_desktop_config.json` in,
+/// most specific first: the standalone (Squirrel) install's `%APPDATA%\Claude`,
+/// then the MSIX virtualized path — the known package, then any other `Claude_*`
+/// package discovered under `%LOCALAPPDATA%\Packages`. Pure so the ordering is
+/// unit-tested without touching disk; `package_dirs` is the folder listing.
+fn desktop_config_candidates(
+    roaming: Option<&Path>,
+    local: Option<&Path>,
+    package_dirs: &[String],
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(roaming) = roaming {
+        dirs.push(roaming.join("Claude"));
+    }
+    if let Some(local) = local {
+        let virtualized = |pkg: &str| {
+            local
+                .join("Packages")
+                .join(pkg)
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+        };
+        dirs.push(virtualized(CLAUDE_MSIX_PACKAGE));
+        for pkg in package_dirs {
+            if pkg.starts_with("Claude_") && pkg != CLAUDE_MSIX_PACKAGE {
+                dirs.push(virtualized(pkg));
+            }
+        }
+    }
+    dirs
 }
 
-fn claude_desktop_config() -> Option<PathBuf> {
-    claude_desktop_dir().map(|d| d.join("claude_desktop_config.json"))
+/// Subdirectory names under `%LOCALAPPDATA%\Packages` (empty when it can't be
+/// read), feeding the `Claude_*` glob without the pure candidate builder
+/// touching disk.
+fn local_package_dirs(local: Option<&Path>) -> Vec<String> {
+    local
+        .map(|l| l.join("Packages"))
+        .and_then(|p| std::fs::read_dir(p).ok())
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The best Claude Desktop config directory visible on disk — the first
+/// candidate that exists, else the first candidate as a sensible default for
+/// display. No `Get-AppxPackage` call, so it's cheap enough for the setup-info
+/// path shown in the copy-paste fallback.
+fn desktop_config_dir_on_disk() -> Option<PathBuf> {
+    let (roaming, local) = (dirs::config_dir(), dirs::data_local_dir());
+    let packages = local_package_dirs(local.as_deref());
+    let candidates = desktop_config_candidates(roaming.as_deref(), local.as_deref(), &packages);
+    candidates
+        .iter()
+        .find(|p| p.is_dir())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+/// The live Claude Desktop config directory and whether it's installed.
+/// Prefers a config dir that exists (standalone or MSIX); only when the fast
+/// disk checks come up empty does it ask `Get-AppxPackage` (slow, hence last)
+/// and derive the dir from the package family — so a freshly-installed but
+/// never-launched Desktop still registers. The path comes back even when
+/// nothing is installed, so callers can still say where to look.
+async fn resolve_desktop_config_dir() -> (Option<PathBuf>, bool) {
+    let (roaming, local) = (dirs::config_dir(), dirs::data_local_dir());
+    let packages = local_package_dirs(local.as_deref());
+    let candidates = desktop_config_candidates(roaming.as_deref(), local.as_deref(), &packages);
+
+    if let Some(existing) = candidates.iter().find(|p| p.is_dir()) {
+        return (Some(existing.clone()), true);
+    }
+    if let (Some(family), Some(local)) = (appx_package_family().await, local.as_deref()) {
+        let dir = local
+            .join("Packages")
+            .join(family)
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Claude");
+        return (Some(dir), true);
+    }
+    (candidates.into_iter().next(), false)
+}
+
+/// `PackageFamilyName` of an installed Claude Desktop MSIX package, or `None`.
+/// Windowless and time-bounded like the client CLIs.
+async fn appx_package_family() -> Option<String> {
+    let output = run_cli(
+        Path::new("powershell.exe"),
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-AppxPackage -Name Claude | Select-Object -First 1).PackageFamilyName",
+        ],
+    )
+    .await
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let family = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!family.is_empty()).then_some(family)
 }
 
 /// Claude Code's user-scope registry (`claude mcp add --scope user` writes it).
@@ -249,8 +364,8 @@ pub async fn mcp_setup_info() -> Result<McpSetupInfo, String> {
         ),
         codex_command: format!("codex mcp add embral -- \"{display}\""),
         codex_toml: codex_toml_snippet(&display),
-        claude_desktop_config_path: claude_desktop_config()
-            .map(|p| p.to_string_lossy().to_string())
+        claude_desktop_config_path: desktop_config_dir_on_disk()
+            .map(|d| d.join(DESKTOP_CONFIG_FILE).to_string_lossy().to_string())
             .unwrap_or_default(),
         path: display,
         exists,
@@ -261,13 +376,14 @@ pub async fn mcp_setup_info() -> Result<McpSetupInfo, String> {
 pub async fn mcp_clients_status() -> Result<McpClientsStatus, String> {
     let (server_path, server_exists) = server_binary()?;
 
-    let desktop_dir = claude_desktop_dir();
-    let desktop_installed = desktop_dir.as_ref().map(|d| d.is_dir()).unwrap_or(false);
+    let (desktop_dir, desktop_installed) = resolve_desktop_config_dir().await;
+    let desktop_config = desktop_dir.map(|d| d.join(DESKTOP_CONFIG_FILE));
     let claude_desktop = ClientStatus {
         installed: desktop_installed,
-        registered: json_registered(claude_desktop_config().as_ref()),
+        registered: json_registered(desktop_config.as_ref()),
         detail: if desktop_installed {
-            claude_desktop_config()
+            desktop_config
+                .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
         } else {
@@ -300,12 +416,41 @@ pub async fn mcp_clients_status() -> Result<McpClientsStatus, String> {
     })
 }
 
+/// The client's telemetry name — the vocabulary's closed set.
+fn client_label(client: McpClient) -> &'static str {
+    match client {
+        McpClient::ClaudeDesktop => "claude_desktop",
+        McpClient::ClaudeCode => "claude_code",
+        McpClient::Codex => "codex",
+    }
+}
+
 #[tauri::command]
-pub async fn mcp_register(client: McpClient) -> Result<String, String> {
+pub async fn mcp_register(
+    state: tauri::State<'_, crate::AppState>,
+    client: McpClient,
+) -> Result<String, String> {
+    let result = mcp_register_inner(client).await;
+    match &result {
+        Ok(_) => crate::telemetry::track(
+            &state,
+            "mcp_registered",
+            serde_json::json!({ "client": client_label(client) }),
+        ),
+        Err(_) => crate::telemetry::track(
+            &state,
+            "error",
+            serde_json::json!({ "category": "mcp_register_failed" }),
+        ),
+    }
+    result
+}
+
+async fn mcp_register_inner(client: McpClient) -> Result<String, String> {
     let (server_path, exists) = server_binary()?;
     if !exists {
         return Err(format!(
-            "the MCP server binary isn't built yet (expected at {})",
+            "A part of embral this feature needs is missing (expected at {}) — reinstalling the app should fix this",
             dunce_simplify(&server_path)
         ));
     }
@@ -313,11 +458,15 @@ pub async fn mcp_register(client: McpClient) -> Result<String, String> {
 
     match client {
         McpClient::ClaudeDesktop => {
-            let dir = claude_desktop_dir().ok_or("no config directory on this system")?;
-            if !dir.is_dir() {
-                return Err("Claude Desktop doesn't appear to be installed (no Claude folder in AppData)".into());
+            let (dir, installed) = resolve_desktop_config_dir().await;
+            let dir = dir.ok_or("no config directory on this system")?;
+            if !installed {
+                return Err("Claude Desktop doesn't appear to be installed (no Claude config folder found)".into());
             }
-            let config = dir.join("claude_desktop_config.json");
+            // create_dir_all covers an installed-but-never-launched MSIX
+            // package, where Get-AppxPackage found it before the folder existed.
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let config = dir.join(DESKTOP_CONFIG_FILE);
             let existing = std::fs::read_to_string(&config).unwrap_or_default();
             let updated = upsert_mcp_server(&existing, &display)?;
             std::fs::write(&config, updated).map_err(|e| e.to_string())?;
@@ -353,10 +502,27 @@ pub async fn mcp_register(client: McpClient) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn mcp_unregister(client: McpClient) -> Result<String, String> {
+pub async fn mcp_unregister(
+    state: tauri::State<'_, crate::AppState>,
+    client: McpClient,
+) -> Result<String, String> {
+    let result = mcp_unregister_inner(client).await;
+    if result.is_ok() {
+        crate::telemetry::track(
+            &state,
+            "mcp_unregistered",
+            serde_json::json!({ "client": client_label(client) }),
+        );
+    }
+    result
+}
+
+async fn mcp_unregister_inner(client: McpClient) -> Result<String, String> {
     match client {
         McpClient::ClaudeDesktop => {
-            let config = claude_desktop_config().ok_or("no config directory on this system")?;
+            let config = desktop_config_dir_on_disk()
+                .map(|d| d.join(DESKTOP_CONFIG_FILE))
+                .ok_or("no config directory on this system")?;
             let existing = std::fs::read_to_string(&config)
                 .map_err(|_| "no Claude Desktop config file to edit")?;
             match remove_mcp_server(&existing)? {
@@ -436,6 +602,55 @@ mod tests {
 
         assert!(remove_mcp_server(r#"{"mcpServers": {}}"#).unwrap().is_none());
         assert!(remove_mcp_server("{}").unwrap().is_none());
+    }
+
+    #[test]
+    fn desktop_candidates_prefer_roaming_then_msix() {
+        let roaming = PathBuf::from(r"C:\Roaming");
+        let local = PathBuf::from(r"C:\Local");
+        let packages = vec![
+            "SomethingElse_abc".to_string(),
+            "Claude_pzs8sxrjxfjjc".to_string(),
+            "Claude_newerhash".to_string(),
+        ];
+        let got = desktop_config_candidates(Some(&roaming), Some(&local), &packages);
+
+        // Standalone Roaming path is tried first.
+        assert_eq!(got[0], roaming.join("Claude"));
+        // Then the known MSIX package's virtualized config dir.
+        assert_eq!(
+            got[1],
+            local
+                .join("Packages")
+                .join("Claude_pzs8sxrjxfjjc")
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude"),
+        );
+        // The glob picks up an unknown Claude_* package but never a non-Claude one.
+        assert!(got
+            .iter()
+            .any(|p| p.to_string_lossy().contains("Claude_newerhash")));
+        assert!(!got
+            .iter()
+            .any(|p| p.to_string_lossy().contains("SomethingElse")));
+        // The known package is listed once, even though it's also in the listing.
+        let known = got
+            .iter()
+            .filter(|p| p.to_string_lossy().contains("Claude_pzs8sxrjxfjjc"))
+            .count();
+        assert_eq!(known, 1);
+    }
+
+    #[test]
+    fn desktop_candidates_offer_msix_without_roaming() {
+        assert!(desktop_config_candidates(None, None, &[]).is_empty());
+
+        let local = PathBuf::from(r"C:\Local");
+        let got = desktop_config_candidates(None, Some(&local), &[]);
+        // No Roaming base, but the known MSIX path is always offered.
+        assert_eq!(got.len(), 1);
+        assert!(got[0].to_string_lossy().contains("Claude_pzs8sxrjxfjjc"));
     }
 
     #[test]

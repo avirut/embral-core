@@ -41,20 +41,14 @@ pub fn notes_config(profile: &LlmProfile) -> embral_notes::NotesConfig {
     }
 }
 
-/// Run best-effort post-meeting integrations (Obsidian export + webhook). Each
-/// is gated on its config field and failures are logged, never propagated — a
-/// broken vault path or unreachable webhook must not affect the saved meeting.
-/// `export_md` is the composed document written to a vault (summary + the
-/// user's notes + transcript); the webhook gets the same parts separately, so
-/// an automation can use whichever it wants. `summary_md` is empty when the
-/// meeting has no summary.
-pub async fn run_post_meeting_integrations(
+/// Run best-effort post-meeting integrations (the Markdown export). Gated on
+/// its config fields; failures are logged, never propagated — a broken vault
+/// path must not affect the saved meeting. `export_md` is the composed
+/// document ([integrations.md]).
+pub fn run_post_meeting_integrations(
     config: &AppConfig,
     record: &embral_types::MeetingRecord,
     export_md: &str,
-    summary_md: &str,
-    user_notes_md: &str,
-    transcript_md: &str,
 ) {
     if config.obsidian_export_enabled && !config.obsidian_vault_dir.trim().is_empty() {
         match embral_notes::integrations::export_to_obsidian(
@@ -66,23 +60,6 @@ pub async fn run_post_meeting_integrations(
         ) {
             Ok(path) => tracing::info!("Obsidian export written to {}", path.display()),
             Err(e) => tracing::warn!("Obsidian export failed: {}", e),
-        }
-    }
-
-    let webhook_url = config.webhook_url.trim();
-    if !webhook_url.is_empty() {
-        match embral_notes::integrations::post_webhook(
-            webhook_url,
-            config.webhook_method,
-            record,
-            summary_md,
-            user_notes_md,
-            transcript_md,
-        )
-        .await
-        {
-            Ok(()) => tracing::info!("Webhook delivered to {}", webhook_url),
-            Err(e) => tracing::warn!("Webhook delivery failed: {}", e),
         }
     }
 }

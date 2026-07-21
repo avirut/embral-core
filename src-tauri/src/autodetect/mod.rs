@@ -109,6 +109,15 @@ pub fn spawn(handle: AppHandle) {
                         AutoStartPolicy::Prompt => {
                             if !state.detection_dismissed.load(Ordering::Acquire) {
                                 tracing::info!(app, "call detected — prompting");
+                                // Normalized: the raw exe name never leaves
+                                // the machine ([telemetry.md]).
+                                crate::telemetry::track(
+                                    &state,
+                                    "meeting_detected",
+                                    serde_json::json!({
+                                        "app": crate::telemetry::normalize_detected_app(&app)
+                                    }),
+                                );
                                 let _ = handle
                                     .emit("meeting-detected", serde_json::json!({ "app": app }));
                             }

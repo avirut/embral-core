@@ -96,7 +96,7 @@
       <p class="px-3 py-4 text-sm text-muted-foreground">Loading meetings...</p>
     {:else if groups.length === 0}
       <p class="px-3 py-4 text-sm text-muted-foreground">
-        No meetings yet — hit record or import one.
+        No meetings yet...
       </p>
     {:else}
       {#each groups as group (group.label)}

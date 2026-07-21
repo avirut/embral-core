@@ -23,6 +23,14 @@ pub fn load_config() -> Result<AppConfig> {
             .to_string_lossy()
             .to_string();
     }
+    // The cloud URL used to be materialized into config.json; a stored value
+    // equal to the production default is that old default, not a
+    // customization — clear it so `cloud_url()` can pick per build (dev
+    // builds talk to the local server).
+    #[cfg(feature = "cloud")]
+    if config.cloud_api_url == embral_types::DEFAULT_CLOUD_URL {
+        config.cloud_api_url = String::new();
+    }
     Ok(config)
 }
 

@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
-use embral_engine::speakers::ChannelWindow;
 use hound::{WavSpec, WavWriter};
 use rubato::{FftFixedInOut, Resampler};
 use std::collections::VecDeque;
@@ -10,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::meter::{ChannelMeter, LevelTap};
+use super::meter::LevelTap;
 
 const TARGET_SAMPLE_RATE: u32 = 16000;
 const RESAMPLE_CHUNK: usize = 1024;
@@ -41,18 +40,12 @@ enum MixSink {
         wav_writer: Arc<Mutex<Option<WavWriter<BufWriter<std::fs::File>>>>>,
         audio_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<f32>>>,
         loopback: Arc<Mutex<VecDeque<f32>>>,
-        /// Pre-mix per-channel loudness timeline — the only place mic and
-        /// loopback still exist separately (feeds "you" attribution).
-        meter: Arc<Mutex<ChannelMeter>>,
         /// Live ~10 Hz spectrum tap for the recording view's meter.
         level: Option<Arc<Mutex<LevelTap>>>,
     },
     /// Loopback — pushes resampled samples into the shared buffer for the
     /// primary to drain and mix. Produces no WAV / transcription output itself.
     Secondary { loopback: Arc<Mutex<VecDeque<f32>>> },
-    /// Plain accumulation into a buffer — used by short one-off captures
-    /// (voice-reference enrollment), no mixing, no file.
-    Buffer { out: Arc<Mutex<Vec<f32>>> },
     /// Stream blocks straight into a channel — dictation's mic-only live
     /// path (no WAV, no loopback). Dropping the stream drops this sender,
     /// which is how the consumer learns the capture ended.
@@ -65,9 +58,6 @@ impl MixSink {
     /// Consume one block of this stream's resampled 16 kHz mono samples.
     fn consume(&self, resampled: &[f32]) {
         match self {
-            MixSink::Buffer { out } => {
-                out.lock().unwrap().extend_from_slice(resampled);
-            }
             MixSink::Tx { tx } => {
                 let _ = tx.send(resampled.to_vec());
             }
@@ -85,7 +75,6 @@ impl MixSink {
                 wav_writer,
                 audio_tx,
                 loopback,
-                meter,
                 level,
             } => {
                 // Mix in buffered loopback (system) audio aligned sample-for-
@@ -97,9 +86,6 @@ impl MixSink {
                     let mut buf = loopback.lock().unwrap();
                     let take = mixed.len().min(buf.len());
                     let lb_block: Vec<f32> = buf.drain(..take).collect();
-                    if let Ok(mut m) = meter.lock() {
-                        m.push_block(resampled, &lb_block);
-                    }
                     if let Some(level) = level {
                         if let Ok(mut tap) = level.lock() {
                             tap.push_block(resampled, &lb_block);
@@ -134,7 +120,6 @@ pub struct Recorder {
     paused: Arc<AtomicBool>,
     wav_path: PathBuf,
     wav_writer: Arc<Mutex<Option<WavWriter<BufWriter<std::fs::File>>>>>,
-    meter: Arc<Mutex<ChannelMeter>>,
     _mic_stream: cpal::Stream,
     _loopback_stream: Option<cpal::Stream>,
 }
@@ -219,13 +204,11 @@ impl Recorder {
             mic_config.channels(),
             mic_config.sample_format()
         );
-        let meter = Arc::new(Mutex::new(ChannelMeter::default()));
         let level = level_cb.map(|cb| Arc::new(Mutex::new(LevelTap::new(cb))));
         let mic_sink = MixSink::Primary {
             wav_writer: wav_writer.clone(),
             audio_tx: audio_tx.clone(),
             loopback: loopback_buffer.clone(),
-            meter: meter.clone(),
             level,
         };
         let mic_stream = build_stream("mic", &mic_device, &mic_config, paused.clone(), mic_sink)?;
@@ -239,7 +222,6 @@ impl Recorder {
             paused,
             wav_path,
             wav_writer,
-            meter,
             _mic_stream: mic_stream,
             _loopback_stream: loopback_stream,
         })
@@ -253,9 +235,8 @@ impl Recorder {
         self.paused.store(false, Ordering::SeqCst);
     }
 
-    /// Stop capturing; returns the WAV path and the pre-mix channel-loudness
-    /// timeline (for "you" attribution in the speaker pipeline).
-    pub fn stop(self) -> Result<(PathBuf, Vec<ChannelWindow>)> {
+    /// Stop capturing; returns the finalized WAV's path.
+    pub fn stop(self) -> Result<PathBuf> {
         drop(self._mic_stream);
         drop(self._loopback_stream);
         if let Ok(mut guard) = self.wav_writer.lock() {
@@ -263,11 +244,7 @@ impl Recorder {
                 writer.finalize()?;
             }
         }
-        let windows = match self.meter.lock() {
-            Ok(mut m) => std::mem::take(&mut *m).finish(),
-            Err(_) => Vec::new(),
-        };
-        Ok((self.wav_path, windows))
+        Ok(self.wav_path)
     }
 }
 
@@ -299,51 +276,6 @@ impl MicStream {
         stream.play()?;
         Ok(MicStream { _stream: stream })
     }
-}
-
-/// Capture up to `secs` of mic-only 16 kHz mono audio, polling `cancel` to
-/// stop early (returns what was captured so far). Blocking — call from a
-/// blocking task. Used for voice-reference enrollment; system audio is
-/// deliberately not mixed in.
-pub fn capture_mic(
-    mic_device: Option<&str>,
-    secs: f32,
-    cancel: Arc<AtomicBool>,
-) -> Result<Vec<f32>> {
-    let host = cpal::default_host();
-    let device = host
-        .input_devices()
-        .ok()
-        .and_then(|devices| find_device(devices, mic_device, "enroll"))
-        .or_else(|| host.default_input_device())
-        .ok_or_else(|| anyhow!("No default input device found"))?;
-    let config = device.default_input_config()?;
-
-    let out: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = MixSink::Buffer { out: out.clone() };
-    let paused = Arc::new(AtomicBool::new(false));
-    let stream = build_stream("enroll", &device, &config, paused, sink)?;
-    stream.play()?;
-
-    let target = (secs * TARGET_SAMPLE_RATE as f32) as usize;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f32(secs + 3.0);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if cancel.load(Ordering::Acquire) {
-            break;
-        }
-        if out.lock().unwrap().len() >= target {
-            break;
-        }
-        // A dead device delivers no callbacks; don't hang the command forever.
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-    }
-    drop(stream);
-    let mut samples = std::mem::take(&mut *out.lock().unwrap());
-    samples.truncate(target);
-    Ok(samples)
 }
 
 fn build_loopback_stream(

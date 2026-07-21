@@ -149,7 +149,6 @@
                 await speakersStore.save({
                     name: to,
                     notes: "",
-                    is_you: false,
                 });
             }
             await invoke("rename_live_speaker", { from, to });
@@ -167,11 +166,18 @@
     let interimStable = $derived(
         appState.interim?.text ? appState.interim.text.split(/\s+/) : [],
     );
-    let interimTentative = $derived(
-        appState.interim?.tentative_text
-            ? appState.interim.tentative_text.split(/\s+/)
-            : [],
-    );
+    let interimTentative = $derived.by(() => {
+        const tail = appState.interim?.tentative_text?.trim();
+        return tail ? tail.split(/\s+/) : [];
+    });
+    // The raw tail's leading space (or its absence) is the word boundary
+    // (see the interim contract in types.ts): a spaceless tail continues
+    // the last stable word — "keep tal" + "king" — so that word must not
+    // render its trailing space.
+    let tentativeJoinsWord = $derived.by(() => {
+        const tail = appState.interim?.tentative_text;
+        return !!tail && !/^\s/.test(tail) && interimStable.length > 0;
+    });
 
     // Pinned-to-bottom auto-scroll: scrolling up unpins (new content stops
     // yanking the viewport); the pill or reaching the bottom re-pins.
@@ -296,15 +302,22 @@
                             {formatTime(appState.interim.start)}
                         </span>
                     </div>
+                    <!-- Whitespace-tight: any newline between these spans
+                         renders as a space and would defeat the mid-word
+                         join between the last stable word and the first
+                         tentative one. Words carry their own trailing
+                         space instead. -->
                     <p class="mt-0.5 text-[15px] leading-relaxed">
-                        {#each interimStable as word, i (i)}
-                            <span class="word-fade">{word}{" "}</span>
-                        {/each}
-                        {#each interimTentative as word, i (i)}
-                            <span class="word-fade text-muted-foreground/60"
+                        {#each interimStable as word, i (i)}<span
+                                class="word-fade"
+                                >{word}{i === interimStable.length - 1 &&
+                                tentativeJoinsWord
+                                    ? ""
+                                    : " "}</span
+                            >{/each}{#each interimTentative as word, i (i)}<span
+                                class="word-fade text-muted-foreground/60"
                                 >{word}{" "}</span
-                            >
-                        {/each}<span class="interim-caret" aria-hidden="true"
+                            >{/each}<span class="interim-caret" aria-hidden="true"
                         ></span>
                     </p>
                 </div>

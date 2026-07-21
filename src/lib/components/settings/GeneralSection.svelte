@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount } from "svelte";
+    import type { Component } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
     import { open } from "@tauri-apps/plugin-dialog";
     import { RefreshCw } from "lucide-svelte";
@@ -10,14 +11,42 @@
     import { Switch } from "$lib/components/ui/switch";
     import { Input } from "$lib/components/ui/input";
     import { Button } from "$lib/components/ui/button";
+    import { loadTelemetrySetting } from "$lib/cloud";
 
     let { draft }: { draft: AppConfig } = $props();
+
+    // The Privacy group (telemetry toggle) is a cloud-edition component
+    // ([telemetry.md]); the open-core build has no telemetry.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let TelemetrySetting = $state<Component<any> | null>(null);
+    onMount(async () => {
+        TelemetrySetting = await loadTelemetrySetting();
+    });
 
     const themeLabels: Record<Theme, string> = {
         system: "System",
         light: "Light",
         dark: "Dark",
     };
+
+    // Recording indicator: the Windows accent by default, or a preset.
+    // Sentinel because the stored "follow the accent" value is "".
+    const ACCENT = "__accent__";
+    const indicatorColors: { value: string; label: string }[] = [
+        { value: "#b91c1c", label: "Red" },
+        { value: "#c2410c", label: "Orange" },
+        { value: "#15803d", label: "Green" },
+        { value: "#1d4ed8", label: "Blue" },
+        { value: "#6d28d9", label: "Purple" },
+        { value: "#be185d", label: "Pink" },
+    ];
+    let indicatorLabel = $derived(
+        indicatorColors.find((c) => c.value === draft.tray_recording_color)
+            ?.label ?? "Windows accent",
+    );
+    // The live accent, for the "Windows accent" swatch; stock blue until read.
+    let accentColor = $state("#0078d4");
+    let swatchColor = $derived(draft.tray_recording_color || accentColor);
 
     // --- Audio devices (moved from the former Audio page) ---
     // Sentinel for "system default" — an empty string is stored in config.
@@ -36,7 +65,12 @@
         }
     }
 
-    onMount(refresh);
+    onMount(() => {
+        void refresh();
+        invoke<string>("system_accent_color")
+            .then((c) => (accentColor = c))
+            .catch(() => {});
+    });
 
     function deviceLabel(configured: string): string {
         return configured === "" ? "System default" : configured;
@@ -68,12 +102,55 @@
                 </Select.Content>
             </Select.Root>
         </SettingRow>
+
+        <SettingRow title="Recording indicator color">
+            <Select.Root
+                type="single"
+                value={draft.tray_recording_color === ""
+                    ? ACCENT
+                    : draft.tray_recording_color}
+                onValueChange={(v) =>
+                    (draft.tray_recording_color =
+                        !v || v === ACCENT ? "" : v)}
+            >
+                <Select.Trigger class="w-56">
+                    <span class="flex min-w-0 items-center gap-2">
+                        <span
+                            class="size-3 shrink-0 rounded-full"
+                            style="background: {swatchColor}"
+                        ></span>
+                        <span class="truncate">{indicatorLabel}</span>
+                    </span>
+                </Select.Trigger>
+                <Select.Content>
+                    <Select.Item value={ACCENT} label="Windows accent">
+                        <span class="flex items-center gap-2">
+                            <span
+                                class="size-3 shrink-0 rounded-full"
+                                style="background: {accentColor}"
+                            ></span>
+                            Windows accent
+                        </span>
+                    </Select.Item>
+                    {#each indicatorColors as c (c.value)}
+                        <Select.Item value={c.value} label={c.label}>
+                            <span class="flex items-center gap-2">
+                                <span
+                                    class="size-3 shrink-0 rounded-full"
+                                    style="background: {c.value}"
+                                ></span>
+                                {c.label}
+                            </span>
+                        </Select.Item>
+                    {/each}
+                </Select.Content>
+            </Select.Root>
+        </SettingRow>
     </SettingsGroup>
 
     <SettingsGroup label="Storage">
         <SettingRow
             title="Storage folder"
-            description="Where your meetings, transcripts, and notes live."
             vertical
         >
             <div class="flex w-full gap-2">
@@ -94,7 +171,9 @@
                     (draft.mic_device = !v || v === DEFAULT ? "" : v)}
             >
                 <Select.Trigger class="w-56"
-                    >{deviceLabel(draft.mic_device)}</Select.Trigger
+                    ><span class="truncate min-w-0"
+                        >{deviceLabel(draft.mic_device)}</span
+                    ></Select.Trigger
                 >
                 <Select.Content>
                     <Select.Item value={DEFAULT} label="System default" />
@@ -107,7 +186,7 @@
 
         <SettingRow
             title="System audio"
-            description="Lets calls on headphones still record everyone."
+            description="Lets calls on headphones still record everyone"
         >
             <Select.Root
                 type="single"
@@ -118,7 +197,9 @@
                     (draft.output_device = !v || v === DEFAULT ? "" : v)}
             >
                 <Select.Trigger class="w-56"
-                    >{deviceLabel(draft.output_device)}</Select.Trigger
+                    ><span class="truncate min-w-0"
+                        >{deviceLabel(draft.output_device)}</span
+                    ></Select.Trigger
                 >
                 <Select.Content>
                     <Select.Item value={DEFAULT} label="System default" />
@@ -148,21 +229,24 @@
         </SettingRow>
         <SettingRow
             title="Recording started"
-            description="Only when the window is hidden."
+            description="Only when the window is hidden"
         >
             <Switch bind:checked={draft.notify_recording_started} />
         </SettingRow>
         <SettingRow
             title="Call detected"
-            description="Only when embral is set to ask before recording."
+            description="Only when embral is set to ask before recording"
         >
             <Switch bind:checked={draft.notify_call_detected} />
         </SettingRow>
         <SettingRow
             title="Update ready"
-            description="A new version is available to install."
         >
             <Switch bind:checked={draft.notify_update_available} />
         </SettingRow>
     </SettingsGroup>
+
+    {#if TelemetrySetting}
+        <TelemetrySetting {draft} />
+    {/if}
 </div>

@@ -92,7 +92,6 @@ pub struct SpeakerRow {
     pub id: String,
     pub name: String,
     pub notes: String,
-    pub is_you: bool,
 }
 
 /// A registry person plus when they were last in a meeting — what the profiles
@@ -103,49 +102,9 @@ pub struct SpeakerListRow {
     pub speaker: SpeakerRow,
     pub created_at: DateTime<Utc>,
     /// The newest meeting this person is linked to; `None` if they have never
-    /// been seen in one (a profile created by hand, or only just enrolled).
+    /// been seen in one (a profile created by hand).
     pub last_seen: Option<DateTime<Utc>>,
 }
-
-/// One stored voice embedding for a registry speaker. `slot` is set (1..=3)
-/// for user-recorded enrollment clips; learned refs (from confirmed matches)
-/// have no slot and are pruned oldest-first past [`MAX_LEARNED_REFS`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct VoiceRef {
-    pub id: i64,
-    pub speaker_id: String,
-    pub kind: VoiceRefKind,
-    pub slot: Option<u32>,
-    pub embedding: Vec<f32>,
-    /// Storage-relative path of the enrollment clip, when one was kept.
-    pub clip_path: Option<String>,
-    pub source_meeting_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoiceRefKind {
-    Enrolled,
-    Learned,
-}
-
-impl VoiceRefKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            VoiceRefKind::Enrolled => "enrolled",
-            VoiceRefKind::Learned => "learned",
-        }
-    }
-    fn parse(s: &str) -> VoiceRefKind {
-        match s {
-            "enrolled" => VoiceRefKind::Enrolled,
-            _ => VoiceRefKind::Learned,
-        }
-    }
-}
-
-/// Learned (non-enrolled) voice refs kept per speaker; older ones are pruned
-/// so the reference set tracks how someone sounds *lately*.
-pub const MAX_LEARNED_REFS: usize = 10;
 
 /// One saved dictation.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -159,7 +118,8 @@ pub struct DictationRow {
     pub created_at: String,
 }
 
-/// f32 slice → little-endian bytes for BLOB storage.
+/// f32 slice → little-endian bytes for BLOB storage — the wire format
+/// sqlite-vec's `vec0` tables take (embral-search's vector store).
 pub fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -427,14 +387,13 @@ impl Db {
     pub fn upsert_speaker(&self, s: &SpeakerRow) -> Result<()> {
         let now = rfc3339(&Utc::now());
         self.lock().execute(
-            "INSERT INTO speakers (id, name, notes, is_you, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            "INSERT INTO speakers (id, name, notes, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
                notes = excluded.notes,
-               is_you = excluded.is_you,
                updated_at = excluded.updated_at",
-            params![s.id, s.name, s.notes, s.is_you as i64, now],
+            params![s.id, s.name, s.notes, now],
         )?;
         Ok(())
     }
@@ -442,7 +401,7 @@ impl Db {
     pub fn get_speaker(&self, id: &str) -> Result<Option<SpeakerRow>> {
         self.lock()
             .query_row(
-                "SELECT id, name, notes, is_you FROM speakers WHERE id = ?1",
+                "SELECT id, name, notes FROM speakers WHERE id = ?1",
                 params![id],
                 row_to_speaker,
             )
@@ -454,8 +413,8 @@ impl Db {
     pub fn list_speakers(&self) -> Result<Vec<SpeakerRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, name, notes, is_you FROM speakers
-             ORDER BY is_you DESC, name COLLATE NOCASE",
+            "SELECT id, name, notes FROM speakers
+             ORDER BY name COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([], row_to_speaker)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -478,7 +437,7 @@ impl Db {
     fn speakers_by_activity(&self, only: Option<&str>) -> Result<Vec<SpeakerListRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.name, s.notes, s.is_you, s.created_at,
+            "SELECT s.id, s.name, s.notes, s.created_at,
                     (SELECT MAX(m.started_at)
                        FROM segments seg
                        JOIN meetings m ON m.id = seg.meeting_id
@@ -495,10 +454,9 @@ impl Db {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     notes: row.get(2)?,
-                    is_you: row.get::<_, i64>(3)? != 0,
                 },
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
 
@@ -514,21 +472,8 @@ impl Db {
         Ok(out)
     }
 
-    /// The registry speaker marked as the user, if one exists.
-    pub fn you_speaker(&self) -> Result<Option<SpeakerRow>> {
-        self.lock()
-            .query_row(
-                "SELECT id, name, notes, is_you FROM speakers
-                 WHERE is_you = 1 LIMIT 1",
-                [],
-                row_to_speaker,
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    /// Delete a speaker. Their voice refs cascade; segments keep their text
-    /// label but lose the registry link.
+    /// Delete a speaker. Segments keep their text label but lose the
+    /// registry link.
     pub fn delete_speaker(&self, id: &str) -> Result<bool> {
         let conn = self.lock();
         conn.execute(
@@ -575,107 +520,28 @@ impl Db {
         Ok(n)
     }
 
-    // --- Voice references ---
+    // --- Pending name suggestions (from the user's typed notes) ---
 
-    /// Store a voice embedding. An enrolled ref replaces any existing ref in
-    /// the same slot; a learned ref is appended and the speaker's learned set
-    /// is pruned oldest-first to [`MAX_LEARNED_REFS`]. Returns the new row id;
-    /// any replaced enrolled clip's path is handed back for file cleanup.
-    pub fn add_voice_ref(
-        &self,
-        speaker_id: &str,
-        kind: VoiceRefKind,
-        slot: Option<u32>,
-        embedding: &[f32],
-        clip_path: Option<&str>,
-        source_meeting_id: Option<&str>,
-    ) -> Result<(i64, Vec<String>)> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let mut removed_clips: Vec<String> = Vec::new();
-
-        if kind == VoiceRefKind::Enrolled {
-            let mut stmt = tx.prepare(
-                "SELECT clip_path FROM voice_refs
-                 WHERE speaker_id = ?1 AND kind = 'enrolled' AND slot = ?2",
-            )?;
-            let old: Vec<Option<String>> = stmt
-                .query_map(params![speaker_id, slot], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            drop(stmt);
-            removed_clips.extend(old.into_iter().flatten());
-            tx.execute(
-                "DELETE FROM voice_refs
-                 WHERE speaker_id = ?1 AND kind = 'enrolled' AND slot = ?2",
-                params![speaker_id, slot],
-            )?;
-        }
-
-        tx.execute(
-            "INSERT INTO voice_refs (speaker_id, kind, slot, embedding, dim,
-                                     clip_path, source_meeting_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                speaker_id,
-                kind.as_str(),
-                slot,
-                embedding_to_blob(embedding),
-                embedding.len() as i64,
-                clip_path,
-                source_meeting_id,
-                rfc3339(&Utc::now()),
-            ],
+    /// Persist a meeting's pending name suggestions (a JSON array; `[]`
+    /// clears them).
+    pub fn set_name_suggestions(&self, meeting_id: &str, json: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE meetings SET name_suggestions = ?2 WHERE id = ?1",
+            params![meeting_id, json],
         )?;
-        let id = tx.last_insert_rowid();
-
-        if kind == VoiceRefKind::Learned {
-            tx.execute(
-                "DELETE FROM voice_refs
-                 WHERE speaker_id = ?1 AND kind = 'learned' AND id NOT IN (
-                     SELECT id FROM voice_refs
-                     WHERE speaker_id = ?1 AND kind = 'learned'
-                     ORDER BY id DESC LIMIT ?2
-                 )",
-                params![speaker_id, MAX_LEARNED_REFS as i64],
-            )?;
-        }
-        tx.commit()?;
-        Ok((id, removed_clips))
+        Ok(())
     }
 
-    /// One speaker's refs, newest first (insertion order ≈ recency).
-    pub fn list_voice_refs(&self, speaker_id: &str) -> Result<Vec<VoiceRef>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {VOICE_REF_COLS} FROM voice_refs
-             WHERE speaker_id = ?1 ORDER BY id DESC"
-        ))?;
-        let rows = stmt.query_map(params![speaker_id], row_to_voice_ref)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
-
-    /// Every stored ref, newest first per speaker — the matcher's input.
-    pub fn all_voice_refs(&self) -> Result<Vec<VoiceRef>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {VOICE_REF_COLS} FROM voice_refs ORDER BY speaker_id, id DESC"
-        ))?;
-        let rows = stmt.query_map([], row_to_voice_ref)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
-
-    /// Delete one voice ref; returns its clip path (if any) for file cleanup.
-    pub fn delete_voice_ref(&self, id: i64) -> Result<Option<String>> {
-        let conn = self.lock();
-        let clip: Option<Option<String>> = conn
+    pub fn get_name_suggestions(&self, meeting_id: &str) -> Result<String> {
+        Ok(self
+            .lock()
             .query_row(
-                "SELECT clip_path FROM voice_refs WHERE id = ?1",
-                params![id],
+                "SELECT name_suggestions FROM meetings WHERE id = ?1",
+                params![meeting_id],
                 |r| r.get(0),
             )
-            .optional()?;
-        conn.execute("DELETE FROM voice_refs WHERE id = ?1", params![id])?;
-        Ok(clip.flatten())
+            .optional()?
+            .unwrap_or_else(|| "[]".to_string()))
     }
 
     // --- Stars ---
@@ -791,24 +657,16 @@ impl Db {
         Ok(self.lock().execute("DELETE FROM meetings", [])?)
     }
 
-    /// Delete every speaker profile (voice refs cascade); segments keep
-    /// their text labels but lose the registry links, same rule as
-    /// [`Self::delete_speaker`]. Returns the voice-clip paths so the caller
-    /// can remove the files.
-    pub fn clear_speakers(&self) -> Result<Vec<String>> {
+    /// Delete every speaker profile; segments keep their text labels but
+    /// lose the registry links, same rule as [`Self::delete_speaker`].
+    pub fn clear_speakers(&self) -> Result<()> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT clip_path FROM voice_refs WHERE clip_path IS NOT NULL")?;
-        let clips: Vec<String> = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
         conn.execute(
             "UPDATE segments SET speaker_id = NULL WHERE speaker_id IS NOT NULL",
             [],
         )?;
         conn.execute("DELETE FROM speakers", [])?;
-        Ok(clips)
+        Ok(())
     }
 
     /// Delete the whole dictation history. Returns rows removed.
@@ -830,57 +688,16 @@ impl Db {
         Ok(n)
     }
 
-    // --- Speaker suggestions ---
-
-    /// Persist the pending match suggestions for a meeting (a JSON array;
-    /// `[]` clears them).
-    pub fn set_speaker_suggestions(&self, meeting_id: &str, json: &str) -> Result<()> {
-        self.lock().execute(
-            "UPDATE meetings SET speaker_suggestions = ?2 WHERE id = ?1",
-            params![meeting_id, json],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_speaker_suggestions(&self, meeting_id: &str) -> Result<String> {
-        Ok(self
-            .lock()
-            .query_row(
-                "SELECT speaker_suggestions FROM meetings WHERE id = ?1",
-                params![meeting_id],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or_else(|| "[]".to_string()))
-    }
-
 }
 
 const MEETING_COLS: &str = "id, title, started_at, duration_seconds, notes_md, transcript_md,
                             attendees, audio_path, notes_path, transcript_path";
-
-const VOICE_REF_COLS: &str =
-    "id, speaker_id, kind, slot, embedding, clip_path, source_meeting_id";
 
 fn row_to_speaker(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpeakerRow> {
     Ok(SpeakerRow {
         id: row.get(0)?,
         name: row.get(1)?,
         notes: row.get(2)?,
-        is_you: row.get::<_, i64>(3)? != 0,
-    })
-}
-
-fn row_to_voice_ref(row: &rusqlite::Row<'_>) -> rusqlite::Result<VoiceRef> {
-    let blob: Vec<u8> = row.get(4)?;
-    Ok(VoiceRef {
-        id: row.get(0)?,
-        speaker_id: row.get(1)?,
-        kind: VoiceRefKind::parse(&row.get::<_, String>(2)?),
-        slot: row.get(3)?,
-        embedding: blob_to_embedding(&blob),
-        clip_path: row.get(5)?,
-        source_meeting_id: row.get(6)?,
     })
 }
 
@@ -1029,9 +846,9 @@ mod tests {
     #[test]
     fn speakers_are_ordered_by_their_last_meeting() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_speaker(&mk_speaker("sp_a", "Alice", false)).unwrap();
-        db.upsert_speaker(&mk_speaker("sp_b", "Bob", false)).unwrap();
-        db.upsert_speaker(&mk_speaker("sp_c", "Never Seen", false)).unwrap();
+        db.upsert_speaker(&mk_speaker("sp_a", "Alice")).unwrap();
+        db.upsert_speaker(&mk_speaker("sp_b", "Bob")).unwrap();
+        db.upsert_speaker(&mk_speaker("sp_c", "Never Seen")).unwrap();
 
         // Alice speaks in the older meeting, Bob in both — so Bob is the more
         // recent of the two, even though Alice also appears in the newest one's
@@ -1078,12 +895,11 @@ mod tests {
         assert_eq!(db.meeting_count().unwrap(), 2);
     }
 
-    fn mk_speaker(id: &str, name: &str, is_you: bool) -> SpeakerRow {
+    fn mk_speaker(id: &str, name: &str) -> SpeakerRow {
         SpeakerRow {
             id: id.to_string(),
             name: name.to_string(),
             notes: String::new(),
-            is_you,
         }
     }
 
@@ -1100,18 +916,17 @@ mod tests {
     #[test]
     fn speakers_crud_roundtrip() {
         let db = Db::open_in_memory().unwrap();
-        let alice = mk_speaker("sp-a", "Alice", false);
-        let you = mk_speaker("sp-you", "Me", true);
+        let alice = mk_speaker("sp-a", "Alice");
+        let bob = mk_speaker("sp-b", "bob");
         db.upsert_speaker(&alice).unwrap();
-        db.upsert_speaker(&you).unwrap();
+        db.upsert_speaker(&bob).unwrap();
 
         assert_eq!(db.get_speaker("sp-a").unwrap().unwrap(), alice);
-        assert_eq!(db.you_speaker().unwrap().unwrap().id, "sp-you");
-        // "you" sorts first, then names.
+        // Ordered by name, case-insensitively.
         let all = db.list_speakers().unwrap();
         assert_eq!(
             all.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
-            vec!["sp-you", "sp-a"]
+            vec!["sp-a", "sp-b"]
         );
 
         let mut renamed = alice.clone();
@@ -1125,92 +940,17 @@ mod tests {
     }
 
     #[test]
-    fn delete_speaker_unlinks_segments_and_cascades_refs() {
+    fn delete_speaker_unlinks_segments() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_meeting(&mk("m1", "T", 1, "", "")).unwrap();
-        db.upsert_speaker(&mk_speaker("sp-a", "Alice", false)).unwrap();
+        db.upsert_speaker(&mk_speaker("sp-a", "Alice")).unwrap();
         db.replace_segments("m1", &[seg(Some("Alice"), Some("sp-a"), 0.0)])
-            .unwrap();
-        db.add_voice_ref("sp-a", VoiceRefKind::Learned, None, &[0.1, 0.2], None, None)
             .unwrap();
 
         db.delete_speaker("sp-a").unwrap();
         let got = db.get_segments("m1").unwrap();
         assert_eq!(got[0].speaker.as_deref(), Some("Alice")); // label survives
         assert_eq!(got[0].speaker_id, None); // link cleared
-        assert!(db.list_voice_refs("sp-a").unwrap().is_empty());
-    }
-
-    #[test]
-    fn voice_refs_roundtrip_slots_and_pruning() {
-        let db = Db::open_in_memory().unwrap();
-        db.upsert_speaker(&mk_speaker("sp-a", "Alice", false)).unwrap();
-
-        // Enrolled slot 1, then re-record it: the old ref is replaced and its
-        // clip path returned for cleanup.
-        db.add_voice_ref(
-            "sp-a",
-            VoiceRefKind::Enrolled,
-            Some(1),
-            &[1.0, 0.0],
-            Some("voices/old.wav"),
-            None,
-        )
-        .unwrap();
-        let (_, removed) = db
-            .add_voice_ref(
-                "sp-a",
-                VoiceRefKind::Enrolled,
-                Some(1),
-                &[0.0, 1.0],
-                Some("voices/new.wav"),
-                None,
-            )
-            .unwrap();
-        assert_eq!(removed, vec!["voices/old.wav".to_string()]);
-
-        // Learned refs prune oldest-first past the cap.
-        for i in 0..(MAX_LEARNED_REFS + 3) {
-            db.add_voice_ref(
-                "sp-a",
-                VoiceRefKind::Learned,
-                None,
-                &[i as f32, 0.5],
-                None,
-                Some("m1"),
-            )
-            .unwrap();
-        }
-        let refs = db.list_voice_refs("sp-a").unwrap();
-        let learned: Vec<_> = refs
-            .iter()
-            .filter(|r| r.kind == VoiceRefKind::Learned)
-            .collect();
-        assert_eq!(learned.len(), MAX_LEARNED_REFS);
-        // Newest first; the earliest three embeddings are gone.
-        assert_eq!(learned[0].embedding[0], (MAX_LEARNED_REFS + 2) as f32);
-        assert!(learned.iter().all(|r| r.embedding[0] >= 3.0));
-        // The enrolled slot survives pruning.
-        assert_eq!(
-            refs.iter()
-                .filter(|r| r.kind == VoiceRefKind::Enrolled)
-                .count(),
-            1
-        );
-
-        // Embedding bytes roundtrip exactly.
-        let enrolled = refs
-            .iter()
-            .find(|r| r.kind == VoiceRefKind::Enrolled)
-            .unwrap();
-        assert_eq!(enrolled.embedding, vec![0.0, 1.0]);
-        assert_eq!(enrolled.clip_path.as_deref(), Some("voices/new.wav"));
-
-        // Delete returns the clip path.
-        assert_eq!(
-            db.delete_voice_ref(enrolled.id).unwrap().as_deref(),
-            Some("voices/new.wav")
-        );
     }
 
     #[test]
@@ -1218,7 +958,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.upsert_meeting(&mk("m1", "A", 1, "", "")).unwrap();
         db.upsert_meeting(&mk("m2", "B", 2, "", "")).unwrap();
-        db.upsert_speaker(&mk_speaker("sp-a", "Alice", false)).unwrap();
+        db.upsert_speaker(&mk_speaker("sp-a", "Alice")).unwrap();
 
         db.replace_segments(
             "m1",
@@ -1255,18 +995,18 @@ mod tests {
     }
 
     #[test]
-    fn speaker_suggestions_roundtrip() {
+    fn name_suggestions_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_meeting(&mk("m1", "T", 1, "", "")).unwrap();
-        assert_eq!(db.get_speaker_suggestions("m1").unwrap(), "[]");
-        db.set_speaker_suggestions("m1", r#"[{"label":"Speaker 1"}]"#)
+        assert_eq!(db.get_name_suggestions("m1").unwrap(), "[]");
+        db.set_name_suggestions("m1", r#"[{"label":"Speaker 1","name":"John"}]"#)
             .unwrap();
         assert_eq!(
-            db.get_speaker_suggestions("m1").unwrap(),
-            r#"[{"label":"Speaker 1"}]"#
+            db.get_name_suggestions("m1").unwrap(),
+            r#"[{"label":"Speaker 1","name":"John"}]"#
         );
         // Unknown meeting reads as empty, not an error.
-        assert_eq!(db.get_speaker_suggestions("nope").unwrap(), "[]");
+        assert_eq!(db.get_name_suggestions("nope").unwrap(), "[]");
     }
 
     #[test]
@@ -1278,7 +1018,7 @@ mod tests {
             db.upsert_meeting(&mk("m1", "T", 1, "", "")).unwrap();
         }
         let db = Db::open(&path).unwrap();
-        db.upsert_speaker(&mk_speaker("sp-a", "Alice", false)).unwrap();
+        db.upsert_speaker(&mk_speaker("sp-a", "Alice")).unwrap();
         assert_eq!(db.list_speakers().unwrap().len(), 1);
     }
 
@@ -1559,17 +1299,11 @@ mod tests {
     fn clears_scope_exactly_their_own_table() {
         let db = Db::open_in_memory().unwrap();
 
-        // One of everything: a meeting with a segment linked to a speaker
-        // with a voice ref, and a dictation.
+        // One of everything: a meeting with a segment linked to a speaker,
+        // and a dictation.
         db.upsert_meeting(&mk("m1", "Reset drill", 1, "# Notes", "body"))
             .unwrap();
-        db.upsert_speaker(&SpeakerRow {
-            id: "sp1".into(),
-            name: "Ada".into(),
-            notes: String::new(),
-            is_you: false,
-        })
-        .unwrap();
+        db.upsert_speaker(&mk_speaker("sp1", "Ada")).unwrap();
         db.replace_segments(
             "m1",
             &[embral_types::TranscriptionSegment {
@@ -1581,15 +1315,6 @@ mod tests {
             }],
         )
         .unwrap();
-        db.add_voice_ref(
-            "sp1",
-            VoiceRefKind::Enrolled,
-            Some(1),
-            &[0.5f32],
-            Some("voices/sp1_1.mp3"),
-            None,
-        )
-        .unwrap();
         db.add_dictation("raw", None, None).unwrap();
 
         // Dictations go alone.
@@ -1597,10 +1322,8 @@ mod tests {
         assert!(db.list_dictations(10).unwrap().is_empty());
         assert_eq!(db.list_meetings(None, None).unwrap().len(), 1);
 
-        // Speakers go with their refs (clip paths surfaced for cleanup);
-        // the meeting's segments keep their text label.
-        let clips = db.clear_speakers().unwrap();
-        assert_eq!(clips, vec!["voices/sp1_1.mp3".to_string()]);
+        // Speakers go; the meeting's segments keep their text label.
+        db.clear_speakers().unwrap();
         assert!(db.list_speakers().unwrap().is_empty());
         let segs = db.get_segments("m1").unwrap();
         assert_eq!(segs[0].speaker.as_deref(), Some("Ada"));

@@ -1,326 +1,187 @@
 <script lang="ts">
+    // The wizard shell: assembles the step list (cloud builds insert an
+    // account step at index 1 when signed out), renders the dots and nav,
+    // and owns the draft. The draft is an overlay of only the fields
+    // onboarding touches — finish() re-loads config before saving so
+    // anything the cloud seam changed mid-wizard (provider adoption on
+    // sign-in) survives ([shell.md](../../../../docs/shell.md)).
     import { onMount } from "svelte";
-    import { Mic, Volume2, Check } from "lucide-svelte";
-    import type { AutoStartPolicy } from "$lib/types";
+    import type { Component } from "svelte";
+    import { invoke } from "@tauri-apps/api/core";
     import { configStore } from "$lib/stores/config.svelte";
     import { modelsStore } from "$lib/stores/models.svelte";
-    import { speakersStore } from "$lib/stores/speakers.svelte";
+    import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
+    import {
+        CLOUD_ENABLED,
+        loadOnboardingAccountStep,
+        loadOnboardingPlansStep,
+    } from "$lib/cloud";
     import { Button } from "$lib/components/ui/button";
-    import { Input } from "$lib/components/ui/input";
     import EmbralIcon from "$lib/components/EmbralIcon.svelte";
-    import { formatBytes } from "$lib/utils/bytes";
     import { cn } from "$lib/utils";
+    import DownloadFooter from "./DownloadFooter.svelte";
+    import WelcomeStep from "./steps/WelcomeStep.svelte";
+    import ModelsStep from "./steps/ModelsStep.svelte";
+    import MeetingsStep from "./steps/MeetingsStep.svelte";
+    import DictationStep from "./steps/DictationStep.svelte";
+    import McpStep from "./steps/McpStep.svelte";
+    import ExportStep from "./steps/ExportStep.svelte";
+    import { draftFrom, type OnboardingDraft } from "./types";
 
     let step = $state(0);
-    const stepCount = 5;
 
-    let selectedModel = $state("zipformer-en");
-    let policyChoice = $state<AutoStartPolicy>("prompt");
-    let notesChoice = $state<"none" | "builtin">("none");
-    let userName = $state("");
+    // Each step carries its telemetry name ([telemetry.md]
+    // onboarding_step_viewed) beside its component.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    type Step = { name: string; component: Component<any> };
+    let steps = $state<Step[]>([
+        { name: "welcome", component: WelcomeStep },
+        { name: "models", component: ModelsStep },
+        { name: "meetings", component: MeetingsStep },
+        { name: "dictation", component: DictationStep },
+        { name: "mcp", component: McpStep },
+        { name: "export", component: ExportStep },
+    ]);
+
+    // Seeded once at mount; the config is loaded before onboarding renders
+    // (the +page gate reads it), so this is never null in practice.
+    let draft = $state<OnboardingDraft>(
+        draftFrom(configStore.config!),
+    );
+
+    // Steps that carry their own forward buttons (the cloud fork pages):
+    // the footer's Continue hides on them — a generic Continue beside
+    // "Sign in / Use offline only" or "Set up local models / Use cloud
+    // only" is a third, ambiguous way forward.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let selfNavigating = $state<Set<Component<any>>>(new Set());
 
     onMount(() => {
-        modelsStore.refresh();
+        void modelsStore.refresh();
+        // Cloud builds get an account step and a plans page after the
+        // welcome, signed in or not — the account step itself renders a
+        // signed-in state (Continue / Sign out) instead of the form.
+        if (CLOUD_ENABLED) {
+            void (async () => {
+                await cloudAuth.refresh();
+                const [AccountStep, PlansStep] = await Promise.all([
+                    loadOnboardingAccountStep(),
+                    loadOnboardingPlansStep(),
+                ]);
+                if (!AccountStep || !PlansStep || step !== 0) return;
+                selfNavigating = new Set([AccountStep, PlansStep]);
+                steps = [
+                    steps[0],
+                    { name: "account", component: AccountStep },
+                    { name: "plans", component: PlansStep },
+                    ...steps.slice(1),
+                ];
+            })();
+        }
     });
 
-    let asrModels = $derived(
-        modelsStore.statuses.filter((m) => m.kind === "streaming_asr"),
-    );
-    let selected = $derived(modelsStore.status(selectedModel));
-    let punctModel = $derived(
-        modelsStore.statuses.find((m) => m.kind === "punctuation"),
-    );
-    let downloading = $derived(
-        modelsStore.isDownloading(selectedModel) ||
-            (punctModel ? modelsStore.isDownloading(punctModel.id) : false),
-    );
+    // The completion mode ([telemetry.md]): recorded at the cloud forks —
+    // declining an account or never seeing one is offline; the plans page
+    // decides cloud_only (skips local models) vs cloud_and_local.
+    let mode = "offline";
 
-
-    async function downloadSelected() {
-        // The Zipformers want the punctuation model alongside; NeMo-family
-        // models punctuate natively.
-        const jobs = [modelsStore.download(selectedModel)];
-        if (selected && !selected.native_punctuation && punctModel && !punctModel.present) {
-            jobs.push(modelsStore.download(punctModel.id));
-        }
-        await Promise.all(jobs);
+    function advance(skip?: number) {
+        const name = steps[step]?.name;
+        if (name === "plans") mode = skip ? "cloud_only" : "cloud_and_local";
+        step += 1 + (skip ?? 0);
     }
 
-    let downloadPct = $derived.by(() => {
-        const main = modelsStore.fraction(selectedModel);
-        return main == null ? null : Math.round(main * 100);
+    // One onboarding_step_viewed per page shown (a population-level funnel;
+    // the guard also absorbs the cloud steps splicing re-running the effect
+    // on the same page). Telemetry is cloud-edition only — the command
+    // doesn't exist offline ([telemetry.md]).
+    let lastViewed = "";
+    $effect(() => {
+        const name = steps[step]?.name;
+        if (!CLOUD_ENABLED || !name || name === lastViewed) return;
+        lastViewed = name;
+        void invoke("telemetry_track", {
+            name: "onboarding_step_viewed",
+            props: { step: name },
+        }).catch(() => {});
     });
 
-    async function finish() {
+    async function finish(skipped: boolean) {
+        // Re-load before saving: the base config may have moved under the
+        // wizard (cloud sign-in adopts providers backend-side).
+        await configStore.load();
         const cfg = configStore.config;
         if (!cfg) return;
-        // The name creates the "you" profile in the speaker registry — the
-        // dominance prior and voice matching hang identity off it.
-        const name = userName.trim();
-        if (name) {
-            await speakersStore.save({
-                name,
-                notes: "",
-                is_you: true,
-            });
-        }
         await configStore.save({
             ...cfg,
+            ...draft,
             onboarding_completed: true,
-            local_asr_model: selectedModel,
-            // Local transcription is the default story; cloud providers can be
-            // picked in Settings any time.
-            transcription_provider: "local",
-            auto_start_policy: policyChoice,
-            // The engine stays at its default; this step is the on/off.
-            summaries_enabled: notesChoice === "builtin",
         });
+        if (CLOUD_ENABLED) {
+            void invoke("telemetry_track", {
+                name: "onboarding_completed",
+                props: { mode, skipped },
+            }).catch(() => {});
+        }
     }
 
-    let builtinLlm = $derived(modelsStore.status("qwen3-4b"));
-    let llmRuntime = $derived(modelsStore.status("llama-server"));
-    let builtinReady = $derived(
-        (builtinLlm?.present ?? false) && (llmRuntime?.present ?? false),
-    );
-    let builtinDownloading = $derived(
-        modelsStore.isDownloading("qwen3-4b") || modelsStore.isDownloading("llama-server"),
-    );
-    let builtinPct = $derived.by(() => {
-        const f = modelsStore.fraction("qwen3-4b");
-        return f == null ? null : Math.round(f * 100);
-    });
-
-    function downloadBuiltin() {
-        void Promise.all([
-            modelsStore.download("llama-server"),
-            modelsStore.download("qwen3-4b"),
-        ]);
-    }
-
-    const policyOptions: { id: AutoStartPolicy; title: string; body: string }[] = [
-        {
-            id: "always",
-            title: "Automatically",
-            body: "embral watches for calls and starts recording on its own.",
-        },
-        {
-            id: "prompt",
-            title: "Ask first",
-            body: "embral notices the call and asks if you want to record it.",
-        },
-        {
-            id: "manual",
-            title: "Never",
-            body: "Nothing records until you press the record button.",
-        },
-    ];
-
-    const notesOptions: {
-        id: "none" | "builtin";
-        title: string;
-        body: string;
-    }[] = [
-        {
-            id: "builtin",
-            title: "On this computer — no setup needed",
-            body: "A bundled model (Qwen3 4B, ~2.5 GB download) writes summaries fully privately.",
-        },
-        {
-            id: "none",
-            title: "Not for now",
-            body: "Turn it on later in Settings. Meetings still get full transcripts.",
-        },
-    ];
+    let Current = $derived(steps[step].component);
+    let hideContinue = $derived(selfNavigating.has(Current));
 </script>
 
-<div class="fixed inset-0 z-50 flex items-center justify-center bg-background">
-    <div class="flex w-full max-w-xl flex-col px-8">
-        <div class="mb-8 flex items-center gap-2">
+<!-- Pinned header and footer with the step scrolling between them: the
+     nav sits in the same place on every page, whatever the content
+     height ([shell.md](../../../../docs/shell.md)). -->
+<div class="fixed inset-0 z-50 flex flex-col bg-background">
+    <div class="mx-auto flex h-full w-full max-w-xl flex-col px-8">
+        <div class="flex shrink-0 items-center gap-2 pt-10 pb-8">
             <EmbralIcon size={20} />
             <span class="text-base font-semibold tracking-tight">embral</span>
         </div>
 
-        {#if step === 0}
-            <h1 class="font-display text-2xl tracking-tight">Welcome to embral</h1>
-            <p class="mt-3 text-sm text-muted-foreground">
-                To transcribe your meetings, embral listens to two things at once:
-            </p>
-            <div class="mt-6 space-y-4">
-                <div class="flex items-start gap-3">
-                    <Mic size={18} class="mt-0.5 shrink-0 text-primary" />
-                    <div>
-                        <p class="text-sm font-medium">Microphone</p>
-                        <p class="text-xs text-muted-foreground">Your voice during calls.</p>
-                    </div>
+        <div class="min-h-0 flex-1 overflow-y-auto pb-4">
+            <!-- Steps may skip ahead: advance(1) hops over the next step
+                 (declining an account skips the plans page; "use cloud
+                 only" skips the local models page). -->
+            <Current {draft} {advance} />
+        </div>
+
+        <div class="shrink-0 pt-4 pb-8">
+            <DownloadFooter />
+
+            <div class="mt-4 flex items-center justify-between">
+                <div class="flex gap-1.5">
+                    {#each steps as _, i (i)}
+                        <span
+                            class={cn(
+                                "h-1.5 w-1.5 rounded-full",
+                                i === step ? "bg-primary" : "bg-muted",
+                            )}
+                        ></span>
+                    {/each}
                 </div>
-                <div class="flex items-start gap-3">
-                    <Volume2 size={18} class="mt-0.5 shrink-0 text-primary" />
-                    <div>
-                        <p class="text-sm font-medium">System audio</p>
-                        <p class="text-xs text-muted-foreground">
-                            Everyone else on the call — even with headphones in.
-                        </p>
-                    </div>
-                </div>
-            </div>
-            <p class="mt-6 text-xs text-muted-foreground">
-                With local transcription, audio never leaves your computer.
-            </p>
-        {:else if step === 1}
-            <h1 class="font-display text-2xl tracking-tight">Pick a speech model</h1>
-            <p class="mt-3 text-sm text-muted-foreground">
-                Runs on this computer. You can switch models any time in Settings.
-            </p>
-            <div class="mt-6 space-y-2">
-                {#each asrModels as m (m.id)}
-                    <button
-                        class={cn(
-                            "w-full rounded-lg border p-3 text-left transition-colors hover:bg-accent/50",
-                            selectedModel === m.id
-                                ? "border-primary ring-1 ring-primary"
-                                : "border-border",
-                        )}
-                        onclick={() => (selectedModel = m.id)}
-                    >
-                        <div class="flex items-center justify-between">
-                            <span class="text-sm font-medium">{m.display_name}</span>
-                            <span class="text-xs text-muted-foreground">
-                                {m.present ? "Downloaded" : `~${formatBytes(m.total_bytes)}`}
-                            </span>
-                        </div>
-                        <p class="mt-0.5 text-xs text-muted-foreground">{m.note}</p>
-                    </button>
-                {/each}
-            </div>
-            <div class="mt-4">
-                {#if selected?.present}
-                    <p class="flex items-center gap-1.5 text-sm text-primary">
-                        <Check size={15} /> Ready to transcribe locally.
-                    </p>
-                {:else if downloading}
-                    <div class="space-y-1.5">
-                        <div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                            <div
-                                class="h-full bg-primary transition-all duration-300"
-                                style="width: {downloadPct ?? 0}%"
-                            ></div>
-                        </div>
-                        <p class="text-xs text-muted-foreground">
-                            Downloading… {downloadPct ?? 0}%
-                        </p>
-                    </div>
-                {:else}
-                    <Button size="sm" onclick={downloadSelected}>Download model</Button>
-                {/if}
-            </div>
-        {:else if step === 2}
-            <h1 class="font-display text-2xl tracking-tight">
-                When should embral start recording?
-            </h1>
-            <p class="mt-3 text-sm text-muted-foreground">
-                Choose how hands-on you want to be. You can fine-tune this — and
-                which apps count — in Settings.
-            </p>
-            <div class="mt-6 space-y-2">
-                {#each policyOptions as option (option.id)}
-                    <button
-                        class={cn(
-                            "w-full rounded-lg border p-3 text-left transition-colors hover:bg-accent/50",
-                            policyChoice === option.id
-                                ? "border-primary ring-1 ring-primary"
-                                : "border-border",
-                        )}
-                        onclick={() => (policyChoice = option.id)}
-                    >
-                        <p class="text-sm font-medium">{option.title}</p>
-                        <p class="mt-0.5 text-xs text-muted-foreground">{option.body}</p>
-                    </button>
-                {/each}
-            </div>
-        {:else if step === 3}
-            <h1 class="font-display text-2xl tracking-tight">Summarize every meeting?</h1>
-            <p class="mt-3 text-sm text-muted-foreground">
-                embral can write structured notes when a meeting ends — key
-                takeaways, next steps, and topic sections.
-            </p>
-            <div class="mt-6 space-y-2">
-                {#each notesOptions as option (option.id)}
-                    <button
-                        class={cn(
-                            "w-full rounded-lg border p-3 text-left transition-colors hover:bg-accent/50",
-                            notesChoice === option.id
-                                ? "border-primary ring-1 ring-primary"
-                                : "border-border",
-                        )}
-                        onclick={() => (notesChoice = option.id)}
-                    >
-                        <p class="text-sm font-medium">{option.title}</p>
-                        <p class="mt-0.5 text-xs text-muted-foreground">{option.body}</p>
-                    </button>
-                {/each}
-            </div>
-            {#if notesChoice === "builtin"}
-                <div class="mt-4">
-                    {#if builtinReady}
-                        <p class="flex items-center gap-1.5 text-sm text-primary">
-                            <Check size={15} /> Ready to summarize on this computer.
-                        </p>
-                    {:else if builtinDownloading}
-                        <div class="space-y-1.5">
-                            <div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                                <div
-                                    class="h-full bg-primary transition-all duration-300"
-                                    style="width: {builtinPct ?? 0}%"
-                                ></div>
-                            </div>
-                            <p class="text-xs text-muted-foreground">
-                                Downloading… {builtinPct ?? 0}% — you can keep going,
-                                it finishes in the background.
-                            </p>
-                        </div>
-                    {:else}
-                        <Button size="sm" onclick={downloadBuiltin}>
-                            Download the model (~2.5 GB)
+                <div class="flex items-center gap-2">
+                    {#if step > 0}
+                        <Button variant="ghost" size="sm" onclick={() => step--}>Back</Button>
+                    {/if}
+                    <Button variant="ghost" size="sm" onclick={() => finish(true)}>Skip setup</Button>
+                    {#if step < steps.length - 1}
+                        <!-- Invisible, not absent, on self-navigating steps:
+                             the slot keeps its width so Back and Skip setup
+                             sit in the same place on every page. -->
+                        <Button
+                            size="sm"
+                            class={hideContinue ? "invisible" : ""}
+                            aria-hidden={hideContinue}
+                            tabindex={hideContinue ? -1 : undefined}
+                            onclick={() => step++}
+                        >
+                            Continue
                         </Button>
+                    {:else}
+                        <Button size="sm" onclick={() => finish(false)}>Finish</Button>
                     {/if}
                 </div>
-            {/if}
-        {:else}
-            <h1 class="font-display text-2xl tracking-tight">What should we call you?</h1>
-            <p class="mt-3 text-sm text-muted-foreground">
-                Used in your transcripts and summaries. It stays on your computer.
-            </p>
-            <Input
-                bind:value={userName}
-                placeholder="Your name"
-                class="mt-6 max-w-sm"
-                onkeydown={(e) => {
-                    if (e.key === "Enter") void finish();
-                }}
-            />
-        {/if}
-
-        <div class="mt-10 flex items-center justify-between">
-            <div class="flex gap-1.5">
-                {#each Array(stepCount) as _, i (i)}
-                    <span
-                        class={cn(
-                            "h-1.5 w-1.5 rounded-full",
-                            i === step ? "bg-primary" : "bg-muted",
-                        )}
-                    ></span>
-                {/each}
-            </div>
-            <div class="flex items-center gap-2">
-                {#if step > 0}
-                    <Button variant="ghost" size="sm" onclick={() => step--}>Back</Button>
-                {/if}
-                <Button variant="ghost" size="sm" onclick={finish}>Skip setup</Button>
-                {#if step < stepCount - 1}
-                    <Button size="sm" onclick={() => step++}>Continue</Button>
-                {:else}
-                    <Button size="sm" onclick={finish}>Finish</Button>
-                {/if}
             </div>
         </div>
     </div>

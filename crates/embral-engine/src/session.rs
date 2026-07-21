@@ -33,6 +33,13 @@ const OFFLINE_INTERIM_STRIDE_SAMPLES: usize = 2 * 16_000;
 /// Offline mode: stop refreshing interims for segments longer than this (the
 /// VAD's max_speech_duration force-splits shortly after anyway).
 const OFFLINE_INTERIM_MAX_SAMPLES: usize = 20 * 16_000;
+/// Offline mode: rolling audio kept while the VAD is idle, seeded into the
+/// live-preview buffer when speech is confirmed. Silero takes a few hundred
+/// ms to flip `detected()`, and the syllables spoken in that window are in
+/// the VAD's own segment (finals are complete) but would be missing from
+/// every interim — the "first words appear only when the segment finalizes"
+/// bug. A little leading silence in the preview decode is harmless.
+const OFFLINE_PREROLL_SAMPLES: usize = 16_000;
 /// Utterances shorter than this get no live speaker label — a sub-second
 /// "yeah" embeds too noisily to cluster honestly. They stay unlabeled; the
 /// post-meeting pass places them by temporal overlap.
@@ -43,7 +50,22 @@ const MIN_LABEL_SAMPLES: usize = 16_000;
 pub enum SessionEvent {
     /// Still-changing preview of the current utterance. Never carries a
     /// speaker — live labeling happens when the utterance completes.
-    Interim { text: String, start: f64, end: f64 },
+    ///
+    /// `text` is the portion that agreed with the previous decode of the
+    /// same utterance; `tentative` is the changed suffix, still likely to
+    /// move. This is heuristic finality (the local engines expose none per
+    /// token — every decode may rewrite anything), split so the UI can dim
+    /// the wobbling tail the same way the cloud provider's real one is.
+    /// The tail always carries a leading space (the seam's word-boundary
+    /// convention — this diff splits on words, so the tail always opens
+    /// one), even when `text` is empty: the finalized segment before the
+    /// interim still needs the separator.
+    Interim {
+        text: String,
+        tentative: Option<String>,
+        start: f64,
+        end: f64,
+    },
     /// Finalized utterance (endpoint fired or session finished). `speaker`
     /// is a provisional live label ("Speaker 1/2/…") when live labeling is
     /// active, else `None`.
@@ -132,6 +154,7 @@ impl LocalSession {
                 labeler,
                 samples_fed: 0,
                 live_buf: Vec::new(),
+                preroll: Vec::new(),
                 last_interim_len: 0,
                 last_interim: String::new(),
             }),
@@ -218,17 +241,23 @@ impl StreamingInner {
             self.last_interim.clear();
         } else if let Some(res) = self.recognizer.get_result(&self.stream) {
             let raw = res.text.trim();
-            if !raw.is_empty() && raw != self.last_interim {
-                self.last_interim = raw.to_string();
+            let display = if self.native_text {
+                raw.to_string()
+            } else {
+                // Interims are a live preview; cheap lowercase is enough
+                // (full punctuation/casing happens on finalization).
+                raw.to_lowercase()
+            };
+            if !display.is_empty() && display != self.last_interim {
+                let (text, tentative) = split_agreed(&self.last_interim, &display);
+                self.last_interim = display;
                 let (start, end) = self.segment_times(&res, now);
-                let text = if self.native_text {
-                    raw.to_string()
-                } else {
-                    // Interims are a live preview; cheap lowercase is enough
-                    // (full punctuation/casing happens on finalization).
-                    raw.to_lowercase()
-                };
-                events.push(SessionEvent::Interim { text, start, end });
+                events.push(SessionEvent::Interim {
+                    text,
+                    tentative,
+                    start,
+                    end,
+                });
             }
         }
         events
@@ -312,6 +341,9 @@ struct OfflineInner {
     samples_fed: u64,
     /// Samples of the in-flight (still-detected) speech run, for interims.
     live_buf: Vec<f32>,
+    /// The last ~1 s of audio heard while the VAD was idle — the words that
+    /// were already being spoken when detection confirms.
+    preroll: Vec<f32>,
     /// `live_buf` length at the last interim decode.
     last_interim_len: usize,
     last_interim: String,
@@ -326,28 +358,38 @@ impl OfflineInner {
         self.drain_completed(&mut events);
 
         if self.vad.detected() {
+            if self.live_buf.is_empty() {
+                // Detection just confirmed: the first syllables are in the
+                // preroll, not in this chunk.
+                std::mem::swap(&mut self.live_buf, &mut self.preroll);
+            }
             self.live_buf.extend_from_slice(pcm);
             let grew = self.live_buf.len().saturating_sub(self.last_interim_len);
             if grew >= OFFLINE_INTERIM_STRIDE_SAMPLES
                 && self.live_buf.len() <= OFFLINE_INTERIM_MAX_SAMPLES
             {
                 self.last_interim_len = self.live_buf.len();
-                let text = self.decode(&self.live_buf);
-                if !text.is_empty() && text != self.last_interim {
-                    self.last_interim = text.clone();
+                let decoded = self.decode(&self.live_buf);
+                if !decoded.is_empty() && decoded != self.last_interim {
+                    let (text, tentative) = split_agreed(&self.last_interim, &decoded);
+                    self.last_interim = decoded;
                     let end = self.samples_fed as f64 / SAMPLE_RATE as f64;
                     let start = end - self.live_buf.len() as f64 / SAMPLE_RATE as f64;
                     events.push(SessionEvent::Interim {
                         text,
+                        tentative,
                         start: start.max(0.0),
                         end,
                     });
                 }
             }
-        } else if !self.live_buf.is_empty() {
-            // Speech run ended; the completed segment arrives via the VAD
-            // queue (drained above / next tick).
-            self.reset_live();
+        } else {
+            roll(&mut self.preroll, pcm, OFFLINE_PREROLL_SAMPLES);
+            if !self.live_buf.is_empty() {
+                // Speech run ended; the completed segment arrives via the
+                // VAD queue (drained above / next tick).
+                self.reset_live();
+            }
         }
         events
     }
@@ -425,6 +467,41 @@ impl OfflineInner {
     }
 }
 
+/// Split the current interim decode against the previous one: the longest
+/// common word prefix is the stable part, the changed suffix the tentative
+/// tail. Word granularity on purpose — a character-level split would carve
+/// syllables the decoder never produced. Because the split is on words, the
+/// tail ALWAYS opens a new word, so it always carries the seam's leading
+/// space — even when the stable part is empty, since whatever precedes the
+/// interim (a finalized segment) still needs the separator; renderers
+/// collapse the space when nothing does.
+fn split_agreed(prev: &str, curr: &str) -> (String, Option<String>) {
+    let prev_words: Vec<&str> = prev.split_whitespace().collect();
+    let curr_words: Vec<&str> = curr.split_whitespace().collect();
+    let agreed = prev_words
+        .iter()
+        .zip(&curr_words)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if agreed == curr_words.len() {
+        // The whole decode already agreed (e.g. the previous one was
+        // longer and shrank): everything is stable.
+        return (curr_words.join(" "), None);
+    }
+    let stable = curr_words[..agreed].join(" ");
+    let tail = format!(" {}", curr_words[agreed..].join(" "));
+    (stable, Some(tail))
+}
+
+/// Append `pcm` to a rolling buffer, keeping only the newest `cap` samples.
+fn roll(buf: &mut Vec<f32>, pcm: &[f32], cap: usize) {
+    buf.extend_from_slice(pcm);
+    let excess = buf.len().saturating_sub(cap);
+    if excess > 0 {
+        buf.drain(..excess);
+    }
+}
+
 // --- Shared text polish ----------------------------------------------------
 
 /// Turn the model's raw ALL-CAPS unpunctuated hypothesis into readable prose:
@@ -464,6 +541,50 @@ fn naive_case(lower: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_agreed_hardens_the_shared_prefix() {
+        // First decode of an utterance: everything is tentative. The tail
+        // still leads with a space — a finalized segment may precede it.
+        assert_eq!(
+            split_agreed("", "the quick"),
+            (String::new(), Some(" the quick".to_string()))
+        );
+        // The agreeing prefix is stable; the changed suffix (with its
+        // word-boundary leading space) is tentative.
+        assert_eq!(
+            split_agreed("the quick brown fex", "the quick brown fox jumps"),
+            (
+                "the quick brown".to_string(),
+                Some(" fox jumps".to_string())
+            )
+        );
+        // Full agreement (a shrunken re-decode): all stable.
+        assert_eq!(
+            split_agreed("the quick brown", "the quick"),
+            ("the quick".to_string(), None)
+        );
+        // A revision at the very start un-hardens everything.
+        assert_eq!(
+            split_agreed("he quick", "the quick"),
+            (String::new(), Some(" the quick".to_string()))
+        );
+    }
+
+    #[test]
+    fn roll_keeps_only_the_newest_samples() {
+        let mut buf = vec![1.0, 2.0];
+        roll(&mut buf, &[3.0, 4.0], 3);
+        assert_eq!(buf, vec![2.0, 3.0, 4.0]);
+        // Under the cap: nothing trimmed.
+        let mut small = vec![1.0];
+        roll(&mut small, &[2.0], 8);
+        assert_eq!(small, vec![1.0, 2.0]);
+        // One oversized chunk keeps its own tail.
+        let mut empty = Vec::new();
+        roll(&mut empty, &[1.0, 2.0, 3.0, 4.0], 2);
+        assert_eq!(empty, vec![3.0, 4.0]);
+    }
 
     #[test]
     fn naive_case_capitalizes_sentence_and_pronoun() {

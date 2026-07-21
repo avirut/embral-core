@@ -8,11 +8,14 @@ mod dictation;
 mod hotkey;
 mod llm;
 mod mcp_clients;
+mod notes_matching;
 mod refinement;
 mod search_index;
 mod speaker_commands;
 mod speakers;
 mod storage;
+mod system_specs;
+mod telemetry;
 mod transcription;
 mod tray;
 
@@ -69,11 +72,6 @@ pub struct AppState {
     /// True after the user dismissed the "call detected" prompt; suppresses
     /// re-prompting until the current call ends.
     pub detection_dismissed: std::sync::atomic::AtomicBool,
-    /// True while a voice-reference enrollment capture is running (they don't
-    /// coexist with recordings — both want the mic).
-    pub enrolling: std::sync::atomic::AtomicBool,
-    /// Set to stop the running enrollment capture early.
-    pub enroll_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// The built-in LLM child process (llama-server), started on demand.
     pub llm: llm::LlmSidecar,
     /// The search-index runtime: the embed child process (`embral-mcp
@@ -86,6 +84,11 @@ pub struct AppState {
     pub dictating: std::sync::atomic::AtomicBool,
     /// When the dictation hotkey press that started the session happened.
     pub dictation_pressed_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Opt-in telemetry queue + enabled mirror — cloud edition only; the
+    /// shared call sites go through `telemetry`'s no-op facade
+    /// ([telemetry.md]).
+    #[cfg(feature = "cloud")]
+    pub telemetry: cloud::telemetry::Telemetry,
 }
 
 impl AppState {
@@ -105,13 +108,13 @@ impl AppState {
             stars: tokio::sync::Mutex::new(Vec::new()),
             star_anchors: tokio::sync::Mutex::new(Vec::new()),
             detection_dismissed: std::sync::atomic::AtomicBool::new(false),
-            enrolling: std::sync::atomic::AtomicBool::new(false),
-            enroll_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             llm: llm::LlmSidecar::default(),
             search: search_index::SearchRuntime::default(),
             dictation: tokio::sync::Mutex::new(None),
             dictating: std::sync::atomic::AtomicBool::new(false),
             dictation_pressed_at: std::sync::Mutex::new(None),
+            #[cfg(feature = "cloud")]
+            telemetry: cloud::telemetry::Telemetry::default(),
         }
     }
 
@@ -148,6 +151,46 @@ pub fn logs_dir() -> std::path::PathBuf {
         .join("embral")
         .join("logs")
 }
+
+/// Put this process in a Windows job object that kills every child when the
+/// process dies — *however* it dies. A clean quit already stops the sidecars
+/// (`RunEvent::Exit`), but a dev-loop rebuild, a crash, or a task-manager
+/// kill skips that path and used to orphan `llama-server.exe`, which then
+/// held its own files open and made every re-download fail with "access
+/// denied" (the NTFS delete-pending trap).
+#[cfg(windows)]
+fn kill_children_with_us() {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe {
+        let Ok(job) = CreateJobObjectW(None, PCWSTR::null()) else {
+            tracing::warn!("failed to create the child-process job object");
+            return;
+        };
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if set.is_err() || AssignProcessToJobObject(job, GetCurrentProcess()).is_err() {
+            tracing::warn!("failed to arm the child-process job object");
+        }
+        // The job handle is deliberately never closed: it closes when this
+        // process exits, and that close is what takes the children down.
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_children_with_us() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -188,9 +231,24 @@ pub fn run() {
         version = env!("CARGO_PKG_VERSION"),
         "embral starting"
     );
+    kill_children_with_us();
     let config = config::load_config().unwrap_or_default();
+    tray::set_recording_color(&config.tray_recording_color);
+    // Read before the config moves into the app state: setup() needs it to
+    // decide whether this launch opens the window (see below).
+    let needs_onboarding = !config.onboarding_completed;
 
     tauri::Builder::default()
+        // Registered first, so a second launch bails out before any heavy
+        // init: the app lives in the tray, so re-launching the installed
+        // shortcut must surface the running window, not stack a new process.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -211,13 +269,22 @@ pub fn run() {
                 }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             tray::create_tray(app)?;
-            // The app always lives in the tray: the window never opens on
-            // launch (users open it from the tray icon), and launch-at-login
-            // is always on — both by design, neither is a setting.
+            // The app lives in the tray: launches land there rather than
+            // opening the window (users open it from the tray icon), and
+            // launch-at-login is always on — both by design, neither is a
+            // setting. The exception is first run: until onboarding is
+            // finished the window opens, so the installer's "run after
+            // closing" box lands on the setup wizard instead of a silent
+            // tray icon. The frontend already gates on the same flag.
             if let Some(w) = app.get_webview_window("main") {
-                let _ = w.hide();
+                if needs_onboarding {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                } else {
+                    let _ = w.hide();
+                }
             }
             {
                 use tauri_plugin_autostart::ManagerExt;
@@ -330,6 +397,24 @@ pub fn run() {
             // Search-index worker: backfills chunks at boot, embeds pending
             // passages whenever a mutation pings it.
             search_index::spawn_worker(app.handle().clone());
+            // Opt-in telemetry (cloud edition only): mirror the flag, start
+            // the flusher, count the launch, and fire the daily config
+            // snapshot when due.
+            #[cfg(feature = "cloud")]
+            {
+                let state = app.state::<AppState>();
+                let enabled = state.config.blocking_lock().telemetry_enabled;
+                state
+                    .telemetry
+                    .enabled
+                    .store(enabled, std::sync::atomic::Ordering::Release);
+                cloud::telemetry::spawn_flusher(app.handle().clone());
+                telemetry::track(&state, "app_started", serde_json::json!({}));
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    cloud::telemetry::maybe_snapshot(&handle.state::<AppState>()).await;
+                });
+            }
             // Register the record + dictation hotkeys from config (empty = none).
             {
                 let (record, dictation) = {
@@ -388,9 +473,10 @@ macro_rules! app_handler_with {
             commands::open_notes_folder,
             commands::list_audio_devices,
             commands::preview_export_filename,
-            commands::test_webhook,
             commands::open_logs_folder,
             commands::update_guard,
+            system_specs::system_specs,
+            tray::system_accent_color,
             mcp_clients::mcp_setup_info,
             mcp_clients::mcp_clients_status,
             mcp_clients::mcp_register,
@@ -409,11 +495,8 @@ macro_rules! app_handler_with {
             speaker_commands::upsert_speaker,
             speaker_commands::delete_speaker,
             speaker_commands::delete_speakers,
-            speaker_commands::record_voice_reference,
-            speaker_commands::cancel_voice_reference,
-            speaker_commands::delete_voice_reference,
-            speaker_commands::confirm_speaker_suggestion,
-            speaker_commands::dismiss_speaker_suggestion,
+            speaker_commands::confirm_name_suggestion,
+            speaker_commands::dismiss_name_suggestion,
             speaker_commands::edit_segments,
             $($extra),*
         ]
@@ -431,6 +514,7 @@ fn app_handler() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static 
         cloud::commands::cloud_billing_url,
         cloud::commands::cloud_billing_tiers,
         cloud::commands::cloud_adopt_provider,
+        cloud::commands::telemetry_track,
     ]
 }
 

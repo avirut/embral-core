@@ -36,7 +36,7 @@
         <p
             class="pb-2 text-xs font-medium tracking-wider text-muted-foreground uppercase"
         >
-            Model downloads
+            Local LLM
         </p>
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
             {#each llmModels as model (model.id)}

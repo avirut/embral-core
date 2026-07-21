@@ -141,7 +141,6 @@
         { id: "dictation", label: "Dictation" },
         { id: "about", label: "About" },
         { id: "markdown", label: "Markdown" },
-        { id: "webhooks", label: "Webhooks" },
         { id: "mcp", label: "MCP" },
         { id: "transcription", label: "Transcription" },
         { id: "synthesis", label: "Synthesis" },

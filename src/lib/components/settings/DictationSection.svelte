@@ -12,6 +12,7 @@
     import { Switch } from "$lib/components/ui/switch";
     import { modelsStore } from "$lib/stores/models.svelte";
     import { CLOUD_ENABLED } from "$lib/cloud";
+    import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
 
     let { draft }: { draft: AppConfig } = $props();
 
@@ -27,8 +28,8 @@
 
     const cleanupLabels: Record<DictationCleanup, string> = {
         cloud: "embral cloud",
-        on_device: "On-device",
-        off: "No cleanup",
+        on_device: "local model",
+        off: "no cleanup",
     };
     let cleanupInfoOpen = $state(false);
 </script>
@@ -49,8 +50,6 @@
     <SettingsGroup label="Transcription">
         <TranscriptionBlock
             providerLabel="Dictate with"
-            cloudNote="Audio streams to embral's servers while you dictate, spending the same hours as meetings."
-            disabledNote="Dictation stops with a message instead of using this device."
             provider={draft.dictation_provider}
             onProviderChange={(v) => (draft.dictation_provider = v)}
             outOfHours={draft.dictation_out_of_hours}
@@ -82,8 +81,13 @@
             <Select.Root
                 type="single"
                 value={draft.dictation_cleanup}
-                onValueChange={(v) =>
-                    v && (draft.dictation_cleanup = v as DictationCleanup)}
+                onValueChange={(v) => {
+                    if (!v) return;
+                    // Cloud cleanup needs an account; refuse and prompt when
+                    // signed out, leaving cleanup on its current value.
+                    if (v === "cloud" && !cloudAuth.requireSignedIn()) return;
+                    draft.dictation_cleanup = v as DictationCleanup;
+                }}
             >
                 <Select.Trigger class="w-56"
                     >{cleanupLabels[draft.dictation_cleanup]}</Select.Trigger
@@ -92,8 +96,8 @@
                     {#if CLOUD_ENABLED}
                         <Select.Item value="cloud" label="embral cloud" />
                     {/if}
-                    <Select.Item value="on_device" label="On-device" />
-                    <Select.Item value="off" label="No cleanup" />
+                    <Select.Item value="on_device" label="local model" />
+                    <Select.Item value="off" label="no cleanup" />
                 </Select.Content>
             </Select.Root>
         </SettingRow>

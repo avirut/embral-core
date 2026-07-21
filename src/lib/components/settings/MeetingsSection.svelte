@@ -10,11 +10,12 @@
         AppConfig,
         AutoStartPolicy,
         DiarizationSensitivity,
+        NotesNamingMode,
         OpenMeetingTab,
-        SpeakerMatchMode,
     } from "$lib/types";
-    import { BUILTIN_PROFILE_ID } from "$lib/types";
+    import { BUILTIN_PROFILE_ID, CLOUD_PROFILE_ID } from "$lib/types";
     import { CLOUD_ENABLED } from "$lib/cloud";
+    import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
     import SettingsGroup from "./SettingsGroup.svelte";
     import SettingRow from "./SettingRow.svelte";
     import * as Select from "$lib/components/ui/select";
@@ -67,16 +68,16 @@
 
     // --- Speakers ------------------------------------------------------------
 
-    const matchLabels: Record<SpeakerMatchMode, string> = {
-        off: "Off",
-        suggest: "Suggest",
-        automatic: "Automatic",
-    };
-
     const sensitivityLabels: Record<DiarizationSensitivity, string> = {
         low: "Fewer speakers",
         medium: "Balanced",
         high: "More speakers",
+    };
+
+    const namingLabels: Record<NotesNamingMode, string> = {
+        off: "Off",
+        suggest: "Suggest",
+        automatic: "Automatic",
     };
 
     // --- Summaries prompt ----------------------------------------------------
@@ -102,10 +103,9 @@
     // The summary engine (moved here from the Synthesis page — it is the
     // product question "who writes my summaries", not a model-management
     // knob). Engines are fixed per edition; the backend picks actual models.
-    const CLOUD_PROFILE_ID = "cloud";
     let engineValue = $derived(draft.summaries_profile_id || BUILTIN_PROFILE_ID);
     let engineLabel = $derived(
-        engineValue === CLOUD_PROFILE_ID ? "embral cloud" : "Built-in (on-device)",
+        engineValue === CLOUD_PROFILE_ID ? "embral cloud" : "local model",
     );
 
     // "" in config means "use the default" — the editor always shows the
@@ -233,7 +233,7 @@
 
             <SettingRow
                 title="Detection delay"
-                description="Active microphone time before recording is triggered."
+                description="Active microphone time before recording is triggered"
             >
                 <div class="flex items-center gap-2">
                     <Input
@@ -254,7 +254,7 @@
 
             <SettingRow
                 title="Stop when the call ends"
-                description="Applies only to auto-started recordings."
+                description="Applies only to auto-started recordings"
             >
                 <Switch bind:checked={draft.auto_stop_enabled} />
             </SettingRow>
@@ -299,15 +299,15 @@
                 </Select.Root>
             </SettingRow>
 
-            <SettingRow title="Match voices from past meetings">
+            <SettingRow title="Name speakers from your notes">
                 <Select.Root
                     type="single"
-                    value={draft.speaker_match_mode}
+                    value={draft.notes_naming_mode}
                     onValueChange={(v) =>
-                        v && (draft.speaker_match_mode = v as SpeakerMatchMode)}
+                        v && (draft.notes_naming_mode = v as NotesNamingMode)}
                 >
                     <Select.Trigger class="w-56"
-                        >{matchLabels[draft.speaker_match_mode]}</Select.Trigger
+                        >{namingLabels[draft.notes_naming_mode]}</Select.Trigger
                     >
                     <Select.Content>
                         <Select.Item value="off" label="Off" />
@@ -327,26 +327,28 @@
         {#if draft.summaries_enabled}
             <SettingRow
                 title="Write summaries with"
-                description={engineValue === CLOUD_PROFILE_ID
-                    ? "Transcripts are summarized on embral's servers. Sign in on the Account page first."
-                    : ""}
             >
                 <Select.Root
                     type="single"
                     value={engineValue}
                     onValueChange={(v) => {
-                        if (v) draft.summaries_profile_id = v;
+                        if (!v) return;
+                        // embral cloud needs an account; refuse and prompt when
+                        // signed out, leaving the engine on its current value.
+                        if (v === CLOUD_PROFILE_ID && !cloudAuth.requireSignedIn())
+                            return;
+                        draft.summaries_profile_id = v;
                     }}
                 >
                     <Select.Trigger class="w-56">{engineLabel}</Select.Trigger>
                     <Select.Content>
-                        <Select.Item
-                            value={BUILTIN_PROFILE_ID}
-                            label="Built-in (on-device)"
-                        />
                         {#if CLOUD_ENABLED}
                             <Select.Item value={CLOUD_PROFILE_ID} label="embral cloud" />
                         {/if}
+                        <Select.Item
+                            value={BUILTIN_PROFILE_ID}
+                            label="local model"
+                        />
                     </Select.Content>
                 </Select.Root>
             </SettingRow>

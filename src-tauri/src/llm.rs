@@ -205,7 +205,7 @@ pub async fn resolved_notes_config(
             !config.cloud_session_token.is_empty(),
             "sign in to your embral account to use cloud summaries"
         );
-        cfg.endpoint = format!("{}/v1", config.cloud_api_url.trim_end_matches('/'));
+        cfg.endpoint = format!("{}/v1", config.cloud_url().trim_end_matches('/'));
         cfg.api_key = config.cloud_session_token.clone();
     }
     #[cfg(not(feature = "cloud"))]
@@ -224,21 +224,29 @@ pub fn uses_local_llm(config: &embral_types::AppConfig) -> bool {
     let summaries_local = config.summaries_enabled
         && (config.summaries_profile_id.is_empty()
             || config.summaries_profile_id == embral_types::BUILTIN_PROFILE_ID);
-    let cleanup_local = match config.dictation_cleanup {
+    summaries_local || cleanup_uses_builtin(config)
+}
+
+/// Whether dictation cleanup would run on the built-in model right now:
+/// the on-device tier, or the cloud tier while signed out (its degrade
+/// target). Dictation start uses this to prewarm the sidecar so cleanup
+/// doesn't cold-start it inside the stop pipeline.
+pub fn cleanup_uses_builtin(config: &embral_types::AppConfig) -> bool {
+    match config.dictation_cleanup {
         embral_types::DictationCleanup::OnDevice => true,
         #[cfg(feature = "cloud")]
         embral_types::DictationCleanup::Cloud => config.cloud_session_token.is_empty(),
         embral_types::DictationCleanup::Off => false,
-    };
-    summaries_local || cleanup_local
+    }
 }
 
 /// The transport dictation cleanup runs with, per the configured tier —
 /// degrading rather than blocking, because cleanup must never cost the user
-/// their dictation: Cloud while signed out falls to the on-device model;
-/// an unavailable on-device model (or `Off`) is `None`, and the caller
-/// delivers the raw text. A *request* failure on whichever transport this
-/// returns degrades at the call site the same way.
+/// their dictation: Cloud while signed out falls to the on-device model
+/// (a stale-config safety net only — sign-out reverts the stored tier to
+/// on-device, [cloud-seam.md]); an unavailable on-device model (or `Off`)
+/// is `None`, and the caller delivers the raw text. A *request* failure on
+/// whichever transport this returns degrades at the call site the same way.
 pub async fn resolved_cleanup_config(
     sidecar: &LlmSidecar,
     config: &embral_types::AppConfig,
@@ -252,12 +260,13 @@ pub async fn resolved_cleanup_config(
             // model chain and its own metering server-side.
             cfg.endpoint = format!(
                 "{}/v1/dictation",
-                config.cloud_api_url.trim_end_matches('/')
+                config.cloud_url().trim_end_matches('/')
             );
             cfg.api_key = config.cloud_session_token.clone();
             Some(cfg)
         }
-        // Cloud while signed out, and OnDevice: the built-in model.
+        // OnDevice — and Cloud while signed out, which sign-out reversion
+        // makes a stale-config edge case: the built-in model.
         _ => {
             let mut cfg =
                 crate::refinement::notes_config(&embral_types::LlmProfile::builtin());
@@ -271,6 +280,35 @@ pub async fn resolved_cleanup_config(
                     None
                 }
             }
+        }
+    }
+}
+
+/// The transport the notes-naming pass runs with: the summaries engine
+/// when one resolves (the sidecar is typically already going to be used by
+/// the summary anyway), else the built-in model, else `None` — the pass
+/// silently skips and speakers keep their labels.
+pub async fn resolved_naming_config(
+    sidecar: &LlmSidecar,
+    config: &embral_types::AppConfig,
+) -> Option<embral_notes::NotesConfig> {
+    if let Some(profile) = crate::refinement::summaries_profile(config) {
+        match resolved_notes_config(sidecar, config, &profile).await {
+            Ok(cfg) => return Some(cfg),
+            Err(e) => tracing::warn!(
+                "naming: summaries engine unavailable ({e}); trying the built-in model"
+            ),
+        }
+    }
+    let mut cfg = crate::refinement::notes_config(&embral_types::LlmProfile::builtin());
+    match sidecar.ensure_running().await {
+        Ok(endpoint) => {
+            cfg.endpoint = endpoint;
+            Some(cfg)
+        }
+        Err(e) => {
+            tracing::warn!("naming model unavailable — speakers keep their labels: {e}");
+            None
         }
     }
 }

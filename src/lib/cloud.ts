@@ -32,3 +32,23 @@ export function loadAccountSection() {
 export function loadHoursRing() {
   return loadCloudComponent('HoursRing');
 }
+
+/** Lazily load onboarding's account step (cloud builds only). */
+export function loadOnboardingAccountStep() {
+  return loadCloudComponent('OnboardingAccountStep');
+}
+
+/** Lazily load onboarding's plans page (cloud builds only). */
+export function loadOnboardingPlansStep() {
+  return loadCloudComponent('OnboardingPlansStep');
+}
+
+/** Lazily load the welcome page's telemetry opt-in checkbox (cloud builds only). */
+export function loadTelemetryOptIn() {
+  return loadCloudComponent('TelemetryOptIn');
+}
+
+/** Lazily load the General settings' telemetry toggle row (cloud builds only). */
+export function loadTelemetrySetting() {
+  return loadCloudComponent('TelemetrySetting');
+}

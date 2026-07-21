@@ -32,7 +32,8 @@ pub struct MeetingDetail {
     /// Structured transcript; empty for legacy meetings that only have
     /// markdown (the UI falls back to the raw editor then).
     pub segments: Vec<embral_types::TranscriptionSegment>,
-    pub speaker_suggestions: Vec<crate::speaker_commands::SuggestionView>,
+    /// Pending "Speaker N looks like X" suggestions from the user's notes.
+    pub name_suggestions: Vec<crate::speaker_commands::NameSuggestionView>,
     /// User-starred moments (empty when none).
     pub stars: Vec<Star>,
     /// The user's raw live notes, verbatim (the Notes tab).
@@ -251,8 +252,8 @@ pub(crate) fn meeting_detail(
     };
 
     let segments = db.get_segments(&row.id).map_err(|e| e.to_string())?;
-    let speaker_suggestions =
-        crate::speaker_commands::suggestion_views(db, &row.id).unwrap_or_default();
+    let name_suggestions =
+        crate::speaker_commands::name_suggestion_views(db, &row.id).unwrap_or_default();
     let stars = db
         .get_stars(&row.id)
         .ok()
@@ -268,7 +269,7 @@ pub(crate) fn meeting_detail(
         audio_exists,
         attendees: row.attendees,
         segments,
-        speaker_suggestions,
+        name_suggestions,
         stars,
         user_notes,
     })
@@ -337,12 +338,26 @@ pub(crate) fn format_transcript_document(
     )
 }
 
+/// One choke point for every start path (button, hotkey, detection accept,
+/// auto-start): a refused start counts once, whatever refused it.
 #[tauri::command]
 pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let result = start_recording_inner(app, &state).await;
+    if result.is_err() {
+        crate::telemetry::track(
+            &state,
+            "error",
+            serde_json::json!({ "category": "recording_start_failed" }),
+        );
+    }
+    result
+}
+
+async fn start_recording_inner(app: AppHandle, state: &State<'_, AppState>) -> Result<(), String> {
     let config = state.config.lock().await.clone();
 
     if !crate::config::is_configured(&config) {
-        return Err("API keys not configured. Open Settings first.".to_string());
+        return Err("Transcription isn't set up yet — download the speech model or sign in from Settings.".to_string());
     }
     if state.dictating.load(std::sync::atomic::Ordering::Acquire) {
         return Err("Can't record during a dictation — finish it first.".to_string());
@@ -584,6 +599,11 @@ pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Resu
                                     "transcription-failed",
                                     serde_json::json!({ "message": message }),
                                 );
+                                crate::telemetry::track(
+                                    &app_clone.state::<AppState>(),
+                                    "error",
+                                    serde_json::json!({ "category": "transcription_failed" }),
+                                );
                                 break;
                             }
                             crate::config::CloudFailureAction::SwitchToLocal => {}
@@ -649,6 +669,11 @@ pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Resu
                                     "transcription-failed",
                                     serde_json::json!({ "message": message }),
                                 );
+                                crate::telemetry::track(
+                                    &app_clone.state::<AppState>(),
+                                    "error",
+                                    serde_json::json!({ "category": "transcription_failed" }),
+                                );
                                 break;
                             }
                         }
@@ -659,6 +684,11 @@ pub async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Resu
                         let _ = app_clone.emit(
                             "transcription-failed",
                             serde_json::json!({ "message": message }),
+                        );
+                        crate::telemetry::track(
+                            &app_clone.state::<AppState>(),
+                            "error",
+                            serde_json::json!({ "category": "transcription_failed" }),
                         );
                         break;
                     }
@@ -783,6 +813,7 @@ pub async fn star_moment(state: State<'_, AppState>, seconds: f64) -> Result<f64
     }
 
     state.stars.lock().await.push(star_secs);
+    crate::telemetry::track(&state, "star_used", serde_json::json!({}));
     Ok(star_secs)
 }
 
@@ -877,7 +908,6 @@ pub(crate) async fn finalize_meeting(
     started_at: chrono::DateTime<chrono::Utc>,
     mut segments: Vec<embral_types::TranscriptionSegment>,
     audio: AudioSource,
-    channel_windows: Vec<embral_engine::speakers::ChannelWindow>,
     labels_authoritative: bool,
     // User-starred moments (with their notes anchors when known).
     stars: Vec<Star>,
@@ -891,7 +921,6 @@ pub(crate) async fn finalize_meeting(
     // pipeline overwrites. A missing model or any failure degrades to the
     // labels we already have.
     let engine = app.state::<AppState>().engine.clone();
-    let mut speaker_suggestions_json: Option<String> = None;
     if config.diarization_enabled
         && engine.speaker_id_present()
         && !segments.is_empty()
@@ -908,32 +937,41 @@ pub(crate) async fn finalize_meeting(
             AudioSource::Samples(s) => Some(s.clone()),
         };
         if let Some(samples) = samples {
-            let input = crate::speakers::PipelineInput {
-                samples,
-                channel_windows,
-                meeting_id: meeting_id.clone(),
-            };
             let db2 = db.clone();
             let config2 = config.clone();
             let engine2 = engine.clone();
             let mut segs = segments.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let suggestions = crate::speakers::run(&engine2, &db2, &config2, &input, &mut segs);
-                (segs, suggestions)
+                let labeled = crate::speakers::run(&engine2, &db2, &config2, &samples, &mut segs);
+                (segs, labeled)
             })
             .await;
             match outcome {
-                Ok((segs, Ok(suggestions))) => {
-                    segments = segs;
-                    if !suggestions.is_empty() {
-                        speaker_suggestions_json = serde_json::to_string(&suggestions).ok();
-                    }
-                }
+                Ok((segs, Ok(()))) => segments = segs,
                 Ok((_, Err(e))) => tracing::warn!("speaker pipeline failed: {e}"),
                 Err(e) => tracing::error!("speaker pipeline panicked: {e}"),
             }
         }
     }
+
+    // --- Name speakers from the user's typed notes ([speakers.md]) — before
+    // formatting for the same reason as the pipeline above. Automatic mode
+    // renames segments here; suggest mode returns pending suggestions that
+    // persist below and surface in the meeting view.
+    let name_suggestions = {
+        let state = app.state::<AppState>();
+        crate::notes_matching::run(
+            &state.search,
+            &state.llm,
+            &db,
+            &config,
+            user_notes.as_deref().unwrap_or(""),
+            &mut segments,
+        )
+        .await
+    };
+    let name_suggestions_json =
+        serde_json::to_string(&name_suggestions).unwrap_or_else(|_| "[]".into());
 
     let transcript_text = format_transcript(&segments);
     let _ = app.emit("transcription-final-complete", &transcript_text);
@@ -956,6 +994,11 @@ pub(crate) async fn finalize_meeting(
                 Err(e) => {
                     tracing::error!("MP3 encode failed: {}", e);
                     let _ = app.emit("processing-error", format!("encode failed: {}", e));
+                    crate::telemetry::track(
+                        &app.state::<AppState>(),
+                        "error",
+                        serde_json::json!({ "category": "encode_failed" }),
+                    );
                 }
             }
             let _ = std::fs::remove_file(&wav_path);
@@ -965,6 +1008,11 @@ pub(crate) async fn finalize_meeting(
                 if let Err(e) = encoder::encode_samples_to_mp3(samples.as_slice(), 16_000, &mp3_path) {
                     tracing::error!("MP3 encode failed: {}", e);
                     let _ = app.emit("processing-error", format!("encode failed: {}", e));
+                    crate::telemetry::track(
+                        &app.state::<AppState>(),
+                        "error",
+                        serde_json::json!({ "category": "encode_failed" }),
+                    );
                 }
             }
         }
@@ -1013,9 +1061,31 @@ pub(crate) async fn finalize_meeting(
                 Err(e) => Err(e),
             };
             sidecar.touch();
-            generated
-                .inspect_err(|e| tracing::error!("LLM refinement failed: {e}"))
-                .ok()
+            match &generated {
+                Ok(_) => {
+                    // "cloud" is CLOUD_PROFILE_ID, spelled out because the
+                    // constant is cfg-gated to the cloud edition.
+                    let engine = match profile.id.as_str() {
+                        "" | embral_types::BUILTIN_PROFILE_ID => "builtin",
+                        "cloud" => "cloud",
+                        _ => "custom",
+                    };
+                    crate::telemetry::track(
+                        &app.state::<AppState>(),
+                        "notes_generated",
+                        serde_json::json!({ "engine": engine }),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("LLM refinement failed: {e}");
+                    crate::telemetry::track(
+                        &app.state::<AppState>(),
+                        "error",
+                        serde_json::json!({ "category": "notes_failed" }),
+                    );
+                }
+            }
+            generated.ok()
         }
         None => {
             if segments.is_empty() {
@@ -1069,6 +1139,11 @@ pub(crate) async fn finalize_meeting(
         let placeholder = base.join("notes").join(format!("{}.md", meeting_id));
         if let Err(e) = std::fs::write(&placeholder, document) {
             let _ = app.emit("processing-error", e.to_string());
+            crate::telemetry::track(
+                &app.state::<AppState>(),
+                "error",
+                serde_json::json!({ "category": "save_failed" }),
+            );
             return;
         }
         let _ = std::fs::rename(&placeholder, &final_notes_path);
@@ -1093,6 +1168,11 @@ pub(crate) async fn finalize_meeting(
         if let Err(e) = std::fs::write(&final_transcript_path, &transcript_markdown) {
             tracing::error!("Failed to write transcript: {}", e);
             let _ = app.emit("processing-error", e.to_string());
+            crate::telemetry::track(
+                &app.state::<AppState>(),
+                "error",
+                serde_json::json!({ "category": "save_failed" }),
+            );
         }
     }
 
@@ -1148,12 +1228,7 @@ pub(crate) async fn finalize_meeting(
     if let Err(e) = db
         .upsert_meeting(&row)
         .and_then(|()| db.replace_segments(&meeting_id, &segments))
-        .and_then(|()| {
-            db.set_speaker_suggestions(
-                &meeting_id,
-                speaker_suggestions_json.as_deref().unwrap_or("[]"),
-            )
-        })
+        .and_then(|()| db.set_name_suggestions(&meeting_id, &name_suggestions_json))
         .and_then(|()| {
             let json = serde_json::to_string(&stars).unwrap_or_else(|_| "[]".into());
             db.set_stars(&meeting_id, &json)
@@ -1162,6 +1237,11 @@ pub(crate) async fn finalize_meeting(
         .and_then(|()| crate::storage::export_index(&db, &base))
     {
         let _ = app.emit("processing-error", e.to_string());
+        crate::telemetry::track(
+            &app.state::<AppState>(),
+            "error",
+            serde_json::json!({ "category": "save_failed" }),
+        );
         return;
     }
     crate::search_index::sync_meeting(&db, &app.state::<AppState>().search, &meeting_id);
@@ -1171,28 +1251,21 @@ pub(crate) async fn finalize_meeting(
         let _ = std::fs::remove_file(&mp3_path);
     }
 
-    // Best-effort fan-out to external destinations (Obsidian vault, webhook).
-    // What leaves the app is everything the meeting produced — the summary
-    // (when there is one), the user's own notes, and the transcript — so a
-    // vault copy is useful even with summaries off.
+    // Best-effort fan-out to the Markdown export. The copy carries what the
+    // include switches say — summary, the user's own notes, transcript, each
+    // defaulting in.
     let summary_body = summary_md.as_deref().unwrap_or("");
     let user_notes_md = user_notes.as_deref().unwrap_or("");
     let export_document = embral_notes::integrations::compose_export(
         &frontmatter,
         &title,
-        summary_body,
-        user_notes_md,
-        &transcript_text,
+        config.export_include_summary.then_some(summary_body),
+        config.export_include_notes.then_some(user_notes_md),
+        config
+            .export_include_transcript
+            .then_some(transcript_text.as_str()),
     );
-    crate::refinement::run_post_meeting_integrations(
-        &config,
-        &record,
-        &export_document,
-        summary_body,
-        user_notes_md,
-        &transcript_markdown,
-    )
-    .await;
+    crate::refinement::run_post_meeting_integrations(&config, &record, &export_document);
 
     let _ = app.emit("notes-generation-complete", &record);
 }
@@ -1223,7 +1296,7 @@ pub async fn stop_recording(
         .await
         .take()
         .ok_or("No active recorder")?;
-    let (wav_path, channel_windows) = recorder.stop().map_err(|e| e.to_string())?;
+    let wav_path = recorder.stop().map_err(|e| e.to_string())?;
 
     let session_arc = state
         .session
@@ -1245,8 +1318,9 @@ pub async fn stop_recording(
     // fires, so the merge happens in the background task below.
     let star_seconds = std::mem::take(&mut *state.stars.lock().await);
 
-    // Any stop (manual, hotkey, or auto) ends the auto-started tracking.
-    state
+    // Any stop (manual, hotkey, or auto) ends the auto-started tracking;
+    // the swapped-out value feeds the telemetry event below.
+    let auto_started = state
         .auto_started
         .swap(false, std::sync::atomic::Ordering::AcqRel);
 
@@ -1285,6 +1359,24 @@ pub async fn stop_recording(
         let segments = segments_acc.lock().await.clone();
         let started_at = meeting_start_time(&meeting_id);
 
+        // The *configured* provider; a mid-recording cloud→local fallback
+        // shows up as error{transcription_failed}, not here ([telemetry.md]).
+        let duration_secs = segments.last().map(|s| s.end as u64).unwrap_or_else(|| {
+            chrono::Utc::now()
+                .signed_duration_since(started_at)
+                .num_seconds()
+                .max(0) as u64
+        });
+        crate::telemetry::track(
+            &app_bg.state::<AppState>(),
+            "meeting_recorded",
+            serde_json::json!({
+                "provider": config.transcription_provider,
+                "duration_bucket": crate::telemetry::meeting_bucket(duration_secs),
+                "auto_started": auto_started,
+            }),
+        );
+
         // Attach the notes anchors the frontend sent at stop (matched by
         // the exact timestamp; a missing anchor just means no notes line).
         let anchors =
@@ -1308,7 +1400,6 @@ pub async fn stop_recording(
             started_at,
             segments,
             AudioSource::Wav(wav_path),
-            channel_windows,
             labels_authoritative,
             stars,
             user_notes,
@@ -1330,6 +1421,11 @@ pub async fn accept_detected_meeting(
     state
         .auto_started
         .store(true, std::sync::atomic::Ordering::Release);
+    crate::telemetry::track(
+        &state,
+        "detection_response",
+        serde_json::json!({ "action": "accepted" }),
+    );
     let result = start_recording(app.clone(), app.state()).await;
     if result.is_err() {
         state
@@ -1345,6 +1441,11 @@ pub async fn dismiss_detected_meeting(state: State<'_, AppState>) -> Result<(), 
     state
         .detection_dismissed
         .store(true, std::sync::atomic::Ordering::Release);
+    crate::telemetry::track(
+        &state,
+        "detection_response",
+        serde_json::json!({ "action": "dismissed" }),
+    );
     Ok(())
 }
 
@@ -1477,14 +1578,29 @@ pub async fn import_recording(
             Ok(Err(e)) => {
                 tracing::error!("import failed: {e}");
                 let _ = app_bg.emit("processing-error", format!("Import failed: {e}"));
+                crate::telemetry::track(
+                    &app_bg.state::<AppState>(),
+                    "error",
+                    serde_json::json!({ "category": "import_failed" }),
+                );
                 return;
             }
             Err(e) => {
                 tracing::error!("import task panicked: {e}");
                 let _ = app_bg.emit("processing-error", "Import failed unexpectedly.".to_string());
+                crate::telemetry::track(
+                    &app_bg.state::<AppState>(),
+                    "error",
+                    serde_json::json!({ "category": "import_failed" }),
+                );
                 return;
             }
         };
+        crate::telemetry::track(
+            &app_bg.state::<AppState>(),
+            "meeting_imported",
+            serde_json::json!({}),
+        );
 
         finalize_meeting(
             app_bg,
@@ -1495,8 +1611,7 @@ pub async fn import_recording(
             started_at,
             segments,
             AudioSource::Samples(Arc::new(samples)),
-            Vec::new(), // imports have no channel identity
-            false,      // imported segments are unlabeled; always diarize
+            false, // imported segments are unlabeled; always diarize
             Vec::new(), // no stars on imports
             None,
             user_title,
@@ -1607,6 +1722,7 @@ pub async fn search_library(
     // Timed end to end. The legs are benched separately (embral-search's
     // bench harness); this line says where keystroke time actually goes.
     let started = std::time::Instant::now();
+    crate::telemetry::track(&state, "search_used", serde_json::json!({}));
     let db = state.db().await?;
     let acquire = started.elapsed();
 
@@ -1869,15 +1985,12 @@ pub async fn update_guard(state: State<'_, AppState>) -> Result<Option<String>, 
     if state.importing.load(Ordering::Acquire) {
         return Ok(Some("An import is in progress".to_string()));
     }
-    if state.enrolling.load(Ordering::Acquire) {
-        return Ok(Some("A voice reference is being recorded".to_string()));
-    }
     Ok(None)
 }
 
 /// The scoped reset behind About → Reset…: each flag deletes one body of
 /// data outright — config to defaults, meetings (rows + their files),
-/// speaker profiles (+ voice clips), dictation history, downloaded models.
+/// speaker profiles, dictation history, downloaded models.
 /// Refused while anything is using the mic; no scope is reversible.
 #[tauri::command]
 pub async fn reset_app_data(
@@ -1911,11 +2024,11 @@ pub async fn reset_app_data(
         }
 
         if scopes.profiles {
-            let clips = db.clear_speakers().map_err(|e| e.to_string())?;
-            for clip in &clips {
-                remove_indexed_file(&base, clip)?;
-            }
-            tracing::info!(clips = clips.len(), "reset cleared speaker profiles");
+            db.clear_speakers().map_err(|e| e.to_string())?;
+            // Voice clips are no longer recorded; sweep any left behind by
+            // older versions.
+            let _ = std::fs::remove_dir_all(base.join("voices"));
+            tracing::info!("reset cleared speaker profiles");
         }
 
         if scopes.dictations {
@@ -1951,6 +2064,12 @@ pub async fn reset_app_data(
         let fresh = AppConfig::default();
         crate::config::save_config(&fresh).map_err(|e| e.to_string())?;
         *state.config.lock().await = fresh;
+        // Defaults have telemetry off; keep the sync mirror honest.
+        #[cfg(feature = "cloud")]
+        state
+            .telemetry
+            .enabled
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     Ok(state.config.lock().await.clone())
@@ -1959,7 +2078,7 @@ pub async fn reset_app_data(
 #[tauri::command]
 pub async fn save_config(
     app: AppHandle,
-    config: AppConfig,
+    mut config: AppConfig,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let hotkeys_changed = {
@@ -1967,10 +2086,31 @@ pub async fn save_config(
         current.record_hotkey != config.record_hotkey
             || current.dictation_hotkey != config.dictation_hotkey
     };
+    // The telemetry install id (cloud edition) lives and dies with the
+    // opt-in: minted when enabled without one, cleared (with the snapshot
+    // date) on opt-out so opting out genuinely severs history
+    // ([telemetry.md]).
+    #[cfg(feature = "cloud")]
+    {
+        if config.telemetry_enabled && config.telemetry_install_id.is_empty() {
+            config.telemetry_install_id = uuid::Uuid::new_v4().to_string();
+        }
+        if !config.telemetry_enabled {
+            config.telemetry_install_id.clear();
+            config.telemetry_last_snapshot.clear();
+        }
+        state
+            .telemetry
+            .enabled
+            .store(config.telemetry_enabled, std::sync::atomic::Ordering::Release);
+    }
     crate::config::save_config(&config).map_err(|e| e.to_string())?;
     let record = config.record_hotkey.clone();
     let dictation = config.dictation_hotkey.clone();
+    // A changed recording-disc override applies on the spot.
+    crate::tray::set_recording_color(&config.tray_recording_color);
     *state.config.lock().await = config;
+    let _ = crate::tray::refresh(&app);
     if hotkeys_changed {
         // Surface an invalid combo to the settings UI; config stays saved so
         // the user can correct it.
@@ -1987,37 +2127,6 @@ pub async fn preview_export_filename(template: String) -> Result<String, String>
     let sample_time = chrono::Utc::now();
     let stem = embral_notes::integrations::render_filename(&template, "Weekly sync", &sample_time);
     Ok(format!("{stem}.md"))
-}
-
-/// Send a sample payload to the configured webhook so users can verify their
-/// endpoint without recording a meeting.
-#[tauri::command]
-pub async fn test_webhook(state: State<'_, AppState>) -> Result<(), String> {
-    let config = state.config.lock().await.clone();
-    let url = config.webhook_url.trim().to_string();
-    if url.is_empty() {
-        return Err("No webhook URL configured.".to_string());
-    }
-    let record = MeetingRecord {
-        id: "000000T000000_sample".to_string(),
-        title: "Webhook test from embral".to_string(),
-        date: chrono::Utc::now(),
-        duration_seconds: 60,
-        chunks: 1,
-        notes_path: String::new(),
-        transcript_path: String::new(),
-        audio_path: String::new(),
-    };
-    embral_notes::integrations::post_webhook(
-        &url,
-        config.webhook_method,
-        &record,
-        "# Webhook test\n\nThis is a sample payload sent from embral settings.",
-        "These are sample notes taken during the meeting.",
-        "This is sample transcript content.",
-    )
-    .await
-    .map_err(|e| e.to_string())
 }
 
 /// Names of the machine's audio devices, for the Settings pickers. An empty
@@ -2134,13 +2243,32 @@ pub async fn download_asr_model(
         id: model_id.clone(),
     };
 
+    // The sidecar holds the runtime exe/DLLs and the weights open; extracting
+    // or renaming over them fails on Windows. Stop it first — it restarts on
+    // next use.
+    if matches!(model_id.as_str(), "llama-server" | "qwen3-4b") {
+        state.llm.shutdown();
+    }
+
     let app_progress = app.clone();
-    embral_engine::catalog::download(&model_id, move |p| {
+    if let Err(e) = embral_engine::catalog::download(&model_id, move |p| {
         let _ = app_progress.emit("model-download-progress", &p);
     })
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        crate::telemetry::track(
+            &state,
+            "error",
+            serde_json::json!({ "category": "model_download_failed" }),
+        );
+        return Err(e.to_string());
+    }
 
+    crate::telemetry::track(
+        &state,
+        "model_downloaded",
+        serde_json::json!({ "model_id": model_id }),
+    );
     let _ = app.emit(
         "model-download-complete",
         serde_json::json!({ "model_id": model_id }),
@@ -2158,9 +2286,20 @@ pub async fn delete_asr_model(
         // The embed worker holds the model files open; release them first.
         state.search.shutdown().await;
     }
+    // Same for the LLM sidecar: deleting the runtime or weights under a
+    // running llama-server leaves NTFS delete-pending files that block
+    // every re-download until the process dies.
+    if matches!(model_id.as_str(), "llama-server" | "qwen3-4b") {
+        state.llm.shutdown();
+    }
     embral_engine::catalog::delete(&model_id).map_err(|e| e.to_string())?;
     // Drop any warm recognizer so a re-download loads fresh files.
     state.engine.evict(&model_id);
+    crate::telemetry::track(
+        &state,
+        "model_deleted",
+        serde_json::json!({ "model_id": model_id }),
+    );
     let _ = app.emit(
         "model-download-complete",
         serde_json::json!({ "model_id": model_id }),
@@ -2184,6 +2323,8 @@ pub async fn open_notes_folder<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let config = state.config.lock().await;
     let base = crate::storage::storage_base(&config.storage_dir);
+    drop(config);
+    crate::telemetry::track(&state, "notes_folder_opened", serde_json::json!({}));
     let notes = base.join("notes");
     app.opener()
         .open_path(notes.to_string_lossy().to_string(), None::<&str>)

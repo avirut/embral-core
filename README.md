@@ -20,8 +20,7 @@ are downloaded on first run and everything after that happens on-device.
 - Dictation into any Windows app via a global hotkey, with AI cleanup.
 - Searches everything — by keyword, and by meaning once the optional
   semantic-search model is downloaded.
-- Mirrors finished notes into an Obsidian vault and/or POSTs a JSON summary
-  to a webhook.
+- Mirrors finished notes into an Obsidian vault.
 - Includes an MCP server so Claude, Codex, and other MCP clients can list,
   search, and read your meetings.
 

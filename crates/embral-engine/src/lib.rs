@@ -4,8 +4,8 @@
 //! - [`hotwords`] — vocabulary boost: phrases → BPE hotword lines.
 //! - [`Engine`] — warm recognizer cache; hands out sessions.
 //! - [`LocalSession`] / [`SessionEvent`] — one live transcription session.
-//! - [`speakers`] — pure speaker-matching math over [`Engine::diarize`] /
-//!   [`Engine::embed`] outputs.
+//! - [`speakers`] — pure diarization math over [`Engine::diarize`] /
+//!   [`Engine::embed`] outputs (live clustering, segment labeling).
 //!
 //! The crate is Tauri-free: the app adapts `LocalSession` to its own
 //! `TranscriptionSession` trait and forwards progress callbacks to events.
@@ -171,13 +171,16 @@ mod integration {
         let ea2 = engine.embed(&a[a.len() / 2..]).expect("embed half");
         let same = speakers::cosine(&ea1, &ea2);
         eprintln!("cross-speaker cosine {cross:.3}, same-speaker cosine {same:.3}");
+        // The live clusterer joins at this threshold: the same voice must
+        // score above it (rejoins its cluster) and different voices below
+        // it (split apart).
         assert!(
-            cross < speakers::MATCH_THRESHOLD,
-            "different voices should score below the match threshold"
+            cross < speakers::ONLINE_CLUSTER_THRESHOLD,
+            "different voices should score below the clustering threshold"
         );
         assert!(
-            same > speakers::MATCH_THRESHOLD,
-            "the same voice should score above the match threshold"
+            same > speakers::ONLINE_CLUSTER_THRESHOLD,
+            "the same voice should score above the clustering threshold"
         );
     }
 }
