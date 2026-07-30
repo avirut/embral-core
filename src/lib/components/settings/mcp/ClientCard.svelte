@@ -6,7 +6,10 @@
     import type { Snippet } from "svelte";
     import { ChevronDown, ChevronRight } from "lucide-svelte";
     import { Button } from "$lib/components/ui/button";
+    import { copy } from "$lib/copy";
     import type { ClientStatus, McpAction } from "./types";
+
+    const t = $derived(copy.settings.mcp.card);
 
     let {
         title,
@@ -14,7 +17,7 @@
         status = null,
         serverExists = false,
         action = null,
-        fallbackLabel = "Manual setup",
+        fallbackLabel = t.manualSetup,
         fallback,
     }: {
         title: string;
@@ -55,13 +58,13 @@
     let statusText = $derived(
         status
             ? status.registered
-                ? "Registered"
+                ? t.registered
                 : status.installed
-                  ? "Installed"
-                  : "Not installed"
+                  ? t.installed
+                  : t.notInstalled
             : informational
               ? (subtitle ?? "")
-              : "Checking…",
+              : t.checking,
     );
 
     async function run(kind: "register" | "unregister") {
@@ -101,7 +104,7 @@
                     disabled={busy}
                     onclick={() => run("unregister")}
                 >
-                    {busy ? "Working…" : "Remove"}
+                    {busy ? t.working : t.remove}
                 </Button>
             {:else}
                 <Button
@@ -109,7 +112,7 @@
                     disabled={busy || !serverExists}
                     onclick={() => run("register")}
                 >
-                    {busy ? "Working…" : "Register"}
+                    {busy ? t.working : t.register}
                 </Button>
             {/if}
         {/if}

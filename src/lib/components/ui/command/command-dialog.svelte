@@ -13,6 +13,7 @@
 		description = "Search for a command to run...",
 		showCloseButton = false,
 		portalProps,
+		onCloseAutoFocus,
 		children,
 		class: className,
 		...restProps
@@ -23,6 +24,9 @@
 			title?: string;
 			description?: string;
 			showCloseButton?: boolean;
+			/** Closing a dialog normally returns focus to whatever opened it.
+			 * A palette that *navigates* wants to opt out — see SearchPalette. */
+			onCloseAutoFocus?: (event: Event) => void;
 			class?: string;
 		} = $props();
 </script>
@@ -39,6 +43,7 @@
 		class={cn("rounded-xl! top-1/3 translate-y-0 overflow-hidden p-0", className)}
 		{showCloseButton}
 		{portalProps}
+		{onCloseAutoFocus}
 	>
 		<Command {...restProps} bind:value bind:ref {children} />
 	</Dialog.Content>

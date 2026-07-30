@@ -1,6 +1,9 @@
 <script lang="ts">
   import { Button } from "$lib/components/ui/button";
   import { comboFromEvent, formatCombo } from "$lib/utils/hotkey";
+  import { copy } from "$lib/copy";
+
+  const t = $derived(copy.common.hotkey);
 
   /**
    * Press-the-combo hotkey capture: click the chip, press a combo, done. Esc
@@ -15,7 +18,7 @@
   let {
     value,
     onChange,
-    ariaLabel = "Hotkey",
+    ariaLabel = t.defaultAria,
   }: {
     value: string;
     onChange: (combo: string) => void;
@@ -51,9 +54,9 @@
     onclick={() => (capturing = true)}
     onkeydown={capture}
   >
-    {capturing ? "Press a combo…" : formatCombo(value) || "Not set"}
+    {capturing ? t.pressCombo : formatCombo(value) || t.notSet}
   </button>
   {#if value}
-    <Button variant="ghost" size="sm" onclick={() => onChange("")}>Clear</Button>
+    <Button variant="ghost" size="sm" onclick={() => onChange("")}>{t.clear}</Button>
   {/if}
 </div>

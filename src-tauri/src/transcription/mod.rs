@@ -179,11 +179,15 @@ pub trait TranscriptionSession: Send + Sync + 'static {
     }
 }
 
+/// `provider` is this recording's lane — the config's standing choice as
+/// bent by the power policy (`config::provider_for_power`), which is why it
+/// is passed rather than read off `config`.
 pub fn build_provider(
+    provider: &embral_types::TranscriptionProvider,
     config: &AppConfig,
     engine: Arc<embral_engine::Engine>,
 ) -> Arc<dyn TranscriptionProvider> {
-    match config.transcription_provider {
+    match provider {
         embral_types::TranscriptionProvider::Local => Arc::new(local::LocalProvider::new(
             engine,
             config.meeting_asr_model(),
@@ -239,5 +243,6 @@ fn relay_provider(
         config.cloud_session_token.clone(),
         config.cloud_url(),
         language_hints,
+        config.diarization_enabled,
     ))
 }

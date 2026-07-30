@@ -35,7 +35,6 @@
   class="flex h-6 shrink-0 items-end gap-px transition-opacity duration-250 {appState.isPaused
     ? 'opacity-25'
     : 'opacity-70'}"
-  title="Live spectrum — microphone (solid) and system audio (faint)"
   aria-hidden="true"
 >
   {#each bars as b, i (i)}

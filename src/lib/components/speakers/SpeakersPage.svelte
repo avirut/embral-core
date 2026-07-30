@@ -1,9 +1,12 @@
 <script lang="ts">
     import { onMount } from "svelte";
-    import { Plus, Trash2, Users } from "lucide-svelte";
+    import { Plus, Trash2, Users, Merge } from "lucide-svelte";
+    import type { SpeakerProfile } from "$lib/types";
     import { speakersStore } from "$lib/stores/speakers.svelte";
     import { appState } from "$lib/stores/app-state.svelte";
     import SpeakerProfilePane from "./SpeakerProfilePane.svelte";
+    import MergeProfilesDialog from "./MergeProfilesDialog.svelte";
+    import * as ContextMenu from "$lib/components/ui/context-menu";
     import ResizableSplit from "$lib/components/ResizableSplit.svelte";
     import OverlayScroll from "$lib/components/OverlayScroll.svelte";
     import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
@@ -11,12 +14,17 @@
     import { Button } from "$lib/components/ui/button";
     import { groupByDate } from "$lib/utils/meetingFormat";
     import { ListSelection } from "$lib/utils/listSelection.svelte";
+    import { copy } from "$lib/copy";
     import { cn } from "$lib/utils";
+
+    const t = $derived(copy.speakers);
 
     let selectedId = $state<string | null>(null);
     let creating = $state(false);
     let confirmDelete = $state(false);
     let deleting = $state(false);
+    let confirmMerge = $state(false);
+    let merging = $state(false);
 
     // The same selection model as the meetings list — the two lists are one
     // object with different contents.
@@ -54,6 +62,34 @@
         creating = false;
         selection.click(id, event, visibleOrder);
         selectedId = selection.primary;
+    }
+
+    /** The menu acts on the selection, so a right-click outside it moves
+     * the selection first — exactly what a plain click would have done. */
+    function onRowContextMenu(id: string, event: MouseEvent) {
+        if (!selection.has(id)) onRowClick(id, event);
+    }
+
+    /** The selected people, resolved to profiles for the merge dialog. */
+    let mergeCandidates = $derived(
+        selection.ids
+            .map((id) => speakersStore.byId(id))
+            .filter((p): p is SpeakerProfile => p !== undefined),
+    );
+
+    async function mergeSelected(targetId: string) {
+        merging = true;
+        try {
+            const sourceIds = selection.ids.filter((id) => id !== targetId);
+            const merged = await speakersStore.merge(targetId, sourceIds);
+            if (merged) {
+                confirmMerge = false;
+                selection.select(targetId);
+                selectedId = targetId;
+            }
+        } finally {
+            merging = false;
+        }
     }
 
     function onKeydown(e: KeyboardEvent) {
@@ -126,40 +162,72 @@
                                 {group.label}
                             </p>
                             {#each group.items as s (s.id)}
-                                <button
-                                    class={cn(
-                                        "w-full border-l-2 px-3 py-2 text-left transition-colors duration-150",
-                                        selectedId === s.id && !creating
-                                            ? "border-l-foreground/60 bg-accent/50"
-                                            : selection.has(s.id) && !creating
-                                              ? "border-l-transparent bg-accent/40"
-                                              : "border-l-transparent hover:bg-accent/40",
-                                    )}
-                                    onclick={(e) => onRowClick(s.id, e)}
-                                >
-                                    <span class="font-display block min-w-0 truncate text-sm"
-                                        >{s.name}</span
-                                    >
-                                </button>
+                                <ContextMenu.Root>
+                                    <ContextMenu.Trigger>
+                                        {#snippet child({ props })}
+                                            <button
+                                                {...props}
+                                                class={cn(
+                                                    "w-full border-l-2 px-3 py-2 text-left transition-colors duration-150",
+                                                    selectedId === s.id && !creating
+                                                        ? "border-l-foreground/60 bg-accent/50"
+                                                        : selection.has(s.id) && !creating
+                                                          ? "border-l-transparent bg-accent/40"
+                                                          : "border-l-transparent hover:bg-accent/40",
+                                                )}
+                                                onclick={(e) => onRowClick(s.id, e)}
+                                                oncontextmenu={(e) => {
+                                                    onRowContextMenu(s.id, e);
+                                                    (props as {
+                                                        oncontextmenu?: (ev: MouseEvent) => void;
+                                                    }).oncontextmenu?.(e);
+                                                }}
+                                            >
+                                                <span
+                                                    class="font-display block min-w-0 truncate text-sm"
+                                                    >{s.name}</span
+                                                >
+                                            </button>
+                                        {/snippet}
+                                    </ContextMenu.Trigger>
+                                    <ContextMenu.Content>
+                                        {#if selection.count > 1}
+                                            <ContextMenu.Item
+                                                onSelect={() => (confirmMerge = true)}
+                                            >
+                                                <Merge />
+                                                {t.menu.merge(selection.count)}
+                                            </ContextMenu.Item>
+                                            <ContextMenu.Separator />
+                                        {/if}
+                                        <ContextMenu.Item
+                                            variant="destructive"
+                                            onSelect={() => (confirmDelete = true)}
+                                        >
+                                            <Trash2 />
+                                            {t.menu.delete(selection.count)}
+                                        </ContextMenu.Item>
+                                    </ContextMenu.Content>
+                                </ContextMenu.Root>
                             {/each}
                         {/each}
                         {#if speakers.length === 0 && speakersStore.loaded && !creating}
                             <!-- Same treatment as the meeting list's empty
                                  state — the two pages are the same object. -->
                             <p class="px-3 py-4 text-sm text-muted-foreground">
-                                No profiles yet...
+                                {t.empty}
                             </p>
                         {/if}
                     </div>
                 </OverlayScroll>
 
-                <Tip side="left" text="Add a profile">
+                <Tip side="left" text={t.add}>
                     {#snippet children({ props })}
                         <button
                             {...props}
                             onclick={startCreate}
                             class="absolute right-3 bottom-3 flex h-10 w-10 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-md transition-colors hover:bg-primary/90"
-                            aria-label="Add a profile"
+                            aria-label={t.add}
                         >
                             <Plus size={18} />
                         </button>
@@ -176,16 +244,25 @@
                         class="flex h-full flex-col items-center justify-center gap-4 p-8"
                     >
                         <p class="text-sm text-muted-foreground">
-                            {selection.count} profiles selected
+                            {t.multiSelect.selected(selection.count)}
                         </p>
-                        <button
-                            onclick={() => (confirmDelete = true)}
-                            class="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm font-medium transition-colors hover:bg-destructive hover:text-white"
-                        >
-                            <Trash2 size={15} />
-                            Delete {selection.count}
-                        </button>
-                        <p class="text-xs text-muted-foreground">Or press Delete.</p>
+                        <div class="flex items-center gap-2">
+                            <button
+                                onclick={() => (confirmMerge = true)}
+                                class="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm font-medium transition-colors hover:bg-accent"
+                            >
+                                <Merge size={15} />
+                                {t.multiSelect.merge(selection.count)}
+                            </button>
+                            <button
+                                onclick={() => (confirmDelete = true)}
+                                class="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm font-medium transition-colors hover:bg-destructive hover:text-white"
+                            >
+                                <Trash2 size={15} />
+                                {t.multiSelect.delete(selection.count)}
+                            </button>
+                        </div>
+                        <p class="text-xs text-muted-foreground">{t.multiSelect.hint}</p>
                     </div>
                 {:else if creating}
                     <SpeakerProfilePane speaker={null} onSaved={onSaved} />
@@ -201,16 +278,13 @@
                     >
                         <Users size={28} class="text-muted-foreground/60" />
                         <div class="max-w-md space-y-1.5">
-                            <p class="text-sm font-medium">Know who said what</p>
+                            <p class="text-sm font-medium">{t.intro.title}</p>
                             <p class="text-xs leading-relaxed text-muted-foreground">
-                                Save the people you meet with. embral tells speakers
-                                apart in every recording; name a speaker once in a
-                                transcript and their profile keeps notes and history
-                                in one place.
+                                {t.intro.body}
                             </p>
                         </div>
                         <Button size="sm" onclick={startCreate}>
-                            <Plus size={15} class="mr-1" /> Add a profile
+                            <Plus size={15} class="mr-1" /> {t.add}
                         </Button>
                     </div>
                 {/if}
@@ -223,11 +297,16 @@
 
 <ConfirmDialog
     bind:open={confirmDelete}
-    title={selection.count === 1
-        ? "Delete profile?"
-        : `Delete ${selection.count} profiles?`}
-    body="Transcripts keep the names already written into them."
-    confirmLabel={selection.count === 1 ? "Delete" : `Delete ${selection.count}`}
+    title={t.deleteConfirm.title(selection.count)}
+    body={t.deleteConfirm.body}
+    confirmLabel={t.deleteConfirm.confirm(selection.count)}
     busy={deleting}
     onConfirm={deleteSelected}
+/>
+
+<MergeProfilesDialog
+    bind:open={confirmMerge}
+    profiles={mergeCandidates}
+    busy={merging}
+    onConfirm={mergeSelected}
 />

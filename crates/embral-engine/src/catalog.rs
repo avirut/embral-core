@@ -92,6 +92,14 @@ pub enum ModelSource {
         /// (role, exe basename) — the file `role_path` resolves to.
         exe: (FileRole, &'static str),
     },
+    /// `ZipAll`'s `.tar.gz` twin (llama.cpp ships tarballs on macOS).
+    /// Unix mode bits are preserved so the exe stays executable.
+    TarAll {
+        url: &'static str,
+        bytes: u64,
+        /// (role, exe basename) — the file `role_path` resolves to.
+        exe: (FileRole, &'static str),
+    },
 }
 
 pub struct KnownModel {
@@ -319,6 +327,10 @@ pub const MODELS: &[KnownModel] = &[
             ],
         },
     },
+    // The llama.cpp runtime is the one per-platform binary in the catalog;
+    // each target carries its own entry (same id, its own artifact —
+    // upstream ships a .zip on Windows and a .tar.gz on macOS).
+    #[cfg(windows)]
     KnownModel {
         id: "llama-server",
         display_name: "Summary engine",
@@ -331,6 +343,21 @@ pub const MODELS: &[KnownModel] = &[
             url: "https://github.com/ggml-org/llama.cpp/releases/download/b9925/llama-b9925-bin-win-cpu-x64.zip",
             bytes: 17_507_535,
             exe: (FileRole::LlamaServer, "llama-server.exe"),
+        },
+    },
+    #[cfg(target_os = "macos")]
+    KnownModel {
+        id: "llama-server",
+        display_name: "Summary engine",
+        kind: ModelKind::Llm,
+        languages: &["*"],
+        note: "Local runtime for summaries and dictation cleanup",
+        supports_hotwords: false,
+        native_punctuation: false,
+        source: ModelSource::TarAll {
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b9925/llama-b9925-bin-macos-arm64.tar.gz",
+            bytes: 11_146_856,
+            exe: (FileRole::LlamaServer, "llama-server"),
         },
     },
     KnownModel {
@@ -405,7 +432,7 @@ impl KnownModel {
         match &self.source {
             ModelSource::Files(files) => files.iter().map(|f| (f.role, f.name)).collect(),
             ModelSource::Archive { members, .. } => members.to_vec(),
-            ModelSource::ZipAll { exe, .. } => vec![*exe],
+            ModelSource::ZipAll { exe, .. } | ModelSource::TarAll { exe, .. } => vec![*exe],
         }
     }
 
@@ -419,7 +446,9 @@ impl KnownModel {
     pub fn total_bytes(&self) -> u64 {
         match &self.source {
             ModelSource::Files(files) => files.iter().map(|f| f.bytes).sum(),
-            ModelSource::Archive { bytes, .. } | ModelSource::ZipAll { bytes, .. } => *bytes,
+            ModelSource::Archive { bytes, .. }
+            | ModelSource::ZipAll { bytes, .. }
+            | ModelSource::TarAll { bytes, .. } => *bytes,
         }
     }
 
@@ -436,7 +465,7 @@ impl KnownModel {
             ModelSource::Archive { members, .. } => {
                 members.iter().all(|(_, name)| dir.join(name).is_file())
             }
-            ModelSource::ZipAll { exe, .. } => {
+            ModelSource::ZipAll { exe, .. } | ModelSource::TarAll { exe, .. } => {
                 dir.join(exe.1).is_file() && dir.join(ZIP_COMPLETE_MARKER).is_file()
             }
         }
@@ -572,11 +601,12 @@ pub async fn download(model_id: &str, progress: impl Fn(DownloadProgress) + Send
                 bail!("archive did not contain all expected model files");
             }
         }
-        ModelSource::ZipAll { url, exe, .. } => {
+        ModelSource::ZipAll { url, exe, .. } | ModelSource::TarAll { url, exe, .. } => {
             if model.present() {
                 return Ok(());
             }
-            let archive_name = "archive.zip";
+            let is_tar = matches!(&model.source, ModelSource::TarAll { .. });
+            let archive_name = if is_tar { "archive.tar.gz" } else { "archive.zip" };
             let tmp = dir.join(archive_name);
             stream_to_file(&client, url, &tmp, |bytes| {
                 progress(DownloadProgress {
@@ -591,9 +621,15 @@ pub async fn download(model_id: &str, progress: impl Fn(DownloadProgress) + Send
 
             let tmp2 = tmp.clone();
             let dir2 = dir.clone();
-            tokio::task::spawn_blocking(move || extract_zip_all(&tmp2, &dir2))
-                .await
-                .context("extract task panicked")??;
+            tokio::task::spawn_blocking(move || {
+                if is_tar {
+                    extract_tar_all(&tmp2, &dir2)
+                } else {
+                    extract_zip_all(&tmp2, &dir2)
+                }
+            })
+            .await
+            .context("extract task panicked")??;
             let _ = tokio::fs::remove_file(&tmp).await;
 
             if !dir.join(exe.1).is_file() {
@@ -632,6 +668,65 @@ fn extract_zip_all(archive: &Path, dir: &Path) -> Result<()> {
         let dest = dir.join(&base);
         std::fs::rename(&tmp, &dest)
             .with_context(|| format!("replace {} (is it held open?)", dest.display()))?;
+    }
+    Ok(())
+}
+
+/// Extract every file in a `.tar.gz` flat into `dir` (leading archive
+/// folders stripped), each via tmp+rename — `extract_zip_all`'s tarball
+/// twin. Unix mode bits carry over, so executables stay executable, and
+/// symlink entries are recreated after the files land — llama.cpp's
+/// dylib version chains (`libggml.0.dylib -> libggml.0.15.3.dylib`) are
+/// symlinks, and the exe links the versioned names.
+fn extract_tar_all(archive: &Path, dir: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive).context("open downloaded archive")?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    // (link basename, target basename), created after the real files so a
+    // link never dangles mid-extraction.
+    let mut links: Vec<(String, String)> = Vec::new();
+    for entry in tar.entries().context("read archive entries")? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let Some(base) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if entry.header().entry_type().is_symlink() {
+            if let Some(target) = entry
+                .link_name()
+                .ok()
+                .flatten()
+                .and_then(|t| t.file_name().map(|n| n.to_string_lossy().to_string()))
+            {
+                links.push((base, target));
+            }
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let tmp = dir.join(format!("{base}.extract.tmp"));
+        {
+            let mut out =
+                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            std::io::copy(&mut entry, &mut out)
+                .with_context(|| format!("write {}", tmp.display()))?;
+        }
+        #[cfg(unix)]
+        if let Ok(mode) = entry.header().mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+        }
+        let dest = dir.join(&base);
+        std::fs::rename(&tmp, &dest)
+            .with_context(|| format!("replace {} (is it held open?)", dest.display()))?;
+    }
+    #[cfg(unix)]
+    for (base, target) in links {
+        let dest = dir.join(&base);
+        let _ = std::fs::remove_file(&dest);
+        std::os::unix::fs::symlink(&target, &dest)
+            .with_context(|| format!("link {} -> {target}", dest.display()))?;
     }
     Ok(())
 }
@@ -778,6 +873,7 @@ mod tests {
         assert!(s.iter().all(|st| st.total_bytes > 0));
     }
 
+    #[cfg(windows)]
     #[test]
     fn llm_pack_has_runtime_and_weights() {
         let runtime = find("llama-server").unwrap();
@@ -791,6 +887,56 @@ mod tests {
                 .unwrap(),
             "llama-server.exe"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn llm_pack_has_runtime_and_weights() {
+        let runtime = find("llama-server").unwrap();
+        assert_eq!(runtime.kind, ModelKind::Llm);
+        assert!(matches!(runtime.source, ModelSource::TarAll { .. }));
+        assert_eq!(
+            runtime
+                .role_path(FileRole::LlamaServer)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "llama-server"
+        );
+    }
+
+    /// Live probe of the real runtime download + spawn — run manually:
+    /// `cargo test -p embral-engine --lib llama_runtime_downloads -- --ignored --nocapture`.
+    /// Proves the tar source end-to-end on this machine: the archive
+    /// extracts flat, the exe keeps its mode bits, and its @rpath dylibs
+    /// resolve from the flattened dir.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "manual probe; downloads the ~11 MB runtime and spawns it"]
+    async fn llama_runtime_downloads_and_runs() {
+        download("llama-server", |p| {
+            eprintln!("{} / {} bytes", p.downloaded_bytes, p.total_bytes)
+        })
+        .await
+        .expect("download + extract");
+        let exe = find("llama-server")
+            .unwrap()
+            .role_path(FileRole::LlamaServer)
+            .unwrap();
+        let out = std::process::Command::new(&exe)
+            .arg("--version")
+            .output()
+            .expect("spawn llama-server");
+        eprintln!(
+            "exit: {:?}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "llama-server --version must run");
+    }
+
+    #[test]
+    fn llm_weights_are_platform_neutral() {
         let weights = find("qwen3-4b").unwrap();
         assert_eq!(weights.kind, ModelKind::Llm);
         assert!(weights.role_path(FileRole::Gguf).is_some());
@@ -817,6 +963,50 @@ mod tests {
         assert_eq!(std::fs::read(out.join("tool.exe"))?, b"exe-bytes");
         assert_eq!(std::fs::read(out.join("helper.dll"))?, b"dll-bytes");
         assert!(!out.join("bin").exists(), "flattened, no subdirs");
+        Ok(())
+    }
+
+    #[test]
+    fn extract_tar_all_flattens_and_keeps_modes() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let archive_path = tmp.path().join("a.tar.gz");
+        {
+            let f = std::fs::File::create(&archive_path)?;
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut w = tar::Builder::new(gz);
+            let add = |w: &mut tar::Builder<_>, path: &str, mode: u32, body: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(mode);
+                h.set_cksum();
+                w.append_data(&mut h, path, body)
+            };
+            add(&mut w, "build/bin/llama-server", 0o755, b"exe-bytes")?;
+            add(&mut w, "build/bin/libggml.0.1.dylib", 0o644, b"lib-bytes")?;
+            // The version-chain symlink llama.cpp ships beside its dylibs.
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_cksum();
+            w.append_link(&mut h, "build/bin/libggml.0.dylib", "libggml.0.1.dylib")?;
+            w.into_inner()?.finish()?;
+        }
+        let out = tmp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        extract_tar_all(&archive_path, &out)?;
+        assert_eq!(std::fs::read(out.join("llama-server"))?, b"exe-bytes");
+        assert_eq!(std::fs::read(out.join("libggml.0.1.dylib"))?, b"lib-bytes");
+        assert!(!out.join("build").exists(), "flattened, no subdirs");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(out.join("llama-server"))?.permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "the exe keeps its executable bits");
+            // The version-chain symlink resolves through to the real dylib.
+            let link = out.join("libggml.0.dylib");
+            assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+            assert_eq!(std::fs::read(&link)?, b"lib-bytes");
+        }
         Ok(())
     }
 

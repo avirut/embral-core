@@ -1,6 +1,6 @@
 [package]
 name = "embral"
-version = "0.4.1"
+version = "26.7.0"
 description = "Meeting transcription and notes, on your machine."
 authors = ["avirut"]
 edition = "2021"
@@ -21,7 +21,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-ico", "image-png"] }
 tauri-plugin-opener = "2"
-tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-dialog = "2"
@@ -54,19 +53,52 @@ async-trait = "0.1"
 futures-util = "0.3"
 url = "2"
 base64 = "0.22"
+arboard = { version = "3", default-features = false }
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
+
+# The Windows platform layer (src/platform/windows/). The macOS build must
+# not drag Win32 bindings in; keep every OS-specific dependency under its
+# target table.
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
+    # WinRT, for the in-box OCR engine (platform/windows/ocr.rs): the
+    # engine itself, the image decoder that feeds it, and the in-memory
+    # stream the bytes arrive on. `Media` already implies `Foundation`.
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_Foundation",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Variant",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_JobObjects",
     "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
-arboard = { version = "3", default-features = false }
-sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
+# The `#[implement]` macro (per-process audio capture's completion
+# handler) expands to `windows_core::` paths, so the crate must be nameable
+# — the `windows` facade's re-export is not enough.
+windows-core = "0.62"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+libc = "0.2.189"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSPanel", "NSResponder", "NSRunningApplication", "NSWindow", "NSWorkspace"] }
+objc2-application-services = { version = "0.3.2", features = ["HIServices"] }
+objc2-av-foundation = { version = "0.3.2", features = ["AVCaptureDevice", "AVMediaFormat"] }
+objc2-core-audio = { version = "0.3.2", features = ["objc2", "objc2-foundation", "block2", "dispatch2", "objc2-core-audio-types"] }
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = { version = "0.3.2", features = ["CGEvent", "CGEventTypes"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSDictionary", "NSProcessInfo", "NSUserDefaults", "NSString"] }
+# Vision, for the in-box OCR engine (platform/macos/ocr.rs).
+objc2-vision = { version = "0.3.2", features = ["VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }

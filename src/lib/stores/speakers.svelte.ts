@@ -1,3 +1,4 @@
+import { errorMessage } from '$lib/copy/errors';
 import { invoke } from '@tauri-apps/api/core';
 import type { SpeakerProfile } from '$lib/types';
 
@@ -30,7 +31,7 @@ export const speakersStore = {
       _speakers = await invoke<SpeakerProfile[]>('list_speakers');
       _loaded = true;
     } catch (e) {
-      _error = String(e);
+      _error = errorMessage(e);
     }
   },
 
@@ -50,7 +51,7 @@ export const speakersStore = {
       await this.refresh();
       return saved;
     } catch (e) {
-      _error = String(e);
+      _error = errorMessage(e);
       return null;
     }
   },
@@ -62,7 +63,24 @@ export const speakersStore = {
       await invoke('delete_speaker', { id });
       await this.refresh();
     } catch (e) {
-      _error = String(e);
+      _error = errorMessage(e);
+    }
+  },
+
+  /** Fold the other selected people into the survivor. */
+  async merge(targetId: string, sourceIds: string[]): Promise<SpeakerProfile | null> {
+    if (!isTauri() || sourceIds.length === 0) return null;
+    _error = null;
+    try {
+      const merged = await invoke<SpeakerProfile>('merge_speakers', {
+        targetId,
+        sourceIds
+      });
+      await this.refresh();
+      return merged;
+    } catch (e) {
+      _error = errorMessage(e);
+      return null;
     }
   },
 
@@ -74,7 +92,7 @@ export const speakersStore = {
       await invoke('delete_speakers', { ids });
       await this.refresh();
     } catch (e) {
-      _error = String(e);
+      _error = errorMessage(e);
     }
   },
 

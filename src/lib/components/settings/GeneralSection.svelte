@@ -6,14 +6,18 @@
     import { RefreshCw } from "lucide-svelte";
     import type { AppConfig, AudioDevices, Theme } from "$lib/types";
     import SettingsGroup from "./SettingsGroup.svelte";
+    import MicAccess from "./MicAccess.svelte";
     import SettingRow from "./SettingRow.svelte";
     import * as Select from "$lib/components/ui/select";
     import { Switch } from "$lib/components/ui/switch";
     import { Input } from "$lib/components/ui/input";
     import { Button } from "$lib/components/ui/button";
     import { loadTelemetrySetting } from "$lib/cloud";
+    import { copy } from "$lib/copy";
 
     let { draft }: { draft: AppConfig } = $props();
+
+    const t = $derived(copy.settings.general);
 
     // The Privacy group (telemetry toggle) is a cloud-edition component
     // ([telemetry.md]); the open-core build has no telemetry.
@@ -23,27 +27,29 @@
         TelemetrySetting = await loadTelemetrySetting();
     });
 
-    const themeLabels: Record<Theme, string> = {
-        system: "System",
-        light: "Light",
-        dark: "Dark",
-    };
-
     // Recording indicator: the Windows accent by default, or a preset.
     // Sentinel because the stored "follow the accent" value is "".
     const ACCENT = "__accent__";
-    const indicatorColors: { value: string; label: string }[] = [
-        { value: "#b91c1c", label: "Red" },
-        { value: "#c2410c", label: "Orange" },
-        { value: "#15803d", label: "Green" },
-        { value: "#1d4ed8", label: "Blue" },
-        { value: "#6d28d9", label: "Purple" },
-        { value: "#be185d", label: "Pink" },
+    // The palette is fixed; the names come from the catalog by key.
+    const indicatorColors: {
+        value: string;
+        key: keyof typeof copy.settings.general.appearance.indicator.colors;
+    }[] = [
+        { value: "#b91c1c", key: "red" },
+        { value: "#c2410c", key: "orange" },
+        { value: "#15803d", key: "green" },
+        { value: "#1d4ed8", key: "blue" },
+        { value: "#6d28d9", key: "purple" },
+        { value: "#be185d", key: "pink" },
     ];
-    let indicatorLabel = $derived(
-        indicatorColors.find((c) => c.value === draft.tray_recording_color)
-            ?.label ?? "Windows accent",
-    );
+    let indicatorLabel = $derived.by(() => {
+        const found = indicatorColors.find(
+            (c) => c.value === draft.tray_recording_color,
+        );
+        return found
+            ? t.appearance.indicator.colors[found.key]
+            : t.appearance.indicator.accent;
+    });
     // The live accent, for the "Windows accent" swatch; stock blue until read.
     let accentColor = $state("#0078d4");
     let swatchColor = $derived(draft.tray_recording_color || accentColor);
@@ -73,7 +79,7 @@
     });
 
     function deviceLabel(configured: string): string {
-        return configured === "" ? "System default" : configured;
+        return configured === "" ? t.audio.systemDefault : configured;
     }
 
     async function browseStorageDir() {
@@ -85,25 +91,34 @@
 </script>
 
 <div class="space-y-6">
-    <SettingsGroup label="Appearance">
-        <SettingRow title="Color scheme">
+    <SettingsGroup label={t.appearance._group}>
+        <SettingRow title={t.appearance.theme.label}>
             <Select.Root
                 type="single"
                 value={draft.theme}
                 onValueChange={(v) => (draft.theme = (v ?? "system") as Theme)}
             >
                 <Select.Trigger class="w-56"
-                    >{themeLabels[draft.theme]}</Select.Trigger
+                    >{t.appearance.theme.options[draft.theme]}</Select.Trigger
                 >
                 <Select.Content>
-                    <Select.Item value="system" label="System" />
-                    <Select.Item value="light" label="Light" />
-                    <Select.Item value="dark" label="Dark" />
+                    <Select.Item
+                        value="system"
+                        label={t.appearance.theme.options.system}
+                    />
+                    <Select.Item
+                        value="light"
+                        label={t.appearance.theme.options.light}
+                    />
+                    <Select.Item
+                        value="dark"
+                        label={t.appearance.theme.options.dark}
+                    />
                 </Select.Content>
             </Select.Root>
         </SettingRow>
 
-        <SettingRow title="Recording indicator color">
+        <SettingRow title={t.appearance.indicator.label}>
             <Select.Root
                 type="single"
                 value={draft.tray_recording_color === ""
@@ -123,23 +138,29 @@
                     </span>
                 </Select.Trigger>
                 <Select.Content>
-                    <Select.Item value={ACCENT} label="Windows accent">
+                    <Select.Item
+                        value={ACCENT}
+                        label={t.appearance.indicator.accent}
+                    >
                         <span class="flex items-center gap-2">
                             <span
                                 class="size-3 shrink-0 rounded-full"
                                 style="background: {accentColor}"
                             ></span>
-                            Windows accent
+                            {t.appearance.indicator.accent}
                         </span>
                     </Select.Item>
                     {#each indicatorColors as c (c.value)}
-                        <Select.Item value={c.value} label={c.label}>
+                        <Select.Item
+                            value={c.value}
+                            label={t.appearance.indicator.colors[c.key]}
+                        >
                             <span class="flex items-center gap-2">
                                 <span
                                     class="size-3 shrink-0 rounded-full"
                                     style="background: {c.value}"
                                 ></span>
-                                {c.label}
+                                {t.appearance.indicator.colors[c.key]}
                             </span>
                         </Select.Item>
                     {/each}
@@ -148,22 +169,20 @@
         </SettingRow>
     </SettingsGroup>
 
-    <SettingsGroup label="Storage">
-        <SettingRow
-            title="Storage folder"
-            vertical
-        >
+    <SettingsGroup label={t.storage._group}>
+        <SettingRow title={t.storage.folder.label} vertical>
             <div class="flex w-full gap-2">
                 <Input bind:value={draft.storage_dir} class="flex-1" />
                 <Button variant="outline" size="sm" onclick={browseStorageDir}
-                    >Browse…</Button
+                    >{t.storage.browse}</Button
                 >
             </div>
         </SettingRow>
     </SettingsGroup>
 
-    <SettingsGroup label="Audio">
-        <SettingRow title="Microphone">
+    <SettingsGroup label={t.audio._group}>
+        <MicAccess />
+        <SettingRow title={t.audio.mic.label}>
             <Select.Root
                 type="single"
                 value={draft.mic_device === "" ? DEFAULT : draft.mic_device}
@@ -176,7 +195,7 @@
                     ></Select.Trigger
                 >
                 <Select.Content>
-                    <Select.Item value={DEFAULT} label="System default" />
+                    <Select.Item value={DEFAULT} label={t.audio.systemDefault} />
                     {#each devices.inputs as name (name)}
                         <Select.Item value={name} label={name} />
                     {/each}
@@ -185,8 +204,8 @@
         </SettingRow>
 
         <SettingRow
-            title="System audio"
-            description="Lets calls on headphones still record everyone"
+            title={t.audio.systemAudio.label}
+            description={t.audio.systemAudio.sub}
         >
             <Select.Root
                 type="single"
@@ -202,7 +221,7 @@
                     ></Select.Trigger
                 >
                 <Select.Content>
-                    <Select.Item value={DEFAULT} label="System default" />
+                    <Select.Item value={DEFAULT} label={t.audio.systemDefault} />
                     {#each devices.outputs as name (name)}
                         <Select.Item value={name} label={name} />
                     {/each}
@@ -210,7 +229,7 @@
             </Select.Root>
         </SettingRow>
 
-        <SettingRow title="Refresh devices">
+        <SettingRow title={t.audio.refresh.label}>
             <Button
                 variant="outline"
                 size="sm"
@@ -218,30 +237,25 @@
                 onclick={refresh}
             >
                 <RefreshCw size={14} class={loading ? "animate-spin" : ""} />
-                Refresh
+                {t.audio.refresh.button}
             </Button>
         </SettingRow>
     </SettingsGroup>
 
-    <SettingsGroup label="Notifications">
-        <SettingRow title="Summary ready">
+    <SettingsGroup label={t.notifications._group}>
+        <SettingRow title={t.notifications.summaryReady.label}>
             <Switch bind:checked={draft.notify_summary_ready} />
         </SettingRow>
-        <SettingRow
-            title="Recording started"
-            description="Only when the window is hidden"
-        >
+        <SettingRow title={t.notifications.recordingStarted.label}>
             <Switch bind:checked={draft.notify_recording_started} />
         </SettingRow>
         <SettingRow
-            title="Call detected"
-            description="Only when embral is set to ask before recording"
+            title={t.notifications.callDetected.label}
+            description={t.notifications.callDetected.sub}
         >
             <Switch bind:checked={draft.notify_call_detected} />
         </SettingRow>
-        <SettingRow
-            title="Update ready"
-        >
+        <SettingRow title={t.notifications.updateReady.label}>
             <Switch bind:checked={draft.notify_update_available} />
         </SettingRow>
     </SettingsGroup>

@@ -173,9 +173,10 @@ describe('formatDuration', () => {
     expect(formatTime(90.6)).toBe('1:30');
   });
 
-  it('switches to hours and minutes once it runs long', () => {
-    expect(formatDuration(3600)).toBe('1h 0m');
-    expect(formatDuration(4830)).toBe('1h 20m');
+  it('grows an hours digit once it runs long, keeping the seconds', () => {
+    expect(formatDuration(3600)).toBe('1:00:00');
+    expect(formatDuration(4830)).toBe('1:20:30');
+    expect(formatDuration(4953)).toBe('1:22:33');
   });
 
   it('clamps a negative to zero', () => {

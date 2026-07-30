@@ -43,11 +43,10 @@ pub struct Candidate {
 }
 
 /// A session-generated numbered label ("Speaker 3") — the only labels the
-/// naming pass may rename.
+/// naming pass may rename. Lives in embral-types so the registry layer can
+/// apply the same rule.
 pub fn is_generic_label(label: &str) -> bool {
-    label
-        .strip_prefix("Speaker ")
-        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    embral_types::is_generic_speaker_label(label)
 }
 
 /// The matchable side of the transcript: paragraphs still carrying a
@@ -71,8 +70,8 @@ pub fn candidates(paragraphs: &[Paragraph], cap: usize) -> Vec<Candidate> {
 
 /// The notes as matchable lines: markdown syntax stripped, blanks and
 /// one-word fragments dropped.
-pub fn note_lines(notes_md: &str) -> Vec<String> {
-    notes_md
+pub fn note_lines(summary: &str) -> Vec<String> {
+    summary
         .lines()
         .map(strip_markdown_line)
         .filter(|l| tokens(l).len() >= 2)
@@ -199,13 +198,13 @@ Use {"assignments":[]} when the notes don't identify anyone."#;
 /// Build the naming call's user message: the labels, the full notes for
 /// context, and the evidence pairs.
 pub fn build_naming_message(
-    notes_md: &str,
+    summary: &str,
     labels: &[String],
     evidence: &[EvidencePair],
 ) -> String {
     let mut out = format!("GENERIC SPEAKER LABELS: {}\n\n", labels.join(", "));
     out.push_str("USER NOTES (typed live during the meeting):\n");
-    out.push_str(notes_md.trim());
+    out.push_str(summary.trim());
     out.push_str("\n\nEVIDENCE (note line beside a transcript excerpt that resembles it):\n");
     if evidence.is_empty() {
         out.push_str("(none — no note line resembles any excerpt)\n");

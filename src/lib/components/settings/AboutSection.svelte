@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { errorMessage } from '$lib/copy/errors';
     import { onMount } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
     import { getVersion } from "@tauri-apps/api/app";
@@ -17,6 +18,9 @@
     import { dictationStore } from "$lib/stores/dictation.svelte";
     import { modelsStore } from "$lib/stores/models.svelte";
     import { updaterStore } from "$lib/stores/updater.svelte";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.settings.about);
 
     let version = $state("");
     let resetOpen = $state(false);
@@ -24,14 +28,16 @@
     let resetError = $state("");
 
     // Settings is the old one-button reset, so it starts on.
-    const scopeItems = [
-        { key: "settings", label: "Settings" },
-        { key: "meetings", label: "Meetings" },
-        { key: "profiles", label: "Profiles" },
-        { key: "dictations", label: "Dictations" },
-        { key: "models", label: "Models" },
+    // The scope keys and order are this component's; labels come from the
+    // catalog.
+    const scopeKeys = [
+        "settings",
+        "meetings",
+        "profiles",
+        "dictations",
+        "models",
     ] as const;
-    type ScopeKey = (typeof scopeItems)[number]["key"];
+    type ScopeKey = (typeof scopeKeys)[number];
     let scopes = $state<Record<ScopeKey, boolean>>({
         settings: true,
         meetings: false,
@@ -39,7 +45,7 @@
         dictations: false,
         models: false,
     });
-    let anyScope = $derived(scopeItems.some((s) => scopes[s.key]));
+    let anyScope = $derived(scopeKeys.some((k) => scopes[k]));
 
     async function resetApp() {
         resetting = true;
@@ -57,7 +63,7 @@
                 appState.setView("idle");
             }
         } catch (e) {
-            resetError = e instanceof Error ? e.message : String(e);
+            resetError = errorMessage(e);
         } finally {
             resetting = false;
         }
@@ -87,52 +93,59 @@
         }
     }
 
-    const credits: { name: string; what: string; license: string; url: string }[] = [
+    // Names, licenses, and URLs are data; the "what" description comes from
+    // the catalog by key.
+    const credits: {
+        name: string;
+        key: keyof typeof copy.settings.about.credits.what;
+        license: string;
+        url: string;
+    }[] = [
         {
             name: "sherpa-onnx (k2-fsa)",
-            what: "speech runtime",
+            key: "sherpa",
             license: "Apache-2.0",
             url: "https://github.com/k2-fsa/sherpa-onnx",
         },
         {
             name: "NVIDIA Parakeet & TitaNet",
-            what: "speech recognition & speaker embeddings",
+            key: "parakeet",
             license: "CC-BY-4.0",
             url: "https://huggingface.co/nvidia",
         },
         {
             name: "icefall Zipformer",
-            what: "speech recognition",
+            key: "zipformer",
             license: "Apache-2.0",
             url: "https://github.com/k2-fsa/icefall",
         },
         {
             name: "pyannote segmentation",
-            what: "speaker diarization",
+            key: "pyannote",
             license: "MIT",
             url: "https://github.com/pyannote/pyannote-audio",
         },
         {
             name: "NVIDIA TitaNet",
-            what: "voice recognition",
+            key: "titanet",
             license: "CC-BY-4.0",
             url: "https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/titanet_small",
         },
         {
             name: "Silero VAD",
-            what: "voice activity detection",
+            key: "silero",
             license: "MIT",
             url: "https://github.com/snakers4/silero-vad",
         },
         {
             name: "Qwen3 (Alibaba)",
-            what: "summaries & dictation cleanup",
+            key: "qwen",
             license: "Apache-2.0",
             url: "https://github.com/QwenLM/Qwen3",
         },
         {
             name: "llama.cpp",
-            what: "on-device LLM runtime",
+            key: "llama",
             license: "MIT",
             url: "https://github.com/ggml-org/llama.cpp",
         },
@@ -145,21 +158,21 @@
         <div class="min-w-0">
             <p class="text-base font-semibold tracking-tight">embral</p>
             <p class="mt-0.5 text-xs text-muted-foreground">
-                Privacy forward meeting transcripts and dictation
+                {t.tagline}
             </p>
             <p class="mt-1 font-mono text-[11px] text-muted-foreground/80">
-                version {version}
+                {t.version(version)}
             </p>
         </div>
     </div>
 
-    <SettingsGroup label="Updates">
+    <SettingsGroup label={t.updates._group}>
         <SettingRow
             title={updaterStore.available
-                ? `Version ${updaterStore.available.version} is ready`
-                : "Up to date"}
+                ? t.updates.ready(updaterStore.available.version)
+                : t.updates.upToDate}
             description={updaterStore.blocked
-                ? `${updaterStore.blocked} — finish it, then update.`
+                ? t.updates.blocked(updaterStore.blocked)
                 : ""}
         >
             {#if updaterStore.available}
@@ -170,10 +183,10 @@
                 >
                     {#if updaterStore.installing}
                         <Loader2 size={13} class="animate-spin" />
-                        Installing…
+                        {t.updates.installing}
                     {:else}
                         <RotateCcw size={13} />
-                        Restart and update
+                        {t.updates.restartAndUpdate}
                     {/if}
                 </Button>
             {:else}
@@ -186,7 +199,7 @@
                     {#if updaterStore.checking}
                         <Loader2 size={13} class="animate-spin" />
                     {/if}
-                    Check for updates
+                    {t.updates.checkForUpdates}
                 </Button>
             {/if}
         </SettingRow>
@@ -195,23 +208,23 @@
         {/if}
     </SettingsGroup>
 
-    <SettingsGroup label="Diagnostics">
+    <SettingsGroup label={t.diagnostics._group}>
         <SettingRow
-            title="Logs"
-            description="Attach the latest file when reporting a problem."
+            title={t.diagnostics.logs.label}
+            description={t.diagnostics.logs.sub}
         >
             <Button variant="outline" size="sm" onclick={openLogs}>
                 <FolderOpen size={14} />
-                Open logs folder
+                {t.diagnostics.logs.button}
             </Button>
         </SettingRow>
-        <SettingRow title="Notes folder">
+        <SettingRow title={t.diagnostics.notesFolder.label}>
             <Button variant="outline" size="sm" onclick={openNotesFolder}>
                 <FolderOpen size={14} />
-                Open notes folder
+                {t.diagnostics.notesFolder.button}
             </Button>
         </SettingRow>
-        <SettingRow title="Reset app">
+        <SettingRow title={t.diagnostics.reset.label}>
             <Button
                 variant="outline"
                 size="sm"
@@ -220,12 +233,12 @@
                 onclick={() => (resetOpen = true)}
             >
                 <RotateCcw size={14} />
-                Reset…
+                {t.diagnostics.reset.button}
             </Button>
         </SettingRow>
     </SettingsGroup>
 
-    <SettingsGroup label="On the shoulders of">
+    <SettingsGroup label={t.credits._group}>
         <div class="px-4 py-3">
             <div class="space-y-1.5">
                 {#each credits as c (c.name)}
@@ -237,7 +250,7 @@
                             {c.name}
                         </button>
                         <span class="shrink-0 text-muted-foreground"
-                            >{c.what} · {c.license}</span
+                            >{t.credits.what[c.key]} · {c.license}</span
                         >
                     </div>
                 {/each}
@@ -249,16 +262,16 @@
 <Dialog.Root bind:open={resetOpen}>
     <Dialog.Content class="sm:max-w-md">
         <Dialog.Header>
-            <Dialog.Title>Reset embral</Dialog.Title>
+            <Dialog.Title>{t.resetDialog.title}</Dialog.Title>
             <Dialog.Description>
-                Pick what to erase. None of it can be brought back.
+                {t.resetDialog.description}
             </Dialog.Description>
         </Dialog.Header>
         <div>
-            {#each scopeItems as item (item.key)}
+            {#each scopeKeys as key (key)}
                 <div class="flex items-center justify-between py-2">
-                    <span class="text-sm">{item.label}</span>
-                    <Switch bind:checked={scopes[item.key]} />
+                    <span class="text-sm">{t.resetDialog.scopes[key]}</span>
+                    <Switch bind:checked={scopes[key]} />
                 </div>
             {/each}
         </div>
@@ -267,7 +280,7 @@
         {/if}
         <Dialog.Footer>
             <Button variant="ghost" size="sm" onclick={() => (resetOpen = false)}>
-                Cancel
+                {t.resetDialog.cancel}
             </Button>
             <Button
                 variant="destructive"
@@ -275,7 +288,7 @@
                 disabled={!anyScope || resetting}
                 onclick={resetApp}
             >
-                {resetting ? "Resetting…" : "Reset"}
+                {resetting ? t.resetDialog.resetting : t.resetDialog.reset}
             </Button>
         </Dialog.Footer>
     </Dialog.Content>

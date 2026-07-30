@@ -1,10 +1,14 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { Pause, Play, Square, Star } from 'lucide-svelte';
+  import { Eye, EyeOff, Pause, Play, Square, Star } from 'lucide-svelte';
   import { appState } from '$lib/stores/app-state.svelte';
   import { formatTime } from '$lib/utils/meetingFormat';
   import LevelRibbon from './LevelRibbon.svelte';
+  import SourcePicker from './SourcePicker.svelte';
   import Tip from './Tip.svelte';
+  import { copy } from '$lib/copy';
+
+  const t = $derived(copy.meetings.recording);
 
   let {
     userNotes = $bindable(''),
@@ -43,10 +47,12 @@
     // The pending meeting on the Meetings page carries this title until the
     // persisted record replaces it. The notes/title drafts are NOT cleared
     // here — the pending view still reads them; a new recording clears them.
+    // Strings always, empty included: a null arg means "use the backend's
+    // mirror" and is reserved for the handshake fallback.
     appState.setPendingTitleHint(meetingTitle);
     await invoke('stop_recording', {
-      userNotes: userNotes || null,
-      meetingTitle: meetingTitle.trim() || null
+      userNotes,
+      meetingTitle
     });
   }
 </script>
@@ -55,23 +61,23 @@
   <!-- The sidebar's record button already carries the recording status;
        the header leads with the star action and the timer. -->
   <div class="flex shrink-0 items-center gap-1.5">
-    <Tip text="Star this moment (Ctrl+S)">
+    <Tip text={t.star}>
       {#snippet children({ props })}
         <button
           {...props}
           onclick={() => onStar?.()}
           class="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          aria-label="Star this moment"
+          aria-label={t.starAria}
         >
           <Star size={16} />
         </button>
       {/snippet}
     </Tip>
-    <span class="font-mono text-sm tabular-nums">{formatTime(elapsed)}</span>
-    {#if appState.isPaused}
-      <span class="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
-        Paused
-      </span>
+    <!-- Shadow mode ([shell.md] §Recording): the timer is the loudest
+         "this is being recorded" on the page after the meter. Starring
+         stays — it is an action, not a tell. -->
+    {#if !appState.shadowMode}
+      <span class="text-sm tabular-nums">{formatTime(elapsed)}</span>
     {/if}
   </div>
 
@@ -80,20 +86,46 @@
     bind:value={meetingTitle}
     class="font-display h-8 min-w-0 flex-1 bg-transparent px-2 text-base outline-none
       placeholder:text-muted-foreground/70"
-    placeholder="Meeting title"
-    aria-label="Meeting title"
+    placeholder={t.titlePlaceholder}
+    aria-label={t.titleAria}
   />
 
-  <LevelRibbon />
+  <SourcePicker />
+  {#if !appState.shadowMode}
+    <LevelRibbon />
+  {/if}
 
   <div class="flex shrink-0 items-center gap-1.5">
-    <Tip text={appState.isPaused ? 'Resume' : 'Pause'}>
+    <!-- Shadow mode ([shell.md] §Recording): its own control, deliberately
+         not tied to the transcript being shut. Collapsing a pane to get
+         room is not the same request as asking the screen to stop
+         announcing the recording. Stays visible while active — it is the
+         way back. The name holds still across the toggle; `aria-pressed`
+         and the icon carry the state. -->
+    <Tip text={t.shadowMode}>
+      {#snippet children({ props })}
+        <button
+          {...props}
+          onclick={() => appState.setShadowMode(!appState.shadowMode)}
+          class="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          aria-pressed={appState.shadowMode}
+          aria-label={t.shadowMode}
+        >
+          {#if appState.shadowMode}
+            <EyeOff size={16} />
+          {:else}
+            <Eye size={16} />
+          {/if}
+        </button>
+      {/snippet}
+    </Tip>
+    <Tip text={appState.isPaused ? t.resume : t.pause}>
       {#snippet children({ props })}
         <button
           {...props}
           onclick={togglePause}
           class="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          aria-label={appState.isPaused ? 'Resume recording' : 'Pause recording'}
+          aria-label={appState.isPaused ? t.resumeAria : t.pauseAria}
         >
           {#if appState.isPaused}
             <Play size={16} />
@@ -103,13 +135,13 @@
         </button>
       {/snippet}
     </Tip>
-    <Tip text="Stop recording">
+    <Tip text={t.stop}>
       {#snippet children({ props })}
         <button
           {...props}
           onclick={stop}
           class="rounded-md p-2 text-destructive transition-colors hover:bg-destructive/10"
-          aria-label="Stop recording"
+          aria-label={t.stop}
         >
           <Square size={16} fill="currentColor" />
         </button>

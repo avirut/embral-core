@@ -1,3 +1,5 @@
+import { copy } from '$lib/copy';
+
 /** Time-of-day only ("3:42 PM") — for list rows already sitting under a
  * date group header. */
 export function formatMeetingTime(value: string): string {
@@ -32,19 +34,20 @@ const startOfWeek = (d: Date) => startOfDay(d) - d.getDay() * 86_400_000;
  * unambiguous.
  */
 export function dateGroupLabel(value: string, now: Date = new Date()): string {
+  const groups = copy.meetings.dateGroups;
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return 'Earlier';
+  if (Number.isNaN(date.getTime())) return groups.earlier;
 
   const day = startOfDay(date);
   const today = startOfDay(now);
-  if (day >= today) return 'Today';
-  if (day === today - 86_400_000) return 'Yesterday';
+  if (day >= today) return groups.today;
+  if (day === today - 86_400_000) return groups.yesterday;
 
   const thisWeek = startOfWeek(now);
   if (day >= thisWeek) {
     return new Intl.DateTimeFormat(undefined, { weekday: 'long' }).format(date);
   }
-  if (day >= thisWeek - 7 * 86_400_000) return 'Last week';
+  if (day >= thisWeek - 7 * 86_400_000) return groups.lastWeek;
 
   // The previous calendar month, whatever its length.
   const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -52,7 +55,7 @@ export function dateGroupLabel(value: string, now: Date = new Date()): string {
     date.getFullYear() === prevMonth.getFullYear() &&
     date.getMonth() === prevMonth.getMonth()
   ) {
-    return 'Last month';
+    return groups.lastMonth;
   }
 
   return new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(date);
@@ -70,7 +73,8 @@ const WEEKDAY_LABELS = new Set(
  * True for Today, Yesterday, and the weekday names; false for the ranges
  * (Last week, Last month, "June 2026"), where a row must say which day it was. */
 export function isSingleDayGroup(label: string): boolean {
-  return label === 'Today' || label === 'Yesterday' || WEEKDAY_LABELS.has(label);
+  const groups = copy.meetings.dateGroups;
+  return label === groups.today || label === groups.yesterday || WEEKDAY_LABELS.has(label);
 }
 
 /**
@@ -125,9 +129,10 @@ export function formatTime(seconds: number): string {
 }
 
 /**
- * How long something lasted — "5:03", or "1h 20m" once it runs past an hour.
- * A *duration* rounds (a 90.6-second meeting lasted 91 seconds); a position
- * ([`formatTime`]) truncates. The two are different questions.
+ * How long something lasted — "5:03", or "1:22:33" once it runs past an
+ * hour (hours appear only when needed). A *duration* rounds (a 90.6-second
+ * meeting lasted 91 seconds); a position ([`formatTime`]) truncates. The
+ * two are different questions.
  */
 export function formatDuration(totalSeconds: number): string {
   const safeSeconds = Math.max(0, Math.round(totalSeconds));
@@ -136,7 +141,9 @@ export function formatDuration(totalSeconds: number): string {
   if (minutes >= 60) {
     const hours = Math.floor(minutes / 60);
     const remainingMinutes = minutes % 60;
-    return `${hours}h ${remainingMinutes}m`;
+    return `${hours}:${remainingMinutes.toString().padStart(2, '0')}:${seconds
+      .toString()
+      .padStart(2, '0')}`;
   }
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }

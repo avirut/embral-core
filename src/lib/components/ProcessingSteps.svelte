@@ -1,13 +1,18 @@
 <script lang="ts">
   import { appState } from '$lib/stores/app-state.svelte';
   import { openNotesFolder } from '$lib/utils/openNotesFolder';
+  import { copy } from '$lib/copy';
+
+  const t = $derived(copy.meetings.processing);
 
   // Imports only — a stopped recording goes straight back to the Meetings
-  // page as a pending entry instead of a processing screen.
+  // page as a pending entry instead of a processing screen. The step ids are
+  // matched against appState.processingStep (data); labels come from the
+  // catalog by key.
   const steps = [
-    { id: 'transcribing-import', label: 'Transcribing file' },
-    { id: 'finalizing-transcript', label: 'Finalizing transcript' },
-    { id: 'generating-notes', label: 'Generating notes' }
+    { id: 'transcribing-import', key: 'transcribing' as const },
+    { id: 'finalizing-transcript', key: 'finalizing' as const },
+    { id: 'generating-notes', key: 'generating' as const }
   ];
 
   function getStatus(stepId: string): 'complete' | 'active' | 'pending' {
@@ -28,7 +33,7 @@
 
 <div class="flex min-h-0 flex-1 flex-col">
   <div class="flex h-12 shrink-0 items-center gap-3 border-b border-border px-4">
-    <span class="text-sm text-muted-foreground">Importing a recording…</span>
+    <span class="text-sm text-muted-foreground">{t.importing}</span>
   </div>
 
   <div class="flex flex-1 flex-col items-center justify-center gap-6 px-8">
@@ -63,10 +68,10 @@
               ? 'font-medium text-foreground'
               : 'text-muted-foreground'}"
           >
-            {step.label}
+            {t.steps[step.key]}
             {#if step.id === 'transcribing-import' && status === 'active' && appState.importFraction != null}
               <span class="tabular-nums text-muted-foreground">
-                — {Math.round(appState.importFraction * 100)}%
+                {t.percent(Math.round(appState.importFraction * 100))}
               </span>
             {/if}
           </span>
@@ -84,7 +89,7 @@
         class="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium
           text-primary-foreground transition-colors hover:bg-primary/90"
       >
-        {appState.error ? 'Back to meetings' : 'Continue in background'}
+        {appState.error ? t.backToMeetings : t.continueBackground}
       </button>
       {#if appState.error}
         <button
@@ -92,7 +97,7 @@
           class="w-full rounded-md border border-border px-4 py-2 text-sm
             font-medium transition-colors hover:bg-accent"
         >
-          Open notes folder
+          {t.openNotesFolder}
         </button>
       {/if}
     </div>

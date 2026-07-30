@@ -4,6 +4,9 @@
     // Multilingual, Fast / Balanced / Accurate. The recommended option
     // carries a small dot.
     import { cn } from "$lib/utils";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.onboarding.segmented);
 
     let {
         options,
@@ -37,7 +40,7 @@
             {#if o.value === recommended}
                 <span
                     class="size-1 rounded-full bg-primary"
-                    title="Recommended for this machine"
+                    title={t.recommended}
                 ></span>
             {/if}
         </button>

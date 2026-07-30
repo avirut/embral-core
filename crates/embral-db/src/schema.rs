@@ -194,6 +194,89 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE meetings ADD COLUMN name_suggestions TEXT NOT NULL DEFAULT '[]';
     "#,
+    // v11 — the summary and transcript documents live in the database only.
+    // The markdown files they pointed at were generated exports nothing read
+    // (integrations.md), and keeping them meant renaming, deleting and
+    // pruning two files at five lifecycle sites. The files already on disk
+    // are left where they are; the markdown export owns that job now.
+    r#"
+    ALTER TABLE meetings DROP COLUMN notes_path;
+    ALTER TABLE meetings DROP COLUMN transcript_path;
+    "#,
+    // v12 — a meeting's three documents get their real names: `summary`
+    // (what the LLM wrote), `notes` (what the user typed) and `transcript`.
+    // `notes_md` used to hold the *summary* while the user's own typing
+    // lived in `user_notes`, so "notes" meant opposite things either side of
+    // the command layer — `update_meeting_notes` wrote the summary, and the
+    // MCP server translated `notes_md` into `summary_md` on the way out. The
+    // `_md` suffix goes with them: all three are markdown, so it
+    // distinguished nothing.
+    //
+    // Note that `notes` deliberately does not become `notes_md`. Reusing the
+    // old name for a *different* document would let any missed reference in
+    // a hand-written SQL string read the wrong one in silence; as it stands
+    // a stale `notes_md` fails loudly with "no such column".
+    r#"
+    ALTER TABLE meetings RENAME COLUMN notes_md TO summary;
+    ALTER TABLE meetings RENAME COLUMN user_notes TO notes;
+    ALTER TABLE meetings RENAME COLUMN transcript_md TO transcript;
+    "#,
+    // v13 — the text OCR read out of a pasted image. It belongs to an image
+    // rather than to a document, so it cannot live on `meetings`, and
+    // deriving it on the fly would re-OCR the whole library on every index
+    // sync. `ocr_engine NULL` means "not read yet", the same idiom as
+    // `chunks.embedded_with`.
+    //
+    // A *recorded engine mismatch does not re-OCR*, unlike the vector
+    // index's model mismatch. There the old data is unusable — a vector
+    // from another model does not live in the same space. Here it is a
+    // string, and a string Vision produced reads perfectly well on Windows.
+    //
+    // Rows appear only once the meeting row does. During a live recording
+    // there is none (finalize creates it), so this key would reject the
+    // insert — which is also why OCR never runs while the recording does.
+    r#"
+    CREATE TABLE image_text (
+        meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        filename   TEXT NOT NULL,
+        ocr_text   TEXT NOT NULL DEFAULT '',
+        ocr_engine TEXT,
+        PRIMARY KEY (meeting_id, filename)
+    );
+    "#,
+    // v14 — which image an `image_text` chunk was read out of, so a search
+    // hit can point at it. NULL for every other source, which is most rows.
+    //
+    // The passage's own text is not enough to find the image: it lives
+    // inside a PNG, so unlike a notes or summary hit there is nothing in the
+    // document to scroll to. This is the column 15b deliberately left out,
+    // on the grounds that a jump-to-the-image feature would be the thing
+    // that earned it.
+    r#"
+    ALTER TABLE chunks ADD COLUMN image_filename TEXT;
+    "#,
+    // v15 — link name-only segments to the registry. Names arrived through
+    // doors that never set `speaker_id` (chiefly the notes-naming pass,
+    // which links only to profiles that already existed), so a person's
+    // history could be split between linked segments and plain-text
+    // look-alikes. From here on the app adopts strays whenever a profile is
+    // created, renamed, or merged into; this backfills everything from
+    // before that rule. `MIN(s.id)` makes a duplicate-name registry
+    // deterministic — duplicates are exactly what merge then fixes. A
+    // profile named like a generic "Speaker N" label adopts nothing (the
+    // GLOB, a hair wider than the Rust-side check): those labels are
+    // per-meeting placeholders, and two meetings' "Speaker 2" are
+    // different people.
+    r#"
+    UPDATE segments SET speaker_id =
+        (SELECT MIN(s.id) FROM speakers s
+          WHERE lower(s.name) = lower(segments.speaker)
+            AND s.name NOT GLOB 'Speaker [0-9]*')
+    WHERE speaker_id IS NULL AND speaker IS NOT NULL
+      AND EXISTS (SELECT 1 FROM speakers s
+                   WHERE lower(s.name) = lower(segments.speaker)
+                     AND s.name NOT GLOB 'Speaker [0-9]*');
+    "#,
 ];
 
 #[cfg(test)]
@@ -342,6 +425,261 @@ mod tests {
         assert!(conn
             .query_row("SELECT is_you FROM speakers", [], |r| r.get::<_, i64>(0))
             .is_err());
+    }
+
+    /// v12 renames all three documents to what they actually are. Each must
+    /// arrive under its new name with its content unmoved — the whole hazard
+    /// of this migration is the summary and the notes swapping places.
+    #[test]
+    fn v12_renames_the_documents_without_swapping_them() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for migration in &MIGRATIONS[..11] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '11')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, started_at, duration_seconds, notes_md,
+                                   user_notes, transcript_md, created_at, updated_at)
+             VALUES ('m1', 'Old', '2026-01-01T00:00:00Z', 60,
+                     'THE SUMMARY', 'WHAT I TYPED', 'WHO SAID WHAT',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (summary, notes, transcript): (String, String, String) = conn
+            .query_row(
+                "SELECT summary, notes, transcript FROM meetings WHERE id = 'm1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(summary, "THE SUMMARY");
+        assert_eq!(notes, "WHAT I TYPED");
+        assert_eq!(transcript, "WHO SAID WHAT");
+
+        // The old names are gone, so a missed reference fails loudly rather
+        // than silently reading the other document.
+        for gone in ["notes_md", "user_notes", "transcript_md"] {
+            assert!(conn
+                .query_row(&format!("SELECT {gone} FROM meetings"), [], |r| r
+                    .get::<_, String>(0))
+                .is_err());
+        }
+    }
+
+    /// v14 records which image a chunk was read out of. Chunks already in
+    /// the index must survive it — they are expensive to rebuild, since
+    /// every one of them carries an embedding.
+    #[test]
+    fn v14_adds_the_image_filename_without_disturbing_existing_chunks() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for migration in &MIGRATIONS[..13] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '13')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, started_at, duration_seconds,
+                                   created_at, updated_at)
+             VALUES ('m1', 'Planning', '2026-01-01T00:00:00Z', 60,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO chunks (meeting_id, source, chunk_index, text, embedding_text,
+                                 speakers, speaker_ids, content_hash, embedded_with)
+             VALUES ('m1', 'user_notes', 0, 'what I typed', 'header\nwhat I typed',
+                     '[]', '[]', 'abc123', 'embedding-multilingual');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // The existing chunk kept its text *and* its embedding stamp: a
+        // migration that re-pends the index would re-embed the library.
+        let (text, embedded, image): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT text, embedded_with, image_filename FROM chunks",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "what I typed");
+        assert_eq!(embedded.as_deref(), Some("embedding-multilingual"));
+        assert_eq!(image, None, "non-image sources name no image");
+    }
+
+    /// v15 links name-only segments to the registry profile whose name they
+    /// carry — the backfill behind adopt-on-write. A segment already linked,
+    /// or whose label the registry does not know, is left alone.
+    #[test]
+    fn v15_links_name_only_segments_to_their_profiles() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for migration in &MIGRATIONS[..14] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '14')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, started_at, duration_seconds,
+                                   created_at, updated_at)
+             VALUES ('m1', 'Planning', '2026-01-01T00:00:00Z', 60,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO speakers (id, name, created_at, updated_at)
+             VALUES ('sp_dana', 'Dana Smith',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                    ('sp_gen', 'Speaker 2',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+             INSERT INTO segments (meeting_id, idx, speaker, speaker_id,
+                                   text, start_secs, end_secs)
+             VALUES ('m1', 0, 'dana smith', NULL,   'notes-named, case aside', 0, 1),
+                    ('m1', 1, 'Dana Smith', 'sp_x', 'already linked',          1, 2),
+                    ('m1', 2, 'Speaker 2',  NULL,   'a generic label',         2, 3),
+                    ('m1', 3, 'Speaker 9',  NULL,   'unknown to the registry', 3, 4);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let links: Vec<Option<String>> = conn
+            .prepare("SELECT speaker_id FROM segments ORDER BY idx")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        // The generic-named profile adopts nothing: "Speaker 2" is a
+        // per-meeting placeholder, not a person.
+        assert_eq!(
+            links,
+            vec![Some("sp_dana".into()), Some("sp_x".into()), None, None]
+        );
+    }
+
+    /// v13 adds the per-image OCR text. Existing meetings must survive, and
+    /// the rows must go when their meeting does — the asset directory is
+    /// already pruned on delete, and a stale row would keep answering
+    /// searches for a meeting that no longer exists.
+    #[test]
+    fn v13_adds_image_text_and_it_dies_with_its_meeting() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for migration in &MIGRATIONS[..12] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '12')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, started_at, duration_seconds, summary,
+                                   created_at, updated_at)
+             VALUES ('m1', 'Planning', '2026-01-01T00:00:00Z', 60, 'THE SUMMARY',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+        // The meeting came through the migration untouched.
+        let summary: String = conn
+            .query_row("SELECT summary FROM meetings WHERE id = 'm1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(summary, "THE SUMMARY");
+
+        conn.execute_batch(
+            "INSERT INTO image_text (meeting_id, filename, ocr_text, ocr_engine)
+             VALUES ('m1', 'img-01.png', 'Q3 revenue 4.2M', 'windows');",
+        )
+        .unwrap();
+        // Not read yet: the engine column is what says so.
+        conn.execute_batch(
+            "INSERT INTO image_text (meeting_id, filename) VALUES ('m1', 'img-02.png');",
+        )
+        .unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM image_text WHERE ocr_engine IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+
+        conn.execute("DELETE FROM meetings WHERE id = 'm1'", []).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM image_text", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "image text must cascade with its meeting");
+    }
+
+    /// v11 drops the two markdown export paths. The documents themselves
+    /// must come through untouched — the paths went, the meetings did not.
+    #[test]
+    fn v11_drops_the_export_paths_and_keeps_the_documents() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .unwrap();
+        for migration in &MIGRATIONS[..10] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', '10')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO meetings (id, title, started_at, duration_seconds, notes_md,
+                                   transcript_md, notes_path, transcript_path, audio_path,
+                                   created_at, updated_at)
+             VALUES ('m1', 'Old', '2026-01-01T00:00:00Z', 60, '# Old', 'said a thing',
+                     'notes/old.md', 'transcripts/old.md', 'audio/old.mp3',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // `migrate` always runs to head, so v12 has renamed the documents by
+        // the time we look.
+        let (notes, transcript, audio): (String, String, String) = conn
+            .query_row(
+                "SELECT summary, transcript, audio_path FROM meetings WHERE id = 'm1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(notes, "# Old");
+        assert_eq!(transcript, "said a thing");
+        // Audio keeps its file, and so its path: it is not an export.
+        assert_eq!(audio, "audio/old.mp3");
+
+        for gone in ["notes_path", "transcript_path"] {
+            assert!(conn
+                .query_row(&format!("SELECT {gone} FROM meetings"), [], |r| r
+                    .get::<_, String>(0))
+                .is_err());
+        }
     }
 
     /// v10 adds the pending name-suggestion column with an empty default.

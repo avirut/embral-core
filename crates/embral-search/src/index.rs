@@ -79,8 +79,9 @@ fn apply(conn: &Connection, owner: &Owner, built: &[BuiltChunk]) -> Result<SyncS
             tx.execute(
                 "INSERT INTO chunks (meeting_id, dictation_id, source, chunk_index, text,
                                      embedding_text, start_secs, end_secs, speakers,
-                                     speaker_ids, content_hash, embedded_with)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL)",
+                                     speaker_ids, content_hash, embedded_with,
+                                     image_filename)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)",
                 params![
                     meeting_id,
                     dictation_id,
@@ -93,6 +94,7 @@ fn apply(conn: &Connection, owner: &Owner, built: &[BuiltChunk]) -> Result<SyncS
                     serde_json::to_string(&chunk.speakers)?,
                     serde_json::to_string(&chunk.speaker_ids)?,
                     chunk.content_hash,
+                    chunk.image_filename,
                 ],
             )?;
             stats.inserted += 1;
@@ -119,14 +121,20 @@ pub fn sync_meeting(db: &Db, meeting_id: &str) -> Result<SyncStats> {
         return Ok(SyncStats::default());
     };
     let segments = db.get_segments(meeting_id)?;
-    let user_notes = db.get_user_notes(meeting_id)?;
+    let user_notes = db.get_notes(meeting_id)?;
+    let image_text = crate::chunker::referenced_image_text(
+        meeting_id,
+        &[&user_notes, &meeting.summary],
+        &db.image_text(meeting_id)?,
+    );
     let built = chunk_meeting(&MeetingDocs {
         title: &meeting.title,
         started_at: meeting.started_at,
         segments: &segments,
         user_notes: &user_notes,
-        summary_md: &meeting.notes_md,
-        transcript_md: &meeting.transcript_md,
+        summary: &meeting.summary,
+        transcript: &meeting.transcript,
+        image_text: &image_text,
     });
     db.with_conn(|conn| apply(conn, &Owner::Meeting(meeting_id), &built))
 }
@@ -280,12 +288,10 @@ pub(crate) mod test_support {
             title: title.to_string(),
             started_at: chrono::Utc.with_ymd_and_hms(2026, 6, day, 10, 0, 0).unwrap(),
             duration_seconds: 600,
-            notes_md: String::new(),
-            transcript_md: String::new(),
+            summary: String::new(),
+            transcript: String::new(),
             attendees: attendees.iter().map(|s| s.to_string()).collect(),
             audio_path: String::new(),
-            notes_path: String::new(),
-            transcript_path: String::new(),
         }
     }
 
@@ -356,7 +362,7 @@ mod tests {
 
         // A title rename feeds every embedding_text header: all re-pend.
         let mut renamed = meeting("m1", "Renamed Planning", 1, &["Alice", "Bob"]);
-        renamed.transcript_md = String::new();
+        renamed.transcript = String::new();
         db.upsert_meeting(&renamed).unwrap();
         db.replace_segments(
             "m1",

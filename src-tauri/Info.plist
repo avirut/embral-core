@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the macOS bundle's Info.plist by tauri-build. Usage
+     strings are shown in the OS permission prompts (docs/shell.md). -->
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>embral records and transcribes your meetings and dictation with your microphone. Audio never leaves this machine unless you turn on embral cloud.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>embral includes what your meeting apps play — the other side of the call — in recordings. Audio never leaves this machine unless you turn on embral cloud.</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.4</string>
+</dict>
+</plist>

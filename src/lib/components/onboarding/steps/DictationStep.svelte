@@ -10,36 +10,38 @@
     import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
     import { CLOUD_ENABLED } from "$lib/cloud";
     import type { DictationCleanup } from "$lib/types";
+    import { copy } from "$lib/copy";
+    import AccessibilityAccess from "$lib/components/settings/AccessibilityAccess.svelte";
     import type { OnboardingDraft } from "../types";
 
     let { draft }: { draft: OnboardingDraft } = $props();
 
-    const cleanupLabels: Record<string, string> = {
-        cloud: "embral cloud",
-        on_device: "local model",
-        off: "no cleanup",
-    };
+    const t = $derived(copy.onboarding.dictation);
+    const providers = $derived(copy.common.providers);
+
+    let cleanupLabels: Record<string, string> = $derived({
+        cloud: providers.cloud,
+        on_device: providers.localModel,
+        off: t.cleanupOff,
+    });
 </script>
 
-<h1 class="font-display text-2xl tracking-tight">Dictation</h1>
+<h1 class="font-display text-2xl tracking-tight">{t.title}</h1>
 <p class="mt-3 text-sm text-muted-foreground">
-    Speech to text in any app, with realtime feedback
+    {t.intro}
 </p>
 
 <div class="mt-6 space-y-4">
     <SettingsGroup>
-        <SettingRow title="Dictation hotkey">
+        <SettingRow title={t.hotkey}>
             <HotkeyCapture
                 value={draft.dictation_hotkey}
-                ariaLabel="Dictation hotkey"
+                ariaLabel={t.hotkeyAria}
                 onChange={(combo) => (draft.dictation_hotkey = combo)}
             />
         </SettingRow>
 
-        <SettingRow
-            title="Clean up with AI"
-            description="Remove filler words and fix phrasing"
-        >
+        <SettingRow title={t.cleanup} description={t.cleanupSub}>
             <Select.Root
                 type="single"
                 value={draft.dictation_cleanup}
@@ -54,20 +56,21 @@
                 >
                 <Select.Content>
                     {#if CLOUD_ENABLED}
-                        <Select.Item value="cloud" label="embral cloud" />
+                        <Select.Item value="cloud" label={providers.cloud} />
                     {/if}
-                    <Select.Item value="on_device" label="local model" />
-                    <Select.Item value="off" label="no cleanup" />
+                    <Select.Item value="on_device" label={providers.localModel} />
+                    <Select.Item value="off" label={t.cleanupOff} />
                 </Select.Content>
             </Select.Root>
         </SettingRow>
 
-        <SettingRow title="Copy to clipboard">
+        <SettingRow title={t.copyClipboard}>
             <Switch bind:checked={draft.dictation_copy_clipboard} />
         </SettingRow>
 
-        <SettingRow title="Paste into the active app">
+        <SettingRow title={t.autoPaste}>
             <Switch bind:checked={draft.dictation_auto_paste} />
         </SettingRow>
+        <AccessibilityAccess enabled={draft.dictation_auto_paste} />
     </SettingsGroup>
 </div>

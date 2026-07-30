@@ -17,6 +17,7 @@
     import { appState } from "$lib/stores/app-state.svelte";
     import { settingsForm } from "$lib/stores/settings-form.svelte";
     import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
+    import { copy } from "$lib/copy";
     import { cn } from "$lib/utils";
     import GeneralSection from "./GeneralSection.svelte";
     import MeetingsSection from "./MeetingsSection.svelte";
@@ -39,38 +40,52 @@
         | "transcription"
         | "synthesis";
 
+    // The grouping and order are this component's (docs/shell.md); the names
+    // come from the catalog, shared with the palette's deep links.
+    let nav = $derived(copy.settings.nav);
+
     type Entry = { id: SectionId; label: string; icon: typeof Mic };
-    const groups: { label: string; items: Entry[] }[] = [
+    let groups: { label: string; items: Entry[] }[] = $derived([
         {
-            label: "Application",
+            label: nav.groups.application,
             items: [
-                { id: "general", label: "General", icon: SettingsIcon },
-                { id: "meetings", label: "Meetings", icon: Disc },
-                { id: "dictation", label: "Dictation", icon: Speech },
+                { id: "general", label: nav.sections.general, icon: SettingsIcon },
+                { id: "meetings", label: nav.sections.meetings, icon: Disc },
+                { id: "dictation", label: nav.sections.dictation, icon: Speech },
                 // Account exists only in the cloud edition; it sits with About
                 // — the two pages about you rather than about the app's work.
                 ...(CLOUD_ENABLED
-                    ? [{ id: "account", label: "Account", icon: CircleUser } as Entry]
+                    ? [
+                          {
+                              id: "account",
+                              label: nav.sections.account,
+                              icon: CircleUser,
+                          } as Entry,
+                      ]
                     : []),
-                { id: "about", label: "About", icon: Info },
+                { id: "about", label: nav.sections.about, icon: Info },
             ],
         },
         {
-            label: "Models",
+            label: nav.groups.models,
             items: [
-                { id: "transcription", label: "Transcription", icon: AudioLines },
-                { id: "synthesis", label: "Synthesis", icon: Brain },
+                {
+                    id: "transcription",
+                    label: nav.sections.transcription,
+                    icon: AudioLines,
+                },
+                { id: "synthesis", label: nav.sections.synthesis, icon: Brain },
             ],
         },
         {
-            label: "Integrations",
+            label: nav.groups.integrations,
             items: [
-                { id: "markdown", label: "Markdown", icon: FileText },
-                { id: "mcp", label: "MCP", icon: Network },
+                { id: "markdown", label: nav.sections.markdown, icon: FileText },
+                { id: "mcp", label: nav.sections.mcp, icon: Network },
             ],
         },
-    ];
-    const sections: Entry[] = groups.flatMap((g) => g.items);
+    ]);
+    let sections: Entry[] = $derived(groups.flatMap((g) => g.items));
 
     let active = $state<SectionId>("general");
     let initialized = false;
@@ -82,7 +97,13 @@
         // Account page (which dispatches this event).
         if (!CLOUD_ENABLED) return;
         void cloudAuth.refresh();
-        const onCloudChanged = () => void cloudAuth.refresh();
+        const onCloudChanged = () => {
+            void cloudAuth.refresh();
+            // Sign-in/out rewrote config backend-side (token, adopted
+            // providers); a draft snapshotted before that would save the
+            // old values back over it.
+            settingsForm.reset();
+        };
         window.addEventListener("embral:cloud-changed", onCloudChanged);
         return () =>
             window.removeEventListener("embral:cloud-changed", onCloudChanged);
@@ -178,6 +199,6 @@
     {/if}
 {:else}
     <div class="flex flex-1 items-center justify-center">
-        <p class="text-sm text-muted-foreground">Loading…</p>
+        <p class="text-sm text-muted-foreground">{nav.loading}</p>
     </div>
 {/if}

@@ -10,6 +10,9 @@
         McpClientId,
         McpClientsStatus,
     } from "$lib/components/settings/mcp/types";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.onboarding.mcp);
 
     let status = $state<McpClientsStatus | null>(null);
 
@@ -40,26 +43,25 @@
     let installed = $derived.by(() => {
         if (!status) return [];
         const entries: { id: McpClientId; title: string }[] = [
-            { id: "claude_desktop", title: "Claude Desktop" },
-            { id: "claude_code", title: "Claude Code" },
-            { id: "codex", title: "Codex" },
+            { id: "claude_desktop", title: t.clients.claudeDesktop },
+            { id: "claude_code", title: t.clients.claudeCode },
+            { id: "codex", title: t.clients.codex },
         ];
         return entries.filter((e) => status![e.id].installed);
     });
 </script>
 
-<h1 class="font-display text-2xl tracking-tight">Connect your AI assistants</h1>
+<h1 class="font-display text-2xl tracking-tight">{t.title}</h1>
 <p class="mt-3 text-sm text-muted-foreground">
-    Search your meeting notes; other MCP clients can be added in settings
+    {t.intro}
 </p>
 
 <div class="mt-6 space-y-3">
     {#if status === null}
-        <p class="text-sm text-muted-foreground">Looking for installed clients…</p>
+        <p class="text-sm text-muted-foreground">{t.looking}</p>
     {:else if installed.length === 0}
         <p class="text-sm text-muted-foreground">
-            No supported AI clients found on this machine. Set this up any time
-            in Settings → MCP.
+            {t.none}
         </p>
     {:else}
         {#each installed as client (client.id)}

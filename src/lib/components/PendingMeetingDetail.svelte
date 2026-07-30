@@ -1,10 +1,13 @@
 <script lang="ts">
   import { LoaderCircle, Star } from 'lucide-svelte';
   import type { PendingMeeting } from '$lib/stores/app-state.svelte';
-  import { chipClass } from '$lib/utils/speakerColors';
+  import { nameClass } from '$lib/utils/speakerColors';
   import { formatDuration, formatTime } from '$lib/utils/meetingFormat';
   import AudioPlayer from './AudioPlayer.svelte';
-  import UserNotesView from './UserNotesView.svelte';
+  import EditorView from './EditorView.svelte';
+  import { copy } from '$lib/copy';
+
+  const t = $derived(copy.meetings.pending);
 
   let { pending }: { pending: PendingMeeting } = $props();
 
@@ -36,17 +39,13 @@
     return map;
   });
 
-  const stageText = $derived(
-    pending.stage === 'notes' ? 'Generating the summary…' : 'Finalizing the transcript…'
-  );
-
 </script>
 
 <div class="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
   <div class="shrink-0 border-b border-border px-3 py-3">
     <h2 class="font-display text-lg leading-snug">{pending.title}</h2>
     <div class="mt-1 flex items-baseline gap-x-2 text-xs text-muted-foreground">
-      <span>Just now</span>
+      <span>{t.justNow}</span>
       <span class="tabular-nums">{formatDuration(pending.durationSeconds)}</span>
     </div>
   </div>
@@ -58,17 +57,12 @@
       <p class="text-xs text-destructive">{pending.error}</p>
     {:else}
       <LoaderCircle size={13} class="animate-spin text-muted-foreground" />
-      <p class="text-xs text-muted-foreground">
-        {stageText}
-        <span class="text-muted-foreground/70">
-          The summary appears here when it's ready.</span
-        >
-      </p>
+      <p class="text-xs text-muted-foreground">{t.finalizing}</p>
     {/if}
   </div>
 
   <div class="flex shrink-0 items-center gap-5 border-b border-border px-4">
-    {#each [['notes', 'Notes'], ['transcript', 'Transcript']] as [key, label] (key)}
+    {#each [['notes', t.tabs.notes], ['transcript', t.tabs.transcript]] as [key, label] (key)}
       <button
         onclick={() => (activeTab = key as PendingTab)}
         class="-mb-px border-b-2 px-0.5 py-2 text-sm font-medium transition-colors
@@ -83,8 +77,10 @@
 
   <div class="flex min-h-0 flex-1 flex-col">
     {#if activeTab === 'notes'}
-      <UserNotesView
-        notes={pending.userNotes}
+      <EditorView
+        value={pending.userNotes}
+        readonly
+        placeholder={copy.meetings.notes.emptyView}
         stars={pending.stars}
         onStarClick={pending.audioPath
           ? (star) => player?.seekTo(star.seconds)
@@ -93,7 +89,7 @@
     {:else}
       <div class="min-h-0 flex-1 space-y-1 overflow-y-auto px-3 py-3">
         {#if pending.segments.length === 0}
-          <p class="text-sm text-muted-foreground">No speech was transcribed.</p>
+          <p class="text-sm text-muted-foreground">{t.noSpeech}</p>
         {:else}
           {#each pending.segments as seg, i (i)}
             {#each starMarkers.get(i) ?? [] as star (star)}
@@ -108,7 +104,7 @@
                 </span>
                 {#if seg.speaker}
                   <span
-                    class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium {chipClass(
+                    class="shrink-0 text-[10px] font-medium {nameClass(
                       seg.speaker,
                       labels
                     )}"

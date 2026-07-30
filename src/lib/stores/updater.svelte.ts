@@ -1,3 +1,4 @@
+import { errorMessage } from '$lib/copy/errors';
 // The auto-updater's state, and the two actions the UI exposes: check and
 // install. Checking is cheap and quiet; installing restarts the app, so it
 // first asks the backend's `update_guard` whether anything (recording,
@@ -8,11 +9,10 @@
 // endpoint is normal until the first release exists, so background checks
 // are silent; only a manual "Check for updates" reports errors.
 import { invoke } from '@tauri-apps/api/core';
-import { getCurrentWindow } from '@tauri-apps/api/window';
-import { sendNotification } from '@tauri-apps/plugin-notification';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { CLOUD_ENABLED } from '$lib/cloud';
+import { copy } from '$lib/copy';
 import { configStore } from './config.svelte';
 
 class UpdaterStore {
@@ -57,20 +57,22 @@ class UpdaterStore {
         this.update = found;
         this._available = { version: found.version, notes: found.body ?? '' };
         if (opts.notify && configStore.config?.notify_update_available) {
-          const visible = await getCurrentWindow().isVisible();
-          if (!visible) {
-            await sendNotification({
-              title: 'Update ready',
-              body: `embral ${found.version} is available. Install it from Settings → About.`
-            });
-          }
+          await invoke('notify', {
+            payload: {
+              kind: 'update_ready',
+              title: copy.notifications.os.updateReady.title,
+              actions: [],
+              sticky: false,
+              target: { kind: 'updates' }
+            }
+          });
         }
       } else {
         this.update = null;
         this._available = null;
       }
     } catch (e) {
-      if (!opts.silent) this._error = e instanceof Error ? e.message : String(e);
+      if (!opts.silent) this._error = errorMessage(e);
     } finally {
       this._checking = false;
     }
@@ -86,9 +88,9 @@ class UpdaterStore {
     if (!this.update || this._installing) return;
     this._blocked = null;
     this._error = null;
-    const reason = await invoke<string | null>('update_guard');
+    const reason = await invoke<unknown>('update_guard');
     if (reason) {
-      this._blocked = reason;
+      this._blocked = errorMessage(reason);
       return;
     }
     this._installing = true;
@@ -106,7 +108,7 @@ class UpdaterStore {
       }
       await relaunch();
     } catch (e) {
-      this._error = e instanceof Error ? e.message : String(e);
+      this._error = errorMessage(e);
       this._installing = false;
       if (CLOUD_ENABLED) {
         void invoke('telemetry_track', {

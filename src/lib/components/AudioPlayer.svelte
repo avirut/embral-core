@@ -4,6 +4,9 @@
   import type { MeetingStar } from '$lib/types';
   import { formatTime } from '$lib/utils/meetingFormat';
   import Tip from './Tip.svelte';
+  import { copy } from '$lib/copy';
+
+  const t = $derived(copy.meetings.player);
 
   let {
     audioPath = null,
@@ -59,7 +62,7 @@
         playing = true;
         loadError = null;
       } catch (e) {
-        loadError = e instanceof Error ? e.message : 'Could not play audio.';
+        loadError = e instanceof Error ? e.message : t.errors.couldNotPlay;
         console.error('Failed to play meeting audio:', e, { audioPath, src });
       }
     } else {
@@ -141,14 +144,14 @@
     const code = audioEl?.error?.code;
     const reason =
       code === MediaError.MEDIA_ERR_ABORTED
-        ? 'Loading was aborted.'
+        ? t.errors.aborted
         : code === MediaError.MEDIA_ERR_NETWORK
-          ? 'The audio file could not be loaded.'
+          ? t.errors.network
           : code === MediaError.MEDIA_ERR_DECODE
-            ? 'The audio file could not be decoded.'
+            ? t.errors.decode
             : code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED
-              ? 'The audio source is not supported.'
-              : 'The audio file could not be loaded.';
+              ? t.errors.unsupported
+              : t.errors.network;
     loadError = reason;
     console.error('Meeting audio failed to load:', {
       reason,
@@ -179,13 +182,13 @@
            it is the same control — at full contrast rather than muted, because
            it is this pane's primary action. Ranking by contrast is how this app
            ranks things; a filled circle belongs to a different one. -->
-      <Tip text={playing ? 'Pause (Space)' : 'Play (Space)'}>
+      <Tip text={playing ? t.pause : t.play}>
         {#snippet children({ props })}
           <button
             {...props}
             onclick={toggle}
             class="shrink-0 rounded-md p-2 text-foreground transition-colors hover:bg-accent"
-            aria-label={playing ? 'Pause audio' : 'Play audio'}
+            aria-label={playing ? t.pauseAria : t.playAria}
           >
             {#if playing}
               <Pause size={16} />
@@ -215,7 +218,7 @@
         onpointerup={onTrackPointerUp}
         onpointerleave={() => (hoverRatio = null)}
         role="slider"
-        aria-label="Audio position"
+        aria-label={t.position}
         aria-valuemin={0}
         aria-valuemax={Math.floor(duration)}
         aria-valuenow={Math.floor(currentTime)}
@@ -247,13 +250,13 @@
                    is all ring and no star. These *are* keyboard-reachable
                    though (unlike the track), so the focus state borrows the
                    hover scale rather than disappearing entirely. -->
-              <Tip text="Play from {formatTime(star.seconds)}">
+              <Tip text={t.playFrom(formatTime(star.seconds))}>
                 {#snippet children({ props })}
                   <button
                     {...props}
                     class="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 outline-none transition-transform hover:scale-115 focus-visible:scale-115"
                     style="left: {(star.seconds / duration) * 100}%"
-                    aria-label="Play from {formatTime(star.seconds)}"
+                    aria-label={t.playFrom(formatTime(star.seconds))}
                     onpointerdown={(e) => {
                       e.stopPropagation();
                       activateStar(star, i);
@@ -299,6 +302,6 @@
       <p class="mt-1.5 text-[11px] text-destructive">{loadError}</p>
     {/if}
   {:else}
-    <p class="text-xs text-muted-foreground">Audio was not retained for this meeting.</p>
+    <p class="text-xs text-muted-foreground">{t.noAudio}</p>
   {/if}
 </div>

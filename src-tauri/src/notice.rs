@@ -1,0 +1,194 @@
+//! The notice window: embral's own notification chrome on every platform
+//! ([shell.md] §Notices). One lazily-created, reused window — frameless,
+//! always-on-top, never focused, bottom-right of the current monitor —
+//! replaces every OS toast. `platform::style_notice` supplies the
+//! never-activate guarantee (`WS_EX_NOACTIVATE` on Windows, a
+//! non-activating panel on macOS).
+//!
+//! Strings arrive pre-rendered from the frontend catalog: this module
+//! displays, it never words.
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager};
+
+use embral_types::AppError;
+
+const NOTICE: &str = "notice";
+
+/// One fixed size for every notice: a single row — logo, one line of
+/// text, the answers ([shell.md] §Notices).
+const NOTICE_SIZE: (f64, f64) = (360.0, 56.0);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoticeAction {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoticePayload {
+    /// The notice's family (e.g. `call_detected`, `silence`) — same-kind
+    /// payloads always replace each other.
+    pub kind: String,
+    /// The one line of text — a notice carries no body.
+    pub title: String,
+    #[serde(default)]
+    pub actions: Vec<NoticeAction>,
+    /// Sticky notices never auto-dismiss and outrank transient ones.
+    #[serde(default)]
+    pub sticky: bool,
+    /// Where a click on the text lands (`open_from_notice`); absent = the app.
+    #[serde(default)]
+    pub target: Option<serde_json::Value>,
+}
+
+/// Body-click on a notice: surface the main window (rescued, shown,
+/// focused — the tray's path) and tell it where the news lives.
+#[tauri::command]
+pub async fn open_from_notice(
+    app: AppHandle,
+    target: serde_json::Value,
+) -> Result<(), AppError> {
+    *CURRENT.lock().expect("notice state poisoned") = None;
+    if let Some(w) = app.get_webview_window(NOTICE) {
+        let _ = w.hide();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        crate::window_rescue::ensure_on_screen(&main);
+        let _ = main.unminimize();
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    let _ = app.emit("notice-navigate", target);
+    Ok(())
+}
+
+/// Whether an incoming payload may replace what is showing. A transient
+/// notice must never clobber a live sticky one (a fallback toast arriving
+/// mid silence check-in), but same-kind updates always land, and sticky
+/// replaces anything.
+fn should_replace(current: Option<(&str, bool)>, kind: &str, sticky: bool) -> bool {
+    match current {
+        None => true,
+        Some((current_kind, _)) if current_kind == kind => true,
+        Some((_, current_sticky)) => sticky || !current_sticky,
+    }
+}
+
+/// What is currently on the notice window. Cleared on hide so precedence
+/// never blocks a fresh notice. The full payload is kept — the first show
+/// races the webview's page load, so the page *fetches* this on mount
+/// (`current_notice`) rather than trusting the one-shot emit to land.
+static CURRENT: std::sync::Mutex<Option<NoticePayload>> = std::sync::Mutex::new(None);
+
+#[tauri::command]
+pub async fn notify(app: AppHandle, payload: NoticePayload) -> Result<(), AppError> {
+    show_notice(&app, payload)
+}
+
+#[tauri::command]
+pub async fn hide_notice(app: AppHandle) -> Result<(), AppError> {
+    *CURRENT.lock().expect("notice state poisoned") = None;
+    if let Some(w) = app.get_webview_window(NOTICE) {
+        let _ = w.hide();
+    }
+    Ok(())
+}
+
+/// The payload currently showing — the notice page's source of truth on
+/// mount; later updates arrive over `notice-payload`.
+#[tauri::command]
+pub async fn current_notice() -> Result<Option<NoticePayload>, AppError> {
+    Ok(CURRENT.lock().expect("notice state poisoned").clone())
+}
+
+fn show_notice(app: &AppHandle, payload: NoticePayload) -> Result<(), AppError> {
+    {
+        let mut current = CURRENT.lock().expect("notice state poisoned");
+        let showing = app
+            .get_webview_window(NOTICE)
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
+        let live = if showing { current.as_ref() } else { None };
+        if !should_replace(
+            live.map(|p| (p.kind.as_str(), p.sticky)),
+            &payload.kind,
+            payload.sticky,
+        ) {
+            tracing::debug!(kind = payload.kind, "notice dropped behind a sticky one");
+            return Ok(());
+        }
+        *current = Some(payload.clone());
+    }
+
+    let (w, h) = NOTICE_SIZE;
+    let window = match app.get_webview_window(NOTICE) {
+        Some(w) => w,
+        None => {
+            let window = tauri::WebviewWindowBuilder::new(
+                app,
+                NOTICE,
+                tauri::WebviewUrl::App("/notice".into()),
+            )
+            .title("Notifications")
+            .inner_size(w, h)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .focused(false)
+            .resizable(false)
+            .visible(false)
+            .build()
+            .map_err(|e| format!("notice window failed: {e}"))?;
+            // Never activate — a notice matters most mid-call, and even a
+            // button click must not pull focus off the meeting app.
+            // Native-window access is main-thread work.
+            {
+                let styled = window.clone();
+                let _ = window.run_on_main_thread(move || {
+                    #[cfg(windows)]
+                    if let Ok(hwnd) = styled.hwnd() {
+                        crate::platform::style_notice(hwnd.0);
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Ok(ns_window) = styled.ns_window() {
+                        crate::platform::style_notice(ns_window);
+                    }
+                });
+            }
+            window
+        }
+    };
+
+    let _ = window.set_size(tauri::LogicalSize::new(w, h));
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let scale = monitor.scale_factor();
+        let screen = monitor.size().to_logical::<f64>(scale);
+        let pos = monitor.position().to_logical::<f64>(scale);
+        let _ = window.set_position(tauri::LogicalPosition::new(
+            pos.x + screen.width - w - 16.0,
+            pos.y + screen.height - h - 72.0,
+        ));
+    }
+    let _ = app.emit_to(NOTICE, "notice-payload", &payload);
+    window.show().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transients_never_clobber_a_live_sticky_notice() {
+        // A fallback toast mid silence check-in must not eat the question.
+        assert!(!should_replace(Some(("silence", true)), "switched_to_local", false));
+        // Sticky replaces anything; transient replaces transient.
+        assert!(should_replace(Some(("notes_ready", false)), "silence", true));
+        assert!(should_replace(Some(("notes_ready", false)), "update_ready", false));
+        // Same kind always updates (the silence minutes tick up).
+        assert!(should_replace(Some(("silence", true)), "silence", true));
+        // An empty window takes whatever comes.
+        assert!(should_replace(None, "recording_started", false));
+    }
+}

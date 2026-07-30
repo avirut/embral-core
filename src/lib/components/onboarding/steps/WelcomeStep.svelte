@@ -12,6 +12,9 @@
         Users,
     } from "lucide-svelte";
     import { loadTelemetryOptIn } from "$lib/cloud";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.onboarding.welcome);
 
     // The telemetry opt-in checkbox is a cloud-edition component
     // ([telemetry.md]); the open-core build renders nothing here.
@@ -21,43 +24,20 @@
         TelemetryOptIn = await loadTelemetryOptIn();
     });
 
-    const features = [
-        {
-            icon: NotebookPen,
-            title: "Meetings",
-            body: "Record, transcribe, summarize, & query",
-        },
-        {
-            icon: Speech,
-            title: "Dictation",
-            body: "Speak to type anywhere, with cleanup",
-        },
-        {
-            icon: Users,
-            title: "Profiles",
-            body: "Track speakers across your meetings",
-        },
-        {
-            icon: FileText,
-            title: "Markdown",
-            body: "Export notes to Obsidian & other tools",
-        },
-        {
-            icon: Bot,
-            title: "AI assistants",
-            body: "Let Claude and Codex search your notes",
-        },
-        {
-            icon: Lock,
-            title: "Private",
-            body: "Your notes & dictations stay on your computer",
-        },
-    ];
+    // Icons and order are this component's; the words come from the catalog.
+    const features = $derived([
+        { icon: NotebookPen, ...t.features.meetings },
+        { icon: Speech, ...t.features.dictation },
+        { icon: Users, ...t.features.profiles },
+        { icon: FileText, ...t.features.markdown },
+        { icon: Bot, ...t.features.assistants },
+        { icon: Lock, ...t.features.private },
+    ]);
 </script>
 
-<h1 class="font-display text-2xl tracking-tight">Welcome to embral</h1>
+<h1 class="font-display text-2xl tracking-tight">{t.title}</h1>
 <p class="mt-3 text-sm text-muted-foreground">
-    Private notes & dictation integrated with the tools you already use:
+    {t.intro}
 </p>
 
 <div class="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-3">

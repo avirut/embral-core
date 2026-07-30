@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use embral_types::AppConfig;
+use embral_types::{AppConfig, AppError};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 
@@ -103,30 +103,28 @@ fn needs_local_model(config: &AppConfig) -> bool {
 
 /// Start a dictation session: a transcription session from the provider
 /// seam, the overlay indicator, the mic streaming into it.
-pub async fn start(app: &AppHandle) -> Result<(), String> {
+pub async fn start(app: &AppHandle) -> Result<(), AppError> {
     let state = app.state::<AppState>();
     if state.recorder.lock().await.is_some() {
-        return Err("Can't dictate during a meeting recording".to_string());
+        return Err(AppError::CantDictateWhileRecording);
     }
     let mut slot = state.dictation.lock().await;
     if slot.is_some() {
-        return Err("Dictation is already running".to_string());
+        return Err(AppError::DictationAlreadyRunning);
     }
 
     let config = state.config.lock().await.clone();
     if needs_local_model(&config) {
         let model_id = config.dictation_asr_model_id();
         if !state.engine.model_present(&model_id) {
-            return Err(format!(
-                "The dictation speech model isn't downloaded ({model_id}) — check Settings → Transcription"
-            ));
+            return Err(AppError::DictationModelMissing { model_id });
         }
     }
     #[cfg(feature = "cloud")]
     if config.dictation_provider == embral_types::TranscriptionProvider::Cloud
         && config.cloud_session_token.is_empty()
     {
-        return Err("Sign in on the Account page to dictate with embral cloud".to_string());
+        return Err(AppError::CloudSignInRequired);
     }
 
     // The overlay and the mic come first — the hotkey must respond
@@ -146,7 +144,7 @@ pub async fn start(app: &AppHandle) -> Result<(), String> {
         Ok(mic) => mic,
         Err(e) => {
             hide_overlay(app);
-            return Err(e.to_string());
+            return Err(AppError::internal(e));
         }
     };
 
@@ -388,14 +386,14 @@ async fn abort_start(app: &AppHandle, message: String) {
     state.dictating.store(false, Ordering::Release);
     hide_overlay(app);
     let _ = app.emit("dictation-active", false);
-    let _ = app.emit("processing-error", format!("Dictation couldn't start: {message}"));
+    let _ = app.emit("processing-error", &AppError::DictationStartFailed { detail: message.to_string() });
 }
 
 /// Stop the session and run the output pipeline. Returns the pasted text.
-pub async fn stop(app: &AppHandle) -> Result<String, String> {
+pub async fn stop(app: &AppHandle) -> Result<String, AppError> {
     let state = app.state::<AppState>();
     let Some(mut active) = state.dictation.lock().await.take() else {
-        return Err("No dictation running".to_string());
+        return Err(AppError::NoDictationRunning);
     };
     state.dictating.store(false, Ordering::Release);
     let _ = app.emit_to(OVERLAY, "dictation-finishing", ());
@@ -452,7 +450,7 @@ pub async fn stop(app: &AppHandle) -> Result<String, String> {
         return Ok(String::new());
     }
 
-    let focused = focused_app();
+    let focused = crate::platform::focused_app().map(|a| a.label().to_string());
 
     // Cleanup per the configured tier; every failure shape delivers the raw
     // text rather than losing the dictation. The *resolved* tier (cloud
@@ -529,7 +527,7 @@ pub async fn stop(app: &AppHandle) -> Result<String, String> {
 
 /// Abort without any output. The session still gets a bounded finish so
 /// engine streams and relay sockets close cleanly; the result is discarded.
-pub async fn cancel(app: &AppHandle) -> Result<(), String> {
+pub async fn cancel(app: &AppHandle) -> Result<(), AppError> {
     let state = app.state::<AppState>();
     let Some(mut active) = state.dictation.lock().await.take() else {
         return Ok(());
@@ -600,7 +598,11 @@ fn deliver(text: &str, copy: bool, paste: bool) {
     if !paste {
         return;
     }
-    send_ctrl_v();
+    if let Err(e) = crate::platform::paste_keystroke() {
+        // The text is still on the clipboard and in history — a failed
+        // paste degrades, it doesn't lose the dictation.
+        tracing::warn!("paste keystroke failed: {e}");
+    }
     // Give the target app a moment to read the clipboard, then put the
     // user's old contents back — only when they didn't ask to keep the
     // text there.
@@ -616,79 +618,50 @@ fn deliver(text: &str, copy: bool, paste: bool) {
     }
 }
 
-/// Synthesize a Ctrl+V keystroke.
-fn send_ctrl_v() {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-        VK_CONTROL, VK_V,
-    };
-    let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk,
-                wScan: 0,
-                dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    let inputs = [
-        key(VK_CONTROL, false),
-        key(VK_V, false),
-        key(VK_V, true),
-        key(VK_CONTROL, true),
-    ];
-    unsafe {
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-    }
-}
-
-/// Process name of the app that currently has focus (e.g. `notepad.exe`).
-fn focused_app() -> Option<String> {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return None;
-        }
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 || pid == std::process::id() {
-            return None;
-        }
-        crate::autodetect::wasapi::process_name(pid)
-    }
-}
-
 /// The overlay's fixed size: a status row over up to ~4 lines of live
 /// words, with real margins all around.
 const OVERLAY_SIZE: (f64, f64) = (440.0, 148.0);
 
 /// Create (once) and show the overlay near the bottom of the current
 /// monitor. Never focused — the paste target must keep focus.
-fn show_overlay(app: &AppHandle) -> Result<(), String> {
+fn show_overlay(app: &AppHandle) -> Result<(), AppError> {
     let (w, h) = OVERLAY_SIZE;
     let window = match app.get_webview_window(OVERLAY) {
         Some(w) => w,
-        None => tauri::WebviewWindowBuilder::new(
-            app,
-            OVERLAY,
-            tauri::WebviewUrl::App("/dictation".into()),
-        )
-        .title("Dictation")
-        .inner_size(w, h)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .resizable(false)
-        .visible(false)
-        .build()
-        .map_err(|e| format!("overlay window failed: {e}"))?,
+        None => {
+            let window = tauri::WebviewWindowBuilder::new(
+                app,
+                OVERLAY,
+                tauri::WebviewUrl::App("/dictation".into()),
+            )
+            .title("Dictation")
+            .inner_size(w, h)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .focused(false)
+            .resizable(false)
+            .visible(false)
+            .build()
+            .map_err(|e| format!("overlay window failed: {e}"))?;
+            // Display-only: clicks pass straight through, so the overlay
+            // can never steal focus from the paste target on any platform.
+            let _ = window.set_ignore_cursor_events(true);
+            // Platform panel behaviors (macOS: join every Space, ride
+            // full-screen apps). Native-window access is main-thread work.
+            {
+                let styled = window.clone();
+                let _ = window.run_on_main_thread(move || {
+                    #[cfg(target_os = "macos")]
+                    if let Ok(ns_window) = styled.ns_window() {
+                        crate::platform::style_overlay(ns_window);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = &styled;
+                });
+            }
+            window
+        }
     };
 
     let _ = window.set_size(tauri::LogicalSize::new(w, h));

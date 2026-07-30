@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { errorMessage } from '$lib/copy/errors';
     import { invoke } from "@tauri-apps/api/core";
     import {
         BookUser,
@@ -12,14 +13,19 @@
         UserPlus,
     } from "lucide-svelte";
     import { importRecording } from "$lib/utils/importRecording";
-    import type { LibrarySearchResults } from "$lib/types";
+    import type { LibraryMeetingHit, LibrarySearchResults } from "$lib/types";
     import { appState, type AppView } from "$lib/stores/app-state.svelte";
     import { meetingsStore } from "$lib/stores/meetings.svelte";
     import { configStore } from "$lib/stores/config.svelte";
     import { dictationStore } from "$lib/stores/dictation.svelte";
+    import { copy } from "$lib/copy";
     import * as Command from "$lib/components/ui/command";
 
     let { open = $bindable(false) }: { open?: boolean } = $props();
+
+    const t = $derived(copy.shell.palette);
+    const navCopy = $derived(copy.shell.sidebar.nav);
+    const sectionNames = $derived(copy.settings.nav.sections);
 
     const noResults: LibrarySearchResults = { meetings: [], dictations: [] };
 
@@ -103,10 +109,22 @@
         fn();
     }
 
-    async function openMeeting(id: string) {
+    // Opening a result carries the passage it matched, so the detail pane
+    // lands on that sentence rather than at the top of the meeting. The
+    // search already knew where it was; making the user find it again was
+    // the whole gap.
+    async function openMeeting(hit: LibraryMeetingHit) {
+        const asked = query.trim();
         open = false;
         appState.setView("idle");
-        await meetingsStore.select(id);
+        await meetingsStore.select(hit.id, {
+            source: hit.source,
+            start_secs: hit.start_secs,
+            end_secs: hit.end_secs,
+            lead: hit.lead,
+            image: hit.image,
+            query: asked,
+        });
     }
 
     async function startRecording() {
@@ -114,7 +132,7 @@
         try {
             await invoke("start_recording");
         } catch (e) {
-            appState.setError(e instanceof Error ? e.message : String(e));
+            appState.setError(errorMessage(e));
         }
     }
 
@@ -123,76 +141,91 @@
         try {
             await invoke("stop_recording", { userNotes: null, meetingTitle: null });
         } catch (e) {
-            appState.setError(e instanceof Error ? e.message : String(e));
+            appState.setError(errorMessage(e));
         }
     }
 
     // Navigation entries, filtered manually against the query. The main
-    // pages always show; settings pages surface as you type.
-    const pages: { label: string; icon: typeof Mic; go: () => void }[] = [
-        { label: "Meetings", icon: NotebookPen, go: () => appState.setView("idle") },
-        { label: "Profiles", icon: BookUser, go: () => appState.setView("speakers") },
-        { label: "Dictation", icon: Type, go: () => appState.setView("dictation") },
+    // pages always show; settings pages surface as you type. The order and the
+    // destinations are this component's; the names come from the catalog —
+    // these must stay the same words the sidebar and the settings rail use.
+    const pages: {
+        key: keyof typeof copy.shell.sidebar.nav;
+        icon: typeof Mic;
+        go: () => void;
+    }[] = [
+        { key: "meetings", icon: NotebookPen, go: () => appState.setView("idle") },
+        { key: "speakers", icon: BookUser, go: () => appState.setView("speakers") },
+        { key: "dictation", icon: Type, go: () => appState.setView("dictation") },
     ];
-    // Ids follow SettingsLayout's SectionId values.
-    const settingsPages: { id: string; label: string }[] = [
-        { id: "general", label: "General" },
-        { id: "meetings", label: "Meetings" },
-        { id: "dictation", label: "Dictation" },
-        { id: "about", label: "About" },
-        { id: "markdown", label: "Markdown" },
-        { id: "mcp", label: "MCP" },
-        { id: "transcription", label: "Transcription" },
-        { id: "synthesis", label: "Synthesis" },
-    ];
+    // Ids follow SettingsLayout's SectionId values. Account is deliberately
+    // absent — it has no deep link.
+    const settingsIds = [
+        "general",
+        "meetings",
+        "dictation",
+        "about",
+        "markdown",
+        "mcp",
+        "transcription",
+        "synthesis",
+    ] as const;
     let settingsMatches = $derived.by(() => {
         const q = query.trim().toLowerCase();
         if (q.length < 2) return [];
-        return settingsPages.filter(
-            (p) =>
-                p.label.toLowerCase().includes(q) ||
-                "settings".includes(q) ||
-                `settings ${p.label}`.toLowerCase().includes(q),
-        );
+        const settingsWord = t.settings.toLowerCase();
+        return settingsIds
+            .map((id) => ({ id, label: sectionNames[id] }))
+            .filter(
+                (p) =>
+                    p.label.toLowerCase().includes(q) ||
+                    settingsWord.includes(q) ||
+                    `${settingsWord} ${p.label}`.toLowerCase().includes(q),
+            );
     });
     let pageMatches = $derived.by(() => {
         const q = query.trim().toLowerCase();
-        if (!q) return pages;
-        return pages.filter((p) => p.label.toLowerCase().includes(q));
+        const labelled = pages.map((p) => ({ ...p, label: navCopy[p.key] }));
+        if (!q) return labelled;
+        return labelled.filter((p) => p.label.toLowerCase().includes(q));
     });
 </script>
 
+<!-- A dialog normally hands focus back to whatever opened it. This one
+     navigates: the row that had focus a moment ago is usually not even the
+     meeting now on screen, so restoring it leaves a focus ring sitting on
+     the wrong thing, reading as a selection that isn't one. -->
 <Command.Dialog
     bind:open
     shouldFilter={false}
-    title="Search"
-    description="Search meetings, dictations, and commands"
+    onCloseAutoFocus={(event) => event.preventDefault()}
+    title={t.dialogTitle}
+    description={t.dialogDescription}
     class="sm:max-w-2xl"
 >
-    <Command.Input
-        placeholder="Search meetings, dictations, and commands…"
-        bind:value={query}
-    />
+    <Command.Input placeholder={t.placeholder} bind:value={query} />
     <Command.List>
         <!-- "No results" is only true once the search has actually finished.
              Saying it while a query is in flight tells the user their meeting
              isn't there, a moment before it appears. -->
         {#if query.trim().length >= 2 && !searching && results.meetings.length === 0 && results.dictations.length === 0}
-            <Command.Empty>No results.</Command.Empty>
+            <Command.Empty>{t.empty}</Command.Empty>
         {/if}
 
         {#if searching && results.meetings.length === 0}
             <Command.Loading>
-                <p class="px-2 py-3 text-center text-sm text-muted-foreground">Searching…</p>
+                <p class="px-2 py-3 text-center text-sm text-muted-foreground">
+                    {t.searching}
+                </p>
             </Command.Loading>
         {/if}
 
         {#if results.meetings.length > 0}
-            <Command.Group heading="Meetings">
+            <Command.Group heading={t.groups.meetings}>
                 {#each results.meetings as hit (hit.id)}
                     <Command.Item
                         value={hit.id}
-                        onSelect={() => openMeeting(hit.id)}
+                        onSelect={() => openMeeting(hit)}
                         class="flex-col items-start gap-0.5"
                     >
                         <div class="flex w-full items-center gap-2">
@@ -216,11 +249,15 @@
         {/if}
 
         {#if results.dictations.length > 0}
-            <Command.Group heading="Dictations">
+            <Command.Group heading={t.groups.dictations}>
                 {#each results.dictations as d (d.id)}
                     <Command.Item
                         value={`dictation-${d.id}`}
-                        onSelect={() => close(() => appState.setView("dictation"))}
+                        onSelect={() =>
+                            close(() => {
+                                dictationStore.landOn(d.id);
+                                appState.setView("dictation");
+                            })}
                         class="flex-col items-start gap-0.5"
                     >
                         <div class="flex w-full items-center gap-2">
@@ -242,23 +279,23 @@
             </Command.Group>
         {/if}
 
-        <Command.Group heading="Actions">
+        <Command.Group heading={t.groups.actions}>
             {#if appState.isRecording}
                 <Command.Item value="action-stop" onSelect={stopRecording}>
                     <Square size={14} />
-                    Stop recording
+                    {t.actions.stopRecording}
                 </Command.Item>
             {:else if configStore.isConfigured}
                 <Command.Item value="action-record" onSelect={startRecording}>
                     <Mic size={14} />
-                    Start recording
+                    {t.actions.startRecording}
                 </Command.Item>
                 <Command.Item
                     value="action-dictate"
                     onSelect={() => close(() => void dictationStore.start())}
                 >
                     <Type size={14} />
-                    Start dictation
+                    {t.actions.startDictation}
                 </Command.Item>
             {/if}
             <Command.Item
@@ -266,23 +303,20 @@
                 onSelect={() => close(() => void importRecording())}
             >
                 <FileUp size={14} />
-                Import a recording…
+                {t.actions.importRecording}
             </Command.Item>
             <Command.Item
                 value="action-new-profile"
                 onSelect={() => close(() => appState.openProfilesCreate())}
             >
                 <UserPlus size={14} />
-                New profile
+                {t.actions.newProfile}
             </Command.Item>
         </Command.Group>
 
-        <Command.Group heading="Go to">
-            {#each pageMatches as p (p.label)}
-                <Command.Item
-                    value={`nav-${p.label}`}
-                    onSelect={() => close(p.go)}
-                >
+        <Command.Group heading={t.groups.goTo}>
+            {#each pageMatches as p (p.key)}
+                <Command.Item value={`nav-${p.key}`} onSelect={() => close(p.go)}>
                     <p.icon size={14} />
                     {p.label}
                 </Command.Item>
@@ -293,7 +327,7 @@
                     onSelect={() => close(() => appState.openSettings())}
                 >
                     <Settings size={14} />
-                    Settings
+                    {t.settings}
                 </Command.Item>
             {/if}
             {#each settingsMatches as s (s.id)}
@@ -302,7 +336,7 @@
                     onSelect={() => close(() => appState.openSettings(s.id))}
                 >
                     <Settings size={14} />
-                    Settings → {s.label}
+                    {t.settingsPage(s.label)}
                 </Command.Item>
             {/each}
         </Command.Group>

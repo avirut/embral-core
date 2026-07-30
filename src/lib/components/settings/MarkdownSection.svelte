@@ -8,8 +8,11 @@
     import { Switch } from "$lib/components/ui/switch";
     import { Input } from "$lib/components/ui/input";
     import { Button } from "$lib/components/ui/button";
+    import { copy } from "$lib/copy";
 
     let { draft }: { draft: AppConfig } = $props();
+
+    const t = $derived(copy.settings.markdown);
 
     let preview = $state("");
 
@@ -28,87 +31,82 @@
         }
     }
 
-    const formatLabels: Record<ExportMetadataFormat, string> = {
-        frontmatter: "YAML frontmatter",
-        inline: "Inline",
-    };
-
-    const tokens = [
-        ["{date}", "YYYY-MM-DD"],
-        ["{time}", "HH-MM"],
-        ["{year}", "YYYY"],
-        ["{month}", "MM"],
-        ["{day}", "DD"],
-        ["{hour}", "HH"],
-        ["{minute}", "MM"],
-        ["{title}", "meeting title"],
-    ] as const;
+    // Token codes are parsed by Rust (data); the meaning beside each comes
+    // from the catalog by key.
+    const tokens: {
+        token: string;
+        key: keyof typeof copy.settings.markdown.filename.tokens;
+    }[] = [
+        { token: "{date}", key: "date" },
+        { token: "{time}", key: "time" },
+        { token: "{year}", key: "year" },
+        { token: "{month}", key: "month" },
+        { token: "{day}", key: "day" },
+        { token: "{hour}", key: "hour" },
+        { token: "{minute}", key: "minute" },
+        { token: "{title}", key: "title" },
+    ];
 </script>
 
 <div class="space-y-6">
-    <SettingsGroup label="Auto-export">
+    <SettingsGroup label={t.autoExport._group}>
         <SettingRow
-            title="Export notes when a recording ends"
-            description="Saves a markdown copy into a folder of your choice, like an Obsidian vault"
+            title={t.autoExport.enabled.label}
+            description={t.autoExport.enabled.sub}
         >
             <Switch bind:checked={draft.obsidian_export_enabled} />
         </SettingRow>
         {#if draft.obsidian_export_enabled}
-            <SettingRow title="Export folder" vertical>
+            <SettingRow title={t.autoExport.folder.label} vertical>
                 <div class="flex w-full gap-2">
                     <Input
                         bind:value={draft.obsidian_vault_dir}
-                        placeholder="Path to your vault or notes folder"
+                        placeholder={t.autoExport.folder.placeholder}
                         class="flex-1"
                     />
                     <Button variant="outline" size="sm" onclick={browseVaultDir}
-                        >Browse…</Button
+                        >{t.autoExport.browse}</Button
                     >
                 </div>
             </SettingRow>
         {/if}
     </SettingsGroup>
 
-    <SettingsGroup label="Include">
-        <SettingRow title="AI summary">
+    <SettingsGroup label={t.include._group}>
+        <SettingRow title={t.include.summary.label}>
             <Switch bind:checked={draft.export_include_summary} />
         </SettingRow>
-        <SettingRow title="Your notes">
+        <SettingRow title={t.include.notes.label}>
             <Switch bind:checked={draft.export_include_notes} />
         </SettingRow>
-        <SettingRow title="Transcript">
+        <SettingRow title={t.include.transcript.label}>
             <Switch bind:checked={draft.export_include_transcript} />
         </SettingRow>
     </SettingsGroup>
 
-    <SettingsGroup label="Filename">
-        <SettingRow
-            title="Filename template"
-            vertical
-        >
+    <SettingsGroup label={t.filename._group}>
+        <SettingRow title={t.filename.template.label} vertical>
             <Input
                 bind:value={draft.export_filename_template}
                 class="max-w-md font-mono text-xs"
             />
             {#if preview}
                 <p class="mt-1.5 text-xs text-muted-foreground">
-                    Preview:
+                    {t.filename.preview}
                     <span class="font-mono">{preview}</span>
                 </p>
             {/if}
             <div class="mt-2 grid max-w-md grid-cols-2 gap-x-6 gap-y-0.5 text-xs text-muted-foreground">
-                {#each tokens as [token, meaning] (token)}
+                {#each tokens as { token, key } (token)}
                     <div class="flex justify-between gap-3">
                         <span class="font-mono">{token}</span>
-                        <span>{meaning}</span>
+                        <span>{t.filename.tokens[key]}</span>
                     </div>
                 {/each}
             </div>
         </SettingRow>
 
-        <SettingRow
-            title="Metadata format"
-        >
+        <SettingRow title={t.filename.metadata.label}>
             <Select.Root
                 type="single"
                 value={draft.export_metadata_format}
@@ -117,11 +115,19 @@
                         "frontmatter") as ExportMetadataFormat)}
             >
                 <Select.Trigger class="w-56"
-                    >{formatLabels[draft.export_metadata_format]}</Select.Trigger
+                    >{t.filename.metadata.options[
+                        draft.export_metadata_format
+                    ]}</Select.Trigger
                 >
                 <Select.Content>
-                    <Select.Item value="frontmatter" label="YAML frontmatter" />
-                    <Select.Item value="inline" label="Inline" />
+                    <Select.Item
+                        value="frontmatter"
+                        label={t.filename.metadata.options.frontmatter}
+                    />
+                    <Select.Item
+                        value="inline"
+                        label={t.filename.metadata.options.inline}
+                    />
                 </Select.Content>
             </Select.Root>
         </SettingRow>

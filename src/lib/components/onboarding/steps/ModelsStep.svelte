@@ -10,6 +10,7 @@
     import { Button } from "$lib/components/ui/button";
     import { modelsStore } from "$lib/stores/models.svelte";
     import { formatBytes } from "$lib/utils/bytes";
+    import { copy } from "$lib/copy";
     import type { TranscriptionLanguage } from "$lib/types";
     import type { OnboardingDraft } from "../types";
     import Segmented from "../Segmented.svelte";
@@ -31,6 +32,8 @@
     } from "../recommend";
 
     let { draft }: { draft: OnboardingDraft } = $props();
+
+    const t = $derived(copy.onboarding.models);
 
     let specs = $state<SystemSpecs | null>(null);
     // Per-unit selection; ASR/punctuation/speakers/search default in, the
@@ -107,8 +110,8 @@
         return [
             mk(
                 "asr",
-                asrStatus?.display_name ?? "Transcription model",
-                multilingual ? "Transcription — 25 languages" : "Transcription",
+                asrStatus?.display_name ?? t.units.asrTitle,
+                multilingual ? t.units.asrWhyMultilingual : t.units.asrWhy,
                 [chosenAsr],
                 wantAsr,
                 (v) => (wantAsr = v),
@@ -118,8 +121,8 @@
                       mk(
                           "punct",
                           modelsStore.status(PUNCTUATION)?.display_name ??
-                              "English punctuation",
-                          "Punctuation for the transcript",
+                              t.units.punctTitle,
+                          t.units.punctWhy,
                           [PUNCTUATION],
                           wantPunct,
                           (v) => (wantPunct = v),
@@ -128,8 +131,8 @@
                 : []),
             mk(
                 "summaries",
-                "Summaries on this computer",
-                "Language model and engine",
+                t.units.summariesTitle,
+                t.units.summariesWhy,
                 [LLM_RUNTIME, LLM_WEIGHTS],
                 wantSummaries,
                 (v) => (wantSummaries = v),
@@ -137,16 +140,16 @@
             mk(
                 "speakers",
                 modelsStore.status(SPEAKER_ID)?.display_name ??
-                    "Speaker identification",
-                "Tells speakers apart",
+                    t.units.speakersTitle,
+                t.units.speakersWhy,
                 [SPEAKER_ID],
                 wantSpeakers,
                 (v) => (wantSpeakers = v),
             ),
             mk(
                 "search",
-                modelsStore.status(EMBEDDING)?.display_name ?? "Semantic search",
-                "Search by meaning",
+                modelsStore.status(EMBEDDING)?.display_name ?? t.units.searchTitle,
+                t.units.searchWhy,
                 [EMBEDDING],
                 wantSearch,
                 (v) => (wantSearch = v),
@@ -171,10 +174,10 @@
     let warnDisk = $derived(specs ? diskWarning(specs, downloadBytes) : false);
     let buttonLabel = $derived(
         checkedUnits.length === 0
-            ? "Download none"
+            ? t.downloadNone
             : checkedUnits.length === downloadable.length
-              ? `Download all (${formatBytes(downloadBytes)})`
-              : `Download selected (${formatBytes(downloadBytes)})`,
+              ? t.downloadAll(formatBytes(downloadBytes))
+              : t.downloadSelected(formatBytes(downloadBytes)),
     );
 
     function downloadSelected() {
@@ -206,27 +209,27 @@
         return `${gb} GB RAM`;
     }
 
-    const languageOptions = [
-        { value: "english", label: "English" },
-        { value: "multilingual", label: "Multilingual" },
-    ];
-    const tierOptions = [
-        { value: ASR_FAST, label: "Fast" },
-        { value: ASR_BALANCED, label: "Balanced" },
-        { value: ASR_ACCURATE, label: "Accurate" },
-    ];
+    let languageOptions = $derived([
+        { value: "english", label: t.languageOptions.english },
+        { value: "multilingual", label: t.languageOptions.multilingual },
+    ]);
+    let tierOptions = $derived([
+        { value: ASR_FAST, label: t.tierOptions.fast },
+        { value: ASR_BALANCED, label: t.tierOptions.balanced },
+        { value: ASR_ACCURATE, label: t.tierOptions.accurate },
+    ]);
 </script>
 
-<h1 class="font-display text-2xl tracking-tight">Set up local models</h1>
+<h1 class="font-display text-2xl tracking-tight">{t.title}</h1>
 
 {#if specs && rec}
     <p class="mt-3 text-sm text-muted-foreground">
-        Based on this machine's specs, here's what we recommend:
+        {t.intro}
     </p>
 
     <div class="mt-5 space-y-2.5">
         <div class="flex items-center justify-between gap-3">
-            <p class="text-sm font-medium">Language</p>
+            <p class="text-sm font-medium">{t.language}</p>
             <Segmented
                 options={languageOptions}
                 value={draft.transcription_language}
@@ -238,7 +241,7 @@
         </div>
         {#if !multilingual}
             <div class="flex items-center justify-between gap-3">
-                <p class="text-sm font-medium">Accuracy</p>
+                <p class="text-sm font-medium">{t.accuracy}</p>
                 <Segmented
                     options={tierOptions}
                     value={draft.local_asr_model}
@@ -282,11 +285,11 @@
         <div class="border-t border-border p-3">
             {#if allPresent}
                 <p class="flex items-center gap-1.5 text-sm text-primary">
-                    <Check size={15} /> Everything's ready.
+                    <Check size={15} /> {t.ready}
                 </p>
             {:else if anyDownloading && toDownload.length === 0}
                 <p class="text-sm text-muted-foreground">
-                    Downloading in background - you can keep going.
+                    {t.downloadingBackground}
                 </p>
             {:else}
                 <Button
@@ -299,12 +302,12 @@
             {/if}
             {#if warnDisk}
                 <p class="mt-2 text-xs text-destructive">
-                    This drive is low on space - downloads may not fit.
+                    {t.lowSpace}
                 </p>
             {/if}
         </div>
     </div>
     {/if}
 {:else}
-    <p class="mt-3 text-sm text-muted-foreground">Checking this computer…</p>
+    <p class="mt-3 text-sm text-muted-foreground">{t.checking}</p>
 {/if}

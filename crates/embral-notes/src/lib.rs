@@ -13,8 +13,10 @@
 //! The Tauri crate builds a [`providers::NotesConfig`] from its `AppConfig` and
 //! calls [`refine_notes`]; everything else stays here.
 
+pub mod assets;
 pub mod integrations;
 pub mod matching;
+pub mod ocr;
 pub mod prompt;
 pub mod providers;
 pub mod text;
@@ -39,6 +41,7 @@ pub async fn refine_notes(
     transcript: &str,
     user_notes: Option<&str>,
     custom_prompt: &str,
+    image_text: &[(String, String)],
 ) -> Result<String> {
     let user_message = prompt::build_user_message(
         meeting_id,
@@ -47,6 +50,7 @@ pub async fn refine_notes(
         meeting_title,
         transcript,
         user_notes,
+        image_text,
     );
     providers::generate(cfg, &prompt::system_prompt(custom_prompt), &user_message).await
 }

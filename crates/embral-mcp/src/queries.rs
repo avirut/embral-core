@@ -71,6 +71,11 @@ fn hit_json(h: &Hit) -> Value {
         body.insert("created_at".into(), json!(rfc3339(&h.date)));
     }
     body.insert("source".into(), json!(h.source));
+    // Which image an `image_text` passage was read out of, so a caller can
+    // say *where* it saw something rather than only that it did.
+    if let Some(image) = &h.image_filename {
+        body.insert("image".into(), json!(image));
+    }
     if !h.speakers.is_empty() {
         body.insert("speakers".into(), json!(h.speakers));
     }
@@ -91,6 +96,40 @@ fn hit_json(h: &Hit) -> Value {
     Value::Object(body)
 }
 
+/// Does a requested name cover a profile's display name? True when its
+/// words are a contiguous run of the profile's words, case-insensitively —
+/// "john" and "john smith" both cover "John Smith Jr", "smith john" covers
+/// nothing.
+fn name_covers(requested: &str, profile_name: &str) -> bool {
+    let req: Vec<String> = requested.split_whitespace().map(str::to_lowercase).collect();
+    let prof: Vec<String> = profile_name.split_whitespace().map(str::to_lowercase).collect();
+    !req.is_empty() && prof.windows(req.len()).any(|w| w == req.as_slice())
+}
+
+fn push_name(names: &mut Vec<String>, name: &str) {
+    if !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+        names.push(name.to_string());
+    }
+}
+
+/// Expand each requested speaker name through the registry so "what has
+/// John said" finds what the labels call "John Smith". The requested name
+/// itself always stays in the list — a label that never got a profile
+/// keeps matching as typed — and an ambiguous first name includes every
+/// profile it covers: search is recall-oriented and each hit carries the
+/// full name.
+fn resolve_speakers(db: &Db, requested: &[String]) -> Result<Vec<String>, ToolError> {
+    let profiles = db.list_speakers().map_err(ToolError::Db)?;
+    let mut names = Vec::new();
+    for name in requested {
+        push_name(&mut names, name);
+        for p in profiles.iter().filter(|p| name_covers(name, &p.name)) {
+            push_name(&mut names, &p.name);
+        }
+    }
+    Ok(names)
+}
+
 fn run_search(
     db: &Db,
     owner: OwnerKind,
@@ -105,7 +144,11 @@ fn run_search(
         .clamp(1, SEARCH_LIMIT_MAX) as usize;
     args.sources = params.sources.clone();
     args.participants = params.participants.clone();
-    args.speakers = params.speakers.clone();
+    args.speakers = params
+        .speakers
+        .as_deref()
+        .map(|names| resolve_speakers(db, names))
+        .transpose()?;
     args.after = params.after.as_deref().map(|s| parse_time(s, false)).transpose()?;
     args.before = params.before.as_deref().map(|s| parse_time(s, true)).transpose()?;
     embral_search::search(db, &args, vector).map_err(ToolError::Db)
@@ -267,13 +310,13 @@ pub fn get_meeting(db: &Db, id: &str) -> Result<Value, ToolError> {
             Ok(names)
         })
         .map_err(ToolError::Db)?;
-    let user_notes = db.get_user_notes(id).map_err(ToolError::Db)?;
+    let user_notes = db.get_notes(id).map_err(ToolError::Db)?;
     Ok(json!({
         "meeting": summary(&m),
         "speakers": spoke,
-        "summary_md": m.notes_md,
+        "summary": m.summary,
         "user_notes": user_notes,
-        "has_transcript": !m.transcript_md.trim().is_empty(),
+        "has_transcript": !m.transcript.trim().is_empty(),
     }))
 }
 
@@ -288,7 +331,7 @@ pub fn get_transcript(
     if from_secs.is_none() && to_secs.is_none() {
         return Ok(json!({
             "meeting": summary(&m),
-            "transcript": m.transcript_md,
+            "transcript": m.transcript,
         }));
     }
     let lo = from_secs.unwrap_or(0.0).max(0.0);
@@ -394,12 +437,10 @@ mod tests {
             title: title.to_string(),
             started_at: Utc.with_ymd_and_hms(2026, 6, day, 10, 0, 0).unwrap(),
             duration_seconds: 600,
-            notes_md: String::new(),
-            transcript_md: String::new(),
+            summary: String::new(),
+            transcript: String::new(),
             attendees: attendees.iter().map(|s| s.to_string()).collect(),
             audio_path: String::new(),
-            notes_path: String::new(),
-            transcript_path: String::new(),
         }
     }
 
@@ -410,8 +451,8 @@ mod tests {
         {
             let writer = Db::open(&path).unwrap();
             let mut budget = mk("m-budget", "Budget Review", 1, &["Alice", "Bob"]);
-            budget.notes_md = "# Budget Review\n\n## Key Takeaways\n\nSpending freeze until Q4.".into();
-            budget.transcript_md = "# Budget Review Transcript\n\nbody".into();
+            budget.summary = "# Budget Review\n\n## Key Takeaways\n\nSpending freeze until Q4.".into();
+            budget.transcript = "# Budget Review Transcript\n\nbody".into();
             writer.upsert_meeting(&budget).unwrap();
             writer
                 .replace_segments(
@@ -423,7 +464,7 @@ mod tests {
                     ],
                 )
                 .unwrap();
-            writer.set_user_notes("m-budget", "freeze confirmed by finance").unwrap();
+            writer.set_notes("m-budget", "freeze confirmed by finance").unwrap();
 
             writer
                 .upsert_meeting(&mk("m-hiring", "Hiring Sync", 20, &["Alice", "Dana"]))
@@ -431,8 +472,16 @@ mod tests {
             writer
                 .replace_segments(
                     "m-hiring",
-                    &[seg("Dana", "Two engineering offers go out this week.", 0.0, 8.0)],
+                    &[seg("Dana Smith", "Two engineering offers go out this week.", 0.0, 8.0)],
                 )
+                .unwrap();
+            // Dana has a registry profile; Alice and Bob are plain labels.
+            writer
+                .upsert_speaker(&embral_db::SpeakerRow {
+                    id: "sp_dana".into(),
+                    name: "Dana Smith".into(),
+                    notes: String::new(),
+                })
                 .unwrap();
 
             writer
@@ -491,6 +540,34 @@ mod tests {
         let mut by_speaker = params("offers");
         by_speaker.speakers = Some(vec!["Alice".into()]);
         assert_eq!(search_meetings(&db, &by_speaker, None).unwrap()["count"], 0);
+    }
+
+    #[test]
+    fn speaker_filter_resolves_names_through_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture(dir.path());
+
+        // "what has Dana said": the labels say "Dana Smith", the caller
+        // says "dana" — the registry bridges them.
+        let mut by_first = params("offers");
+        by_first.speakers = Some(vec!["dana".into()]);
+        assert_eq!(search_meetings(&db, &by_first, None).unwrap()["count"], 1);
+
+        // A label with no profile still matches as typed.
+        let mut unregistered = params("freeze");
+        unregistered.speakers = Some(vec!["alice".into()]);
+        let found = search_meetings(&db, &unregistered, None).unwrap();
+        assert!(found["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn name_covers_matches_contiguous_words() {
+        assert!(name_covers("john", "John Smith"));
+        assert!(name_covers("JOHN SMITH", "John Smith"));
+        assert!(name_covers("smith jr", "John Smith Jr"));
+        assert!(!name_covers("smith john", "John Smith"));
+        assert!(!name_covers("jo", "John Smith"));
+        assert!(!name_covers("", "John Smith"));
     }
 
     #[test]
@@ -557,7 +634,7 @@ mod tests {
 
         let detail = get_meeting(&db, "m-hiring").unwrap();
         assert_eq!(detail["meeting"]["attendees"], json!(["Alice", "Dana"]));
-        assert_eq!(detail["speakers"], json!(["Dana"]));
+        assert_eq!(detail["speakers"], json!(["Dana Smith"]));
         assert_eq!(detail["user_notes"], "");
 
         assert!(matches!(

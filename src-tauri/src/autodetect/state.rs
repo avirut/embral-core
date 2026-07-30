@@ -47,6 +47,17 @@ impl Detector {
         matches!(self.phase, Phase::Active | Phase::Grace { .. })
     }
 
+    /// The current phase, for the poller's transition log — a stuck Active
+    /// state was invisible in the field before this existed.
+    pub fn phase_name(&self) -> &'static str {
+        match self.phase {
+            Phase::Idle => "idle",
+            Phase::Arming { .. } => "arming",
+            Phase::Active => "active",
+            Phase::Grace { .. } => "grace",
+        }
+    }
+
     /// Feed one tick's observation; returns a transition when one fires.
     pub fn tick(&mut self, candidate: Option<&str>) -> Option<Detection> {
         match (&mut self.phase, candidate) {
@@ -110,8 +121,17 @@ impl Detector {
 /// Whether a process name counts as a meeting app. Case-insensitive, `.exe`
 /// stripped, substring match in either direction so "ms-teams" matches
 /// "ms-teams.exe" and "zoom" matches "Zoom.exe".
-pub fn match_app(process_name: &str, allowlist: &[String]) -> bool {
-    let name = process_name
+pub fn match_app(app: &crate::platform::types::AppId, allowlist: &[String]) -> bool {
+    app.identities()
+        .any(|identity| match_identity(identity, allowlist))
+}
+
+/// One identity string (exe name, bundle id, display name) against the
+/// allowlist: case-insensitive, `.exe`-stripped, bidirectional substring —
+/// which is what lets a bare entry like "chrome" catch `chrome.exe`,
+/// `com.google.Chrome.helper`, and "Google Chrome" alike.
+fn match_identity(identity: &str, allowlist: &[String]) -> bool {
+    let name = identity
         .to_lowercase()
         .trim_end_matches(".exe")
         .to_string();
@@ -132,15 +152,46 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    fn exe(name: &str) -> crate::platform::types::AppId {
+        crate::platform::types::AppId::from_exe(1, name.to_string())
+    }
+
     #[test]
     fn matcher_is_case_insensitive_and_exe_agnostic() {
         let allow = list(&["zoom", "ms-teams", "chrome"]);
-        assert!(match_app("Zoom.exe", &allow));
-        assert!(match_app("ms-teams.exe", &allow));
-        assert!(match_app("chrome", &allow));
-        assert!(match_app("GoogleChrome.exe", &allow)); // substring
-        assert!(!match_app("notepad.exe", &allow));
-        assert!(!match_app("", &allow));
+        assert!(match_app(&exe("Zoom.exe"), &allow));
+        assert!(match_app(&exe("ms-teams.exe"), &allow));
+        assert!(match_app(&exe("chrome"), &allow));
+        assert!(match_app(&exe("GoogleChrome.exe"), &allow)); // substring
+        assert!(!match_app(&exe("notepad.exe"), &allow));
+        assert!(!match_app(&exe(""), &allow));
+    }
+
+    #[test]
+    fn matcher_accepts_any_identity_the_platform_has() {
+        let allow = list(&["zoom", "chrome", "slack"]);
+        // A macOS-shaped observation: bundle id + display name, no exe.
+        let helper = crate::platform::types::AppId {
+            pid: 7,
+            exe: None,
+            bundle_id: Some("com.google.Chrome.helper".into()),
+            display_name: Some("Google Chrome".into()),
+        };
+        assert!(match_app(&helper, &allow), "helper bundle ids match brand tokens");
+        let zoom = crate::platform::types::AppId {
+            pid: 8,
+            exe: Some("zoom.us".into()),
+            bundle_id: Some("us.zoom.xos".into()),
+            display_name: None,
+        };
+        assert!(match_app(&zoom, &allow));
+        let other = crate::platform::types::AppId {
+            pid: 9,
+            exe: None,
+            bundle_id: Some("com.apple.notes".into()),
+            display_name: Some("Notes".into()),
+        };
+        assert!(!match_app(&other, &allow));
     }
 
     #[test]

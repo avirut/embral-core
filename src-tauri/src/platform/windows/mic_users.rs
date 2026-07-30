@@ -20,9 +20,11 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
 
-/// Process names (e.g. `Zoom.exe`) with an active microphone session,
-/// excluding `exclude_pid` (our own recorder).
-pub fn processes_using_microphone(exclude_pid: u32) -> Vec<String> {
+use crate::platform::types::AppId;
+
+/// Apps (identified by exe name, e.g. `Zoom.exe`) with an active microphone
+/// session, excluding `exclude_pid` (our own recorder).
+pub fn processes_using_microphone(exclude_pid: u32) -> Vec<AppId> {
     match scan(exclude_pid) {
         Ok(names) => names,
         Err(e) => {
@@ -32,7 +34,7 @@ pub fn processes_using_microphone(exclude_pid: u32) -> Vec<String> {
     }
 }
 
-fn scan(exclude_pid: u32) -> windows::core::Result<Vec<String>> {
+fn scan(exclude_pid: u32) -> windows::core::Result<Vec<AppId>> {
     unsafe {
         // Idempotent per-thread init; RPC_E_CHANGED_MODE (already initialized
         // with a different model) is fine for our read-only usage.
@@ -42,7 +44,7 @@ fn scan(exclude_pid: u32) -> windows::core::Result<Vec<String>> {
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let devices = enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
 
-        let mut names: Vec<String> = Vec::new();
+        let mut names: Vec<AppId> = Vec::new();
         for i in 0..devices.GetCount()? {
             let device = match devices.Item(i) {
                 Ok(d) => d,
@@ -75,10 +77,15 @@ fn scan(exclude_pid: u32) -> windows::core::Result<Vec<String>> {
                 if pid == 0 || pid == exclude_pid {
                     continue; // 0 = system sounds session
                 }
-                if let Some(name) = process_name(pid) {
-                    if !names.iter().any(|n| n == &name) {
-                        names.push(name);
+                match process_name(pid) {
+                    Some(name) => {
+                        if !names.iter().any(|n| n.exe.as_deref() == Some(&name)) {
+                            names.push(AppId::from_exe(pid, name));
+                        }
                     }
+                    // The implicit liveness check: a session whose process is
+                    // gone can't be named — and can't hold a call open.
+                    None => tracing::debug!(pid, "active mic session with no live process; skipped"),
                 }
             }
         }
@@ -100,7 +107,7 @@ mod tests {
 
 /// Executable base name for a PID (e.g. `Zoom.exe`). Also used by dictation
 /// to identify the focused app.
-pub(crate) fn process_name(pid: u32) -> Option<String> {
+pub fn process_name(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
         let mut buf = [0u16; 260];

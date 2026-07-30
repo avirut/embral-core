@@ -46,9 +46,6 @@ const HEALTH_POLL: Duration = Duration::from_millis(500);
 /// but meeting transcripts fit and RAM stays modest.
 const CONTEXT_TOKENS: u32 = 16_384;
 
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 impl LlmSidecar {
     /// Base URL of a healthy sidecar (e.g. `http://127.0.0.1:8641/v1`),
     /// starting it first when needed.
@@ -106,12 +103,10 @@ impl LlmSidecar {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
+        crate::platform::hide_console(&mut command);
+        crate::platform::prepare_spawn(&mut command);
         let mut child = command.spawn().context("spawn llama-server")?;
+        crate::platform::watch_child(child.id());
 
         // Wait until the model is loaded (/health flips 503 → 200).
         let client = reqwest::Client::new();
@@ -345,6 +340,7 @@ Speaker 2: Sounds good. Last thing — budget: we are about eight percent under 
             transcript,
             None,
             "",
+            &[],
         )
         .await
         .expect("refine notes");

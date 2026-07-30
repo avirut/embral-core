@@ -4,11 +4,14 @@
     import { Check, PenLine, RotateCcw } from "lucide-svelte";
     import * as Dialog from "$lib/components/ui/dialog";
     import { modelsStore } from "$lib/stores/models.svelte";
+    import { isMac } from "$lib/platform";
     import TranscriptionBlock from "./TranscriptionBlock.svelte";
     import HotkeyCapture from "./HotkeyCapture.svelte";
     import type {
         AppConfig,
         AutoStartPolicy,
+        AutoStopScope,
+        SilenceUnanswered,
         DiarizationSensitivity,
         NotesNamingMode,
         OpenMeetingTab,
@@ -16,6 +19,7 @@
     import { BUILTIN_PROFILE_ID, CLOUD_PROFILE_ID } from "$lib/types";
     import { CLOUD_ENABLED } from "$lib/cloud";
     import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
+    import { copy } from "$lib/copy";
     import SettingsGroup from "./SettingsGroup.svelte";
     import SettingRow from "./SettingRow.svelte";
     import * as Select from "$lib/components/ui/select";
@@ -27,32 +31,57 @@
 
     let { draft }: { draft: AppConfig } = $props();
 
+    const t = $derived(copy.settings.meetings);
+    const providers = $derived(copy.common.providers);
+
     // --- Auto-start -----------------------------------------------------
 
-    const policyOptions: { value: AutoStartPolicy; label: string }[] = [
-        { value: "always", label: "Always" },
-        { value: "selective", label: "Selectively" },
-        { value: "prompt", label: "After asking" },
-        { value: "manual", label: "Never" },
+    // The order is fixed here; the names come from the catalog by key.
+    const policyOrder: AutoStartPolicy[] = [
+        "always",
+        "selective",
+        "prompt",
+        "manual",
     ];
 
-    let policy = $derived(
-        policyOptions.find((o) => o.value === draft.auto_start_policy) ??
-            policyOptions[2],
+    let policyLabel = $derived(
+        t.autoStart.prompt.options[draft.auto_start_policy] ??
+            t.autoStart.prompt.options.prompt,
+    );
+
+    const autoStopOrder: AutoStopScope[] = ["never", "auto_started", "all"];
+
+    let autoStopLabel = $derived(
+        t.autoStart.autoStop.options[draft.auto_stop] ??
+            t.autoStart.autoStop.options.auto_started,
+    );
+
+    const silenceUnansweredOrder: SilenceUnanswered[] = ["stop", "keep"];
+
+    let silenceUnansweredLabel = $derived(
+        t.autoStart.silenceUnanswered.options[draft.silence_stop_unanswered] ??
+            t.autoStart.silenceUnanswered.options.stop,
     );
 
     // The fixed set of meeting apps (4×2 grid). Each checkbox owns one
     // process-match string; the detector matches case-insensitive substrings
-    // ("teams" also catches ms-teams.exe).
-    const knownApps: { label: string; match: string }[] = [
-        { label: "Zoom", match: "zoom" },
-        { label: "Teams", match: "teams" },
-        { label: "Chrome", match: "chrome" },
-        { label: "Edge", match: "msedge" },
-        { label: "Firefox", match: "firefox" },
-        { label: "Slack", match: "slack" },
-        { label: "Discord", match: "discord" },
-        { label: "Webex", match: "webex" },
+    // against every identity the platform reports ("teams" catches
+    // ms-teams.exe and com.microsoft.teams2 alike). The names come from the
+    // catalog by key; `match` is detector data, platform-keyed where the
+    // brand token differs (msedge.exe vs com.microsoft.edgemac).
+    const knownApps: {
+        key: keyof typeof copy.settings.meetings.autoStart.apps.names;
+        match: string;
+    }[] = [
+        { key: "zoom", match: "zoom" },
+        { key: "teams", match: "teams" },
+        { key: "chrome", match: "chrome" },
+        { key: "edge", match: isMac ? "edge" : "msedge" },
+        ...(isMac ? [{ key: "safari", match: "safari" } as const] : []),
+        { key: "firefox", match: "firefox" },
+        { key: "slack", match: "slack" },
+        { key: "discord", match: "discord" },
+        { key: "webex", match: "webex" },
     ];
 
     function appChecked(match: string): boolean {
@@ -65,20 +94,6 @@
             : [...draft.auto_detect_apps, match];
     }
 
-
-    // --- Speakers ------------------------------------------------------------
-
-    const sensitivityLabels: Record<DiarizationSensitivity, string> = {
-        low: "Fewer speakers",
-        medium: "Balanced",
-        high: "More speakers",
-    };
-
-    const namingLabels: Record<NotesNamingMode, string> = {
-        off: "Off",
-        suggest: "Suggest",
-        automatic: "Automatic",
-    };
 
     // --- Summaries prompt ----------------------------------------------------
 
@@ -105,7 +120,9 @@
     // knob). Engines are fixed per edition; the backend picks actual models.
     let engineValue = $derived(draft.summaries_profile_id || BUILTIN_PROFILE_ID);
     let engineLabel = $derived(
-        engineValue === CLOUD_PROFILE_ID ? "embral cloud" : "local model",
+        engineValue === CLOUD_PROFILE_ID
+            ? providers.cloud
+            : providers.localModel,
     );
 
     // "" in config means "use the default" — the editor always shows the
@@ -118,12 +135,6 @@
         draft.summary_prompt = value.trim() === defaultPrompt.trim() ? "" : value;
     }
 
-    const tabLabels: Record<OpenMeetingTab, string> = {
-        summary: "Summary",
-        notes: "Notes",
-        transcript: "Transcript",
-    };
-
     // "Open on Summary" is only an option while summaries exist at all; a
     // stored `summary` with the switch off rewrites to notes (same pattern
     // as the diarization↔model effect above).
@@ -135,42 +146,57 @@
 
     // --- Retention -----------------------------------------------------------
 
-    const retentionOptions = [
-        { value: "0", label: "Never" },
-        { value: "7", label: "After 7 days" },
-        { value: "30", label: "After 30 days" },
-        { value: "90", label: "After 90 days" },
+    // Values are day counts (config data); labels come from the catalog by key.
+    const retentionOptions: {
+        value: string;
+        key: keyof typeof copy.settings.meetings.audio.deleteAudio.options;
+    }[] = [
+        { value: "0", key: "never" },
+        { value: "7", key: "d7" },
+        { value: "30", key: "d30" },
+        { value: "90", key: "d90" },
     ];
 
-    let retentionLabel = $derived(
-        retentionOptions.find(
+    let retentionLabel = $derived.by(() => {
+        const found = retentionOptions.find(
             (o) => o.value === String(draft.audio_retention_days),
-        )?.label ?? "Never",
-    );
+        );
+        return found
+            ? t.audio.deleteAudio.options[found.key]
+            : t.audio.deleteAudio.options.never;
+    });
 
-    const meetingRetentionOptions = [
-        { value: "0", label: "Never" },
-        { value: "90", label: "After 90 days" },
-        { value: "365", label: "After 1 year" },
-        { value: "730", label: "After 2 years" },
+    const meetingRetentionOptions: {
+        value: string;
+        key: keyof typeof copy.settings.meetings.audio.deleteMeetings.options;
+    }[] = [
+        { value: "0", key: "never" },
+        { value: "90", key: "d90" },
+        { value: "365", key: "y1" },
+        { value: "730", key: "y2" },
     ];
 
-    let meetingRetentionLabel = $derived(
-        meetingRetentionOptions.find(
+    let meetingRetentionLabel = $derived.by(() => {
+        const found = meetingRetentionOptions.find(
             (o) => o.value === String(draft.meeting_retention_days),
-        )?.label ?? "Never",
-    );
+        );
+        return found
+            ? t.audio.deleteMeetings.options[found.key]
+            : t.audio.deleteMeetings.options.never;
+    });
 </script>
 
 <div class="space-y-6">
-    <SettingsGroup label="Transcription">
+    <SettingsGroup label={t.transcription._group}>
         <TranscriptionBlock
-            providerLabel="Transcribe meetings with"
-            disabledNote="Recording and notes continue; no transcript is written."
+            providerLabel={t.transcription.providerLabel}
+            disabledNote={t.transcription.disabledNote}
             provider={draft.transcription_provider}
             onProviderChange={(v) => (draft.transcription_provider = v)}
             outOfHours={draft.cloud_out_of_hours}
             onOutOfHoursChange={(v) => (draft.cloud_out_of_hours = v)}
+            powerPolicy={draft.transcription_power_policy}
+            onPowerPolicyChange={(v) => (draft.transcription_power_policy = v)}
             language={draft.transcription_language}
             onLanguageChange={(v) => (draft.transcription_language = v)}
             accuracyModel={draft.local_asr_model}
@@ -178,8 +204,8 @@
         />
     </SettingsGroup>
 
-    <SettingsGroup label="Auto-start">
-        <SettingRow title="When a call is detected, auto-start…">
+    <SettingsGroup label={t.autoStart._group}>
+        <SettingRow title={t.autoStart.prompt.label}>
             <Select.Root
                 type="single"
                 value={draft.auto_start_policy}
@@ -187,10 +213,13 @@
                     (draft.auto_start_policy = (v ??
                         "prompt") as AutoStartPolicy)}
             >
-                <Select.Trigger class="w-56">{policy.label}</Select.Trigger>
+                <Select.Trigger class="w-56">{policyLabel}</Select.Trigger>
                 <Select.Content>
-                    {#each policyOptions as o (o.value)}
-                        <Select.Item value={o.value} label={o.label} />
+                    {#each policyOrder as value (value)}
+                        <Select.Item
+                            {value}
+                            label={t.autoStart.prompt.options[value]}
+                        />
                     {/each}
                 </Select.Content>
             </Select.Root>
@@ -198,10 +227,11 @@
 
         {#if draft.auto_start_policy !== "manual"}
             {#if draft.auto_start_policy !== "always"}
-                <SettingRow title="Meeting apps" vertical>
+                <SettingRow title={t.autoStart.apps.label} vertical>
                     <div class="grid max-w-xl grid-cols-4 gap-2">
                         {#each knownApps as app (app.match)}
                             {@const checked = appChecked(app.match)}
+                            {@const appName = t.autoStart.apps.names[app.key]}
                             <button
                                 type="button"
                                 class={cn(
@@ -224,7 +254,7 @@
                                 >
                                     {#if checked}<Check size={10} strokeWidth={3} />{/if}
                                 </span>
-                                {app.label}
+                                {appName}
                             </button>
                         {/each}
                     </div>
@@ -232,8 +262,8 @@
             {/if}
 
             <SettingRow
-                title="Detection delay"
-                description="Active microphone time before recording is triggered"
+                title={t.autoStart.delay.label}
+                description={t.autoStart.delay.sub}
             >
                 <div class="flex items-center gap-2">
                     <Input
@@ -248,36 +278,99 @@
                             ))}
                         class="w-16 text-right"
                     />
-                    <span class="text-xs text-muted-foreground">seconds</span>
+                    <span class="text-xs text-muted-foreground"
+                        >{t.autoStart.delay.unit}</span
+                    >
                 </div>
             </SettingRow>
 
-            <SettingRow
-                title="Stop when the call ends"
-                description="Applies only to auto-started recordings"
-            >
-                <Switch bind:checked={draft.auto_stop_enabled} />
+            <SettingRow title={t.autoStart.autoStop.label}>
+                <Select.Root
+                    type="single"
+                    value={draft.auto_stop}
+                    onValueChange={(v) =>
+                        (draft.auto_stop = (v ?? "auto_started") as AutoStopScope)}
+                >
+                    <Select.Trigger class="w-56">{autoStopLabel}</Select.Trigger>
+                    <Select.Content>
+                        {#each autoStopOrder as value (value)}
+                            <Select.Item
+                                {value}
+                                label={t.autoStart.autoStop.options[value]}
+                            />
+                        {/each}
+                    </Select.Content>
+                </Select.Root>
+            </SettingRow>
+        {/if}
+
+        <!-- The silence check-in guards every recording, whatever the
+             detection policy — it sits outside the policy gate. -->
+        <SettingRow
+            title={t.autoStart.silence.label}
+            description={t.autoStart.silence.sub}
+        >
+            <div class="flex items-center gap-2">
+                <Input
+                    type="number"
+                    min="0"
+                    max="120"
+                    value={String(draft.silence_stop_minutes)}
+                    oninput={(e) =>
+                        (draft.silence_stop_minutes = Math.max(
+                            0,
+                            Number(e.currentTarget.value) || 0,
+                        ))}
+                    class="w-16 text-right"
+                />
+                <span class="text-xs text-muted-foreground"
+                    >{t.autoStart.silence.unit}</span
+                >
+            </div>
+        </SettingRow>
+
+        {#if draft.silence_stop_minutes > 0}
+            <SettingRow title={t.autoStart.silenceUnanswered.label}>
+                <Select.Root
+                    type="single"
+                    value={draft.silence_stop_unanswered}
+                    onValueChange={(v) =>
+                        (draft.silence_stop_unanswered = (v ??
+                            "stop") as SilenceUnanswered)}
+                >
+                    <Select.Trigger class="w-56"
+                        >{silenceUnansweredLabel}</Select.Trigger
+                    >
+                    <Select.Content>
+                        {#each silenceUnansweredOrder as value (value)}
+                            <Select.Item
+                                {value}
+                                label={t.autoStart.silenceUnanswered.options[value]}
+                            />
+                        {/each}
+                    </Select.Content>
+                </Select.Root>
             </SettingRow>
         {/if}
     </SettingsGroup>
 
-    <SettingsGroup label="Toggle recording">
-        <SettingRow title="Hotkey">
+    <SettingsGroup label={t.toggle._group}>
+        <SettingRow title={t.toggle.hotkey.label}>
             <HotkeyCapture
                 value={draft.record_hotkey}
-                ariaLabel="Record hotkey"
+                ariaLabel={t.toggle.hotkey.aria}
                 onChange={(combo) => (draft.record_hotkey = combo)}
             />
         </SettingRow>
     </SettingsGroup>
 
-    <SettingsGroup label="Speakers">
-        <SettingRow title="Detect speakers">
+    <SettingsGroup label={t.speakers._group}>
+        <SettingRow title={t.speakers.detect.label}>
             <Switch bind:checked={draft.diarization_enabled} />
         </SettingRow>
 
         {#if draft.diarization_enabled}
-            <SettingRow title="Speaker separation">
+            <SettingRow title={t.speakers.separation.label}>
                 <Select.Root
                     type="single"
                     value={draft.diarization_sensitivity}
@@ -287,19 +380,28 @@
                             v as DiarizationSensitivity)}
                 >
                     <Select.Trigger class="w-56"
-                        >{sensitivityLabels[
+                        >{t.speakers.separation.options[
                             draft.diarization_sensitivity
                         ]}</Select.Trigger
                     >
                     <Select.Content>
-                        <Select.Item value="low" label="Fewer speakers" />
-                        <Select.Item value="medium" label="Balanced" />
-                        <Select.Item value="high" label="More speakers" />
+                        <Select.Item
+                            value="low"
+                            label={t.speakers.separation.options.low}
+                        />
+                        <Select.Item
+                            value="medium"
+                            label={t.speakers.separation.options.medium}
+                        />
+                        <Select.Item
+                            value="high"
+                            label={t.speakers.separation.options.high}
+                        />
                     </Select.Content>
                 </Select.Root>
             </SettingRow>
 
-            <SettingRow title="Name speakers from your notes">
+            <SettingRow title={t.speakers.naming.label}>
                 <Select.Root
                     type="single"
                     value={draft.notes_naming_mode}
@@ -307,27 +409,36 @@
                         v && (draft.notes_naming_mode = v as NotesNamingMode)}
                 >
                     <Select.Trigger class="w-56"
-                        >{namingLabels[draft.notes_naming_mode]}</Select.Trigger
+                        >{t.speakers.naming.options[
+                            draft.notes_naming_mode
+                        ]}</Select.Trigger
                     >
                     <Select.Content>
-                        <Select.Item value="off" label="Off" />
-                        <Select.Item value="suggest" label="Suggest" />
-                        <Select.Item value="automatic" label="Automatic" />
+                        <Select.Item
+                            value="off"
+                            label={t.speakers.naming.options.off}
+                        />
+                        <Select.Item
+                            value="suggest"
+                            label={t.speakers.naming.options.suggest}
+                        />
+                        <Select.Item
+                            value="automatic"
+                            label={t.speakers.naming.options.automatic}
+                        />
                     </Select.Content>
                 </Select.Root>
             </SettingRow>
         {/if}
     </SettingsGroup>
 
-    <SettingsGroup label="Summaries">
-        <SettingRow title="Summarize meetings">
+    <SettingsGroup label={t.summaries._group}>
+        <SettingRow title={t.summaries.enabled.label}>
             <Switch bind:checked={draft.summaries_enabled} />
         </SettingRow>
 
         {#if draft.summaries_enabled}
-            <SettingRow
-                title="Write summaries with"
-            >
+            <SettingRow title={t.summaries.engine.label}>
                 <Select.Root
                     type="single"
                     value={engineValue}
@@ -343,27 +454,30 @@
                     <Select.Trigger class="w-56">{engineLabel}</Select.Trigger>
                     <Select.Content>
                         {#if CLOUD_ENABLED}
-                            <Select.Item value={CLOUD_PROFILE_ID} label="embral cloud" />
+                            <Select.Item
+                                value={CLOUD_PROFILE_ID}
+                                label={providers.cloud}
+                            />
                         {/if}
                         <Select.Item
                             value={BUILTIN_PROFILE_ID}
-                            label="local model"
+                            label={providers.localModel}
                         />
                     </Select.Content>
                 </Select.Root>
             </SettingRow>
 
             <SettingRow
-                title="Summary prompt"
-                description={customized ? "Customized." : ""}
+                title={t.summaries.prompt.label}
+                description={customized ? t.summaries.prompt.customized : ""}
             >
                 <Button variant="outline" size="sm" onclick={() => (editorOpen = true)}>
-                    <PenLine size={13} class="mr-1" /> Edit prompt…
+                    <PenLine size={13} class="mr-1" /> {t.summaries.prompt.edit}
                 </Button>
             </SettingRow>
         {/if}
 
-        <SettingRow title="Open meetings on">
+        <SettingRow title={t.summaries.openOn.label}>
             <Select.Root
                 type="single"
                 value={draft.open_meeting_tab}
@@ -371,25 +485,36 @@
                     v && (draft.open_meeting_tab = v as OpenMeetingTab)}
             >
                 <Select.Trigger class="w-56"
-                    >{tabLabels[draft.open_meeting_tab]}</Select.Trigger
+                    >{t.summaries.openOn.options[
+                        draft.open_meeting_tab
+                    ]}</Select.Trigger
                 >
                 <Select.Content>
                     {#if draft.summaries_enabled}
-                        <Select.Item value="summary" label="Summary" />
+                        <Select.Item
+                            value="summary"
+                            label={t.summaries.openOn.options.summary}
+                        />
                     {/if}
-                    <Select.Item value="notes" label="Notes" />
-                    <Select.Item value="transcript" label="Transcript" />
+                    <Select.Item
+                        value="notes"
+                        label={t.summaries.openOn.options.notes}
+                    />
+                    <Select.Item
+                        value="transcript"
+                        label={t.summaries.openOn.options.transcript}
+                    />
                 </Select.Content>
             </Select.Root>
         </SettingRow>
     </SettingsGroup>
 
-    <SettingsGroup label="Audio recordings">
-        <SettingRow title="Keep audio files">
+    <SettingsGroup label={t.audio._group}>
+        <SettingRow title={t.audio.keep.label}>
             <Switch bind:checked={draft.retain_audio} />
         </SettingRow>
 
-        <SettingRow title="Delete audio automatically">
+        <SettingRow title={t.audio.deleteAudio.label}>
             <Select.Root
                 type="single"
                 value={String(draft.audio_retention_days)}
@@ -399,13 +524,16 @@
                 <Select.Trigger class="w-56">{retentionLabel}</Select.Trigger>
                 <Select.Content>
                     {#each retentionOptions as o (o.value)}
-                        <Select.Item value={o.value} label={o.label} />
+                        <Select.Item
+                            value={o.value}
+                            label={t.audio.deleteAudio.options[o.key]}
+                        />
                     {/each}
                 </Select.Content>
             </Select.Root>
         </SettingRow>
 
-        <SettingRow title="Delete meetings automatically">
+        <SettingRow title={t.audio.deleteMeetings.label}>
             <Select.Root
                 type="single"
                 value={String(draft.meeting_retention_days)}
@@ -417,7 +545,10 @@
                 >
                 <Select.Content>
                     {#each meetingRetentionOptions as o (o.value)}
-                        <Select.Item value={o.value} label={o.label} />
+                        <Select.Item
+                            value={o.value}
+                            label={t.audio.deleteMeetings.options[o.key]}
+                        />
                     {/each}
                 </Select.Content>
             </Select.Root>
@@ -428,10 +559,9 @@
 <Dialog.Root bind:open={editorOpen}>
     <Dialog.Content class="sm:max-w-3xl">
         <Dialog.Header>
-            <Dialog.Title>Summary prompt</Dialog.Title>
+            <Dialog.Title>{t.promptDialog.title}</Dialog.Title>
             <Dialog.Description>
-                The full prompt sent with every meeting. Edit anything; the
-                required output format is appended automatically.
+                {t.promptDialog.description}
             </Dialog.Description>
         </Dialog.Header>
         <div class="space-y-2">
@@ -445,7 +575,9 @@
                 class="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
                 onclick={() => (showContract = !showContract)}
             >
-                {showContract ? "Hide" : "Show"} the enforced output format
+                {showContract
+                    ? t.promptDialog.hideFormat
+                    : t.promptDialog.showFormat}
             </button>
             {#if showContract}
                 <pre
@@ -460,11 +592,13 @@
                         size="sm"
                         onclick={() => (draft.summary_prompt = "")}
                     >
-                        <RotateCcw size={13} class="mr-1" /> Reset to default
+                        <RotateCcw size={13} class="mr-1" /> {t.promptDialog.reset}
                     </Button>
                 {/if}
             </div>
-            <Button size="sm" onclick={() => (editorOpen = false)}>Done</Button>
+            <Button size="sm" onclick={() => (editorOpen = false)}
+                >{t.promptDialog.done}</Button
+            >
         </Dialog.Footer>
     </Dialog.Content>
 </Dialog.Root>

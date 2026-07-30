@@ -206,21 +206,53 @@ fn split_frontmatter(
 /// Write the meeting's notes into `vault_dir` (created if missing), named by
 /// the user's filename template, with metadata rendered per `format`.
 /// Returns the path written.
+/// Where images land inside the vault. A single directory beside the notes,
+/// sub-foldered by meeting so two meetings' `img-01.png` never collide.
+pub const VAULT_ASSET_DIR: &str = "embral-assets";
+
 pub fn export_to_obsidian(
     vault_dir: &str,
     record: &MeetingRecord,
-    notes_md: &str,
+    summary: &str,
     filename_template: &str,
     format: ExportMetadataFormat,
+    // `storage_base` is the library root, so an `assets/…` link can be
+    // resolved and copied. `None` skips the copying; the links are still
+    // repointed, which is the honest outcome — a broken link the user can
+    // see beats an image that silently isn't there.
+    storage_base: Option<&Path>,
 ) -> Result<PathBuf> {
     let dir = Path::new(vault_dir);
     std::fs::create_dir_all(dir)?;
     let stem = render_filename(filename_template, &record.title, &record.date);
     let path = dir.join(format!("{stem}.md"));
+
+    // Copy the images first, so the note is never written pointing at files
+    // that are not there yet.
+    if let Some(base) = storage_base {
+        for link in crate::assets::image_links(summary) {
+            let Some(tail) = link.strip_prefix("assets/") else {
+                continue;
+            };
+            let from = base.join("assets").join(tail);
+            let to = dir.join(VAULT_ASSET_DIR).join(tail);
+            if !from.is_file() {
+                continue;
+            }
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&from, &to)?;
+        }
+    }
+
+    // One pass over the composed document covers the summary body and the
+    // "## My notes" section alike.
+    let summary = crate::assets::rewrite_asset_links(summary, VAULT_ASSET_DIR);
     let content = match format {
         // Frontmatter passes through — Obsidian reads it as note properties.
-        ExportMetadataFormat::Frontmatter => notes_md.to_string(),
-        ExportMetadataFormat::Inline => to_inline_metadata(notes_md),
+        ExportMetadataFormat::Frontmatter => summary,
+        ExportMetadataFormat::Inline => to_inline_metadata(&summary),
     };
     std::fs::write(&path, content)?;
     Ok(path)
@@ -238,8 +270,6 @@ mod tests {
             date: Utc.with_ymd_and_hms(2026, 3, 26, 14, 30, 0).unwrap(),
             duration_seconds: 3480,
             chunks: 1,
-            notes_path: "notes/x.md".into(),
-            transcript_path: "transcripts/x.md".into(),
             audio_path: "audio/x.mp3".into(),
         }
     }
@@ -304,6 +334,7 @@ mod tests {
             notes,
             "{date} {title}",
             ExportMetadataFormat::Inline,
+            None,
         )
         .unwrap();
         assert!(path.ends_with("2026-03-26 q3-pipeline-review.md"));
@@ -311,6 +342,44 @@ mod tests {
         assert!(written.contains("**Participants:** Sarah"));
         assert!(!written.starts_with("---"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A vault copy has to stand on its own: the image travels with the
+    /// note and the link points at where it landed, not back into the
+    /// library the reader may not have.
+    #[test]
+    fn export_carries_the_images_and_repoints_their_links() {
+        let base = std::env::temp_dir().join(format!("embral-exp-lib-{}", std::process::id()));
+        let vault = std::env::temp_dir().join(format!("embral-exp-vault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&vault);
+        let assets = base.join("assets").join("260326T143000_a3f9b2");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("img-01.png"), b"pretend png").unwrap();
+
+        let doc = "# Q3: Pipeline Review\n\n\
+                   ![the chart](assets/260326T143000_a3f9b2/img-01.png)\n";
+        let path = export_to_obsidian(
+            vault.to_str().unwrap(),
+            &record(),
+            doc,
+            "{title}",
+            ExportMetadataFormat::Frontmatter,
+            Some(&base),
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("![the chart](embral-assets/260326T143000_a3f9b2/img-01.png)"),
+            "{written}"
+        );
+        assert!(vault
+            .join("embral-assets/260326T143000_a3f9b2/img-01.png")
+            .is_file());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&vault);
     }
 
     const FRONTMATTER: &str = "---\nstart_time: 2026-03-26T14:30:00Z\n---\n";

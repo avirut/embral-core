@@ -13,8 +13,13 @@
     import { modelsStore } from "$lib/stores/models.svelte";
     import { CLOUD_ENABLED } from "$lib/cloud";
     import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
+    import { copy } from "$lib/copy";
+    import AccessibilityAccess from "./AccessibilityAccess.svelte";
 
     let { draft }: { draft: AppConfig } = $props();
+
+    const t = $derived(copy.settings.dictation);
+    const providers = $derived(copy.common.providers);
 
     onMount(() => {
         modelsStore.refresh();
@@ -26,20 +31,22 @@
         draft.dictation_asr_model || draft.local_asr_model,
     );
 
-    const cleanupLabels: Record<DictationCleanup, string> = {
-        cloud: "embral cloud",
-        on_device: "local model",
-        off: "no cleanup",
-    };
+    // cloud / on_device share the app-wide provider labels; "off" is this
+    // page's own word.
+    let cleanupLabels: Record<DictationCleanup, string> = $derived({
+        cloud: providers.cloud,
+        on_device: providers.localModel,
+        off: t.output.cleanup.off,
+    });
     let cleanupInfoOpen = $state(false);
 </script>
 
 <div class="space-y-6">
-    <SettingsGroup label="Start dictating">
-        <SettingRow title="Hotkey">
+    <SettingsGroup label={t.start._group}>
+        <SettingRow title={t.start.hotkey.label}>
             <HotkeyCapture
                 value={draft.dictation_hotkey}
-                ariaLabel="Dictation hotkey"
+                ariaLabel={t.start.hotkey.aria}
                 onChange={(combo) => (draft.dictation_hotkey = combo)}
             />
         </SettingRow>
@@ -47,9 +54,9 @@
 
     <!-- Dictation's own transcription tree — independent of the Meetings
          one, because cloud meetings with on-device dictation is legitimate. -->
-    <SettingsGroup label="Transcription">
+    <SettingsGroup label={t.transcription._group}>
         <TranscriptionBlock
-            providerLabel="Dictate with"
+            providerLabel={t.transcription.providerLabel}
             provider={draft.dictation_provider}
             onProviderChange={(v) => (draft.dictation_provider = v)}
             outOfHours={draft.dictation_out_of_hours}
@@ -61,18 +68,19 @@
         />
     </SettingsGroup>
 
-    <SettingsGroup label="Output">
-        <SettingRow title="Copy to clipboard">
+    <SettingsGroup label={t.output._group}>
+        <SettingRow title={t.output.copyClipboard.label}>
             <Switch bind:checked={draft.dictation_copy_clipboard} />
         </SettingRow>
-        <SettingRow title="Auto-paste on completion">
+        <SettingRow title={t.output.autoPaste.label}>
             <Switch bind:checked={draft.dictation_auto_paste} />
         </SettingRow>
-        <SettingRow title="Clean up with AI">
+        <AccessibilityAccess enabled={draft.dictation_auto_paste} />
+        <SettingRow title={t.output.cleanup.label}>
             {#snippet titleExtra()}
                 <button
                     class="text-muted-foreground/60 transition-colors hover:text-foreground"
-                    aria-label="What cleanup does"
+                    aria-label={t.output.cleanup.infoAria}
                     onclick={() => (cleanupInfoOpen = true)}
                 >
                     <Info size={13} />
@@ -94,26 +102,26 @@
                 >
                 <Select.Content>
                     {#if CLOUD_ENABLED}
-                        <Select.Item value="cloud" label="embral cloud" />
+                        <Select.Item value="cloud" label={providers.cloud} />
                     {/if}
-                    <Select.Item value="on_device" label="local model" />
-                    <Select.Item value="off" label="no cleanup" />
+                    <Select.Item value="on_device" label={providers.localModel} />
+                    <Select.Item value="off" label={t.output.cleanup.off} />
                 </Select.Content>
             </Select.Root>
         </SettingRow>
     </SettingsGroup>
 
-    <SettingsGroup label="History">
+    <SettingsGroup label={t.history._group}>
         <SettingRow
-            title="Auto-delete history"
+            title={t.history.autoDelete.label}
             description={draft.dictation_auto_delete
-                ? "Use 0 to ignore a criterion."
+                ? t.history.autoDelete.sub
                 : ""}
         >
             <Switch bind:checked={draft.dictation_auto_delete} />
         </SettingRow>
         {#if draft.dictation_auto_delete}
-            <SettingRow title="Delete after">
+            <SettingRow title={t.history.deleteAfter.label}>
                 <div class="flex items-center gap-2">
                     <Input
                         type="number"
@@ -121,10 +129,12 @@
                         bind:value={draft.dictation_retention_days}
                         class="w-16 text-right"
                     />
-                    <span class="text-xs text-muted-foreground">days</span>
+                    <span class="text-xs text-muted-foreground"
+                        >{t.history.deleteAfter.unit}</span
+                    >
                 </div>
             </SettingRow>
-            <SettingRow title="Keep only the last">
+            <SettingRow title={t.history.keepLast.label}>
                 <div class="flex items-center gap-2">
                     <Input
                         type="number"
@@ -132,7 +142,9 @@
                         bind:value={draft.dictation_retention_count}
                         class="w-16 text-right"
                     />
-                    <span class="text-xs text-muted-foreground">dictations</span>
+                    <span class="text-xs text-muted-foreground"
+                        >{t.history.keepLast.unit}</span
+                    >
                 </div>
             </SettingRow>
         {/if}
@@ -142,39 +154,35 @@
 <Dialog.Root bind:open={cleanupInfoOpen}>
     <Dialog.Content class="sm:max-w-lg">
         <Dialog.Header>
-            <Dialog.Title>What cleanup does</Dialog.Title>
+            <Dialog.Title>{t.cleanupDialog.title}</Dialog.Title>
             <Dialog.Description>
-                Your dictation goes to the model as-is; what comes back is what
-                gets pasted. A failure of any kind delivers the raw
-                transcription instead — cleanup never loses your words.
+                {t.cleanupDialog.description}
             </Dialog.Description>
         </Dialog.Header>
         <div class="space-y-4 text-sm">
             <div>
-                <p class="font-medium">Punctuation and fillers</p>
+                <p class="font-medium">{t.cleanupDialog.fillers.heading}</p>
                 <p class="mt-1 text-xs text-muted-foreground">
-                    "um so i think we should uh move the meeting to thursday"
+                    "{t.cleanupDialog.fillers.input}"
                 </p>
                 <p class="mt-0.5 text-xs">
-                    → I think we should move the meeting to Thursday.
+                    {t.cleanupDialog.fillers.output}
                 </p>
             </div>
             <div>
-                <p class="font-medium">Spoken formatting</p>
+                <p class="font-medium">{t.cleanupDialog.formatting.heading}</p>
                 <p class="mt-1 text-xs text-muted-foreground">
-                    "first item new line second item new paragraph and that's it"
+                    "{t.cleanupDialog.formatting.input}"
                 </p>
-                <p class="mt-0.5 text-xs">
-                    → First item<br />Second item<br /><br />And that's it.
-                </p>
+                <p class="mt-0.5 text-xs whitespace-pre-line">{t.cleanupDialog
+                        .formatting.output}</p>
             </div>
             <div>
-                <p class="font-medium">Instruction mode</p>
+                <p class="font-medium">{t.cleanupDialog.instruction.heading}</p>
                 <p class="mt-1 text-xs text-muted-foreground">
-                    Open with an instruction and it follows it: "make a bulleted
-                    list milk eggs flour"
+                    {t.cleanupDialog.instruction.input}
                 </p>
-                <p class="mt-0.5 text-xs">→ • Milk&ensp;• Eggs&ensp;• Flour</p>
+                <p class="mt-0.5 text-xs">{t.cleanupDialog.instruction.output}</p>
             </div>
         </div>
     </Dialog.Content>

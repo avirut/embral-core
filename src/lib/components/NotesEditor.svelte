@@ -1,12 +1,25 @@
 <script lang="ts">
   import MarkdownEditor from './MarkdownEditor.svelte';
+  import { copy } from '$lib/copy';
+
+  const t = $derived(copy.meetings.notes);
 
   let {
     value = $bindable(''),
-    onStarClick
-  }: { value?: string; onStarClick?: (id: number) => void } = $props();
+    onStarClick,
+    onPasteError
+  }: {
+    value?: string;
+    onStarClick?: (id: number) => void;
+    onPasteError?: (message: string) => void;
+  } = $props();
 
   let editorRef = $state<MarkdownEditor | null>(null);
+
+  /** Present, so paste is enabled; `undefined`, because the recording in
+   * flight owns the meeting id and the backend reads it from the recovery
+   * scratch. There is no id here to give. */
+  const liveRecording = () => undefined;
 
   /** Anchor a gutter star at the caret's line. */
   export function addStar(id: number) {
@@ -34,5 +47,7 @@
   bind:value
   autofocus
   {onStarClick}
-  placeholder="Take notes — they'll be woven into the summary."
+  {onPasteError}
+  placeholder={t.placeholder}
+  pasteMeetingId={liveRecording}
 />

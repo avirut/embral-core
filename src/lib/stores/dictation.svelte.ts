@@ -1,3 +1,4 @@
+import { errorMessage } from '$lib/copy/errors';
 import { invoke } from '@tauri-apps/api/core';
 import type { DictationRow } from '$lib/types';
 
@@ -8,10 +9,26 @@ function isTauri() {
 let _history = $state<DictationRow[]>([]);
 let _active = $state(false);
 let _error = $state<string | null>(null);
+/** Which entry a search result asked the history to land on, waiting for
+ * the view to render it. */
+let _pendingLanding = $state<number | null>(null);
 
 export const dictationStore = {
   get history() {
     return _history;
+  },
+  get pendingLanding() {
+    return _pendingLanding;
+  },
+  /** Set by the palette; the history view takes it once. Landing again on a
+   * later, ordinary visit to the page would be a highlight out of nowhere. */
+  landOn(id: number) {
+    _pendingLanding = id;
+  },
+  takeLanding(): number | null {
+    const id = _pendingLanding;
+    _pendingLanding = null;
+    return id;
   },
   get active() {
     return _active;
@@ -25,7 +42,7 @@ export const dictationStore = {
     try {
       _history = await invoke<DictationRow[]>('list_dictations', { limit: 100 });
     } catch (e) {
-      _error = String(e);
+      _error = errorMessage(e);
     }
   },
 
@@ -35,7 +52,7 @@ export const dictationStore = {
     try {
       await invoke('start_dictation');
     } catch (e) {
-      _error = String(e);
+      _error = errorMessage(e);
     }
   },
 
@@ -46,7 +63,7 @@ export const dictationStore = {
       await invoke('stop_dictation');
       await this.refresh();
     } catch (e) {
-      _error = String(e);
+      _error = errorMessage(e);
     }
   },
 
@@ -56,7 +73,7 @@ export const dictationStore = {
       await invoke('delete_dictation', { id });
       _history = _history.filter((d) => d.id !== id);
     } catch (e) {
-      _error = String(e);
+      _error = errorMessage(e);
     }
   },
 

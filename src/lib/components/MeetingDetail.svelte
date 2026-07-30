@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { ChevronLeft, Trash2 } from 'lucide-svelte';
   import { meetingsStore, PENDING_MEETING_ID } from '$lib/stores/meetings.svelte';
   import { appState } from '$lib/stores/app-state.svelte';
@@ -8,12 +8,16 @@
   import AudioPlayer from './AudioPlayer.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import Tip from './Tip.svelte';
-  import MarkdownEditor from './MarkdownEditor.svelte';
   import PendingMeetingDetail from './PendingMeetingDetail.svelte';
   import TranscriptSegments from './TranscriptSegments.svelte';
-  import UserNotesView from './UserNotesView.svelte';
-  import type { MeetingStar } from '$lib/types';
+  import EditorView from './EditorView.svelte';
+  import type { ChunkSource, MeetingStar, PassageLanding } from '$lib/types';
+  import { findMatchIndex } from '$lib/editor/locate';
   import { formatDuration, formatMeetingDate } from '$lib/utils/meetingFormat';
+  import { copy } from '$lib/copy';
+
+  const t = $derived(copy.meetings.detail);
+  const deleteConfirm = $derived(copy.meetings.deleteConfirm);
 
   type DetailTab = 'summary' | 'notes' | 'transcript';
   type SaveState = 'idle' | 'saving' | 'saved' | 'error';
@@ -25,9 +29,10 @@
 
   let activeTab = $state<DetailTab>('summary');
   let titleDraft = $state('');
+  let summaryDraft = $state('');
   let notesDraft = $state('');
   let transcriptDraft = $state('');
-  let notesFrontmatter = $state('');
+  let summaryFrontmatter = $state('');
   let transcriptFrontmatter = $state('');
   let loadedDraftId = $state<string | null>(null);
   let saveState = $state<SaveState>('idle');
@@ -39,22 +44,58 @@
   // tab's current-segment highlight and auto-follow.
   let playbackTime = $state(0);
   let playbackActive = $state(false);
-  let userNotesRef = $state<UserNotesView | null>(null);
+  let notesViewRef = $state<EditorView | null>(null);
+  let summaryViewRef = $state<EditorView | null>(null);
+  let transcriptViewRef = $state<EditorView | null>(null);
   let transcriptRef = $state<TranscriptSegments | null>(null);
+  /** Where a search result asked us to land, held until the tab it names has
+   * actually mounted — the `{#key}` blocks below remount per meeting, so the
+   * view refs are null for a beat after the detail arrives. */
+  let landing = $state<PassageLanding | null>(null);
+  let landingAttempts = $state(0);
+  /** Mount, then the draft arriving, is two. The rest is slack for a tab
+   * whose content settles in stages; past this the text is genuinely not
+   * there and the user stays where they are. */
+  const MAX_LANDING_ATTEMPTS = 6;
+
+  /** Which tab holds a passage. Image text has no document of its own: it
+   * was read out of a picture, and the picture is in the notes. */
+  function tabForSource(source: ChunkSource): DetailTab {
+    if (source === 'summary') return 'summary';
+    if (source === 'transcript') return 'transcript';
+    return 'notes';
+  }
 
   /** A star tick/chip on the player was clicked: the player already
    * seeked; scroll the active tab to that star's place. */
   function onStarActivate(star: MeetingStar, index: number) {
     if (activeTab === 'notes' && star.note_block !== null) {
-      userNotesRef?.scrollToStar(index);
+      notesViewRef?.scrollToStar(index);
     } else if (activeTab === 'transcript') {
       transcriptRef?.followPlayhead();
     }
   }
 
-  let titleTimer: ReturnType<typeof setTimeout> | null = null;
-  let notesTimer: ReturnType<typeof setTimeout> | null = null;
-  let transcriptTimer: ReturnType<typeof setTimeout> | null = null;
+  // A debounced save is a promise to write, so it is never *dropped* — it
+  // is either fired by its timer or flushed early. Keeping the work itself
+  // (not just the timer) is what makes flushing possible: switching
+  // meetings used to clear the timers, so typing and clicking away inside
+  // the debounce window silently lost the edit. Each closure captured its
+  // own meeting id, so a flush after the selection moved still writes to
+  // the meeting the text belongs to.
+  type SaveKey = 'title' | 'summary' | 'notes' | 'transcript';
+  const timers: Record<SaveKey, ReturnType<typeof setTimeout> | null> = {
+    title: null,
+    summary: null,
+    notes: null,
+    transcript: null
+  };
+  const pending: Record<SaveKey, (() => Promise<unknown>) | null> = {
+    title: null,
+    summary: null,
+    notes: null,
+    transcript: null
+  };
   let saveRevision = 0;
 
   const detail = $derived(meetingsStore.selectedDetail);
@@ -69,23 +110,23 @@
    *
    * Keyed off the *saved* meeting, not the draft: from the draft, the tab would
    * vanish out from under a user who selected all and hit delete. */
-  const hasSummary = $derived((detail?.notes_markdown ?? '').trim().length > 0);
+  const hasSummary = $derived((detail?.summary ?? '').trim().length > 0);
   const tabs = $derived(
     (hasSummary
       ? [
-          ['summary', 'Summary'],
-          ['notes', 'Notes'],
-          ['transcript', 'Transcript']
+          ['summary', t.tabs.summary],
+          ['notes', t.tabs.notes],
+          ['transcript', t.tabs.transcript]
         ]
       : [
-          ['notes', 'Notes'],
-          ['transcript', 'Transcript']
+          ['notes', t.tabs.notes],
+          ['transcript', t.tabs.transcript]
         ]) as [DetailTab, string][]
   );
   const statusText = $derived.by(() => {
-    if (saveState === 'saving') return 'Saving...';
-    if (saveState === 'saved') return 'Saved';
-    if (saveState === 'error') return saveError ?? "Couldn't save";
+    if (saveState === 'saving') return t.status.saving;
+    if (saveState === 'saved') return t.status.saved;
+    if (saveState === 'error') return saveError ?? t.status.failed;
     return '';
   });
   // Read-only: speakers are edited through the transcript pills, and this
@@ -143,36 +184,180 @@
     const selectedId = meetingsStore.selectedId;
     const selectedDetail = detail;
     if (!selectedId) {
-      clearSaveTimers();
+      void flushSaves();
       loadedDraftId = null;
       titleDraft = '';
+      summaryDraft = '';
       notesDraft = '';
       transcriptDraft = '';
-      notesFrontmatter = '';
+      summaryFrontmatter = '';
       transcriptFrontmatter = '';
       return;
     }
     if (selectedDetail && loadedDraftId !== selectedId) {
-      clearSaveTimers();
-      const notesParts = splitEditableMarkdown(selectedDetail.notes_markdown);
-      const transcriptParts = splitEditableMarkdown(selectedDetail.transcript_markdown);
+      // The outgoing meeting's pending edits go to disk before this pane
+      // starts showing a different meeting's text.
+      void flushSaves();
+      const notesParts = splitEditableMarkdown(selectedDetail.summary);
+      const transcriptParts = splitEditableMarkdown(selectedDetail.transcript);
       loadedDraftId = selectedId;
       titleDraft = selectedDetail.record.title;
-      notesDraft = notesParts.body;
+      summaryDraft = notesParts.body;
+      // The Notes tab needs a draft of its own for the same reason the
+      // Summary tab does: it used to render `detail.notes` straight, and
+      // the fresh detail returned by a save would push text back into the
+      // live editor — wiping the star attributes and jumping the caret.
+      notesDraft = selectedDetail.notes;
       transcriptDraft = transcriptParts.body;
-      notesFrontmatter = notesParts.frontmatter;
+      summaryFrontmatter = notesParts.frontmatter;
       transcriptFrontmatter = transcriptParts.frontmatter;
       saveState = 'idle';
       saveError = null;
       confirmDelete = false;
       // The config names one of the detail's three tabs directly; a meeting
       // with no summary has no Summary tab to open on, so that one degrades
-      // to Notes.
+      // to Notes. A search result overrides this — see below.
       const preferred: DetailTab = configStore.config?.open_meeting_tab ?? 'summary';
       activeTab =
         preferred === 'summary' && !notesParts.body.trim() ? 'notes' : preferred;
     }
   });
+
+  /** A search result names the tab its passage lives in, and beats the
+   * config default: the user asked for that sentence, not for their usual
+   * landing page.
+   *
+   * Deliberately its own effect rather than part of the block above, which
+   * only runs when the *meeting* changes — searching for a passage in the
+   * meeting already on screen is an ordinary thing to do, and it used to do
+   * nothing at all. Waiting on `loadedDraftId` keeps the order fixed: the
+   * drafts are in place, so this is never overwritten by the config default
+   * a moment later. */
+  $effect(() => {
+    const pending = meetingsStore.pendingLanding;
+    if (!pending || loadedDraftId !== meetingsStore.selectedId) return;
+    meetingsStore.takeLanding();
+    landing = pending;
+    landingAttempts = 0;
+    const wanted = tabForSource(pending.source);
+    activeTab = wanted === 'summary' && !hasSummary ? 'notes' : wanted;
+  });
+
+  /** Land on the passage a search result matched, once the tab holding it
+   * has a document to scroll.
+   *
+   * Two separate waits, and missing the second one is what made this look
+   * broken from a *different* meeting while working on the one already
+   * open. The `{#key}` blocks remount per meeting, so first the view ref
+   * has to exist — and then the document inside it, which arrives with the
+   * draft, a beat later still. Landing at the first of those searched an
+   * editor still holding the previous meeting's text, found nothing, and
+   * cleared the landing anyway, so nothing retried.
+   *
+   * So: keep the landing until an attempt succeeds, re-run when a draft
+   * changes, and do the work after `tick()` — this effect runs before the
+   * editor's own, parent before child, so without the wait it would read
+   * the document one update too early.
+   *
+   * A passage that cannot be found once the document is there leaves the
+   * user on the right tab with nothing marked, which is honest — the text
+   * may have been edited away since it was indexed. */
+  $effect(() => {
+    const target = landing;
+    if (!target) return;
+    // Named so the effect re-runs when what it needs finally appears: the
+    // view ref, and the draft whose arrival is what fills the document.
+    const waitingOn = {
+      notesViewRef,
+      summaryViewRef,
+      transcriptViewRef,
+      transcriptRef,
+      summaryDraft,
+      notesDraft,
+      transcriptDraft
+    };
+    void waitingOn;
+    // After the DOM settles: the editor applies a new draft in its own
+    // effect, and this one runs first (parent before child). Without the
+    // wait we search a document that has not been filled in yet.
+    void tick().then(() => attemptLanding(target));
+  });
+
+  function attemptLanding(target: PassageLanding) {
+    // A newer search has already replaced this one.
+    if (landing !== target) return;
+    landingAttempts += 1;
+    const givingUp = landingAttempts >= MAX_LANDING_ATTEMPTS;
+
+    if (target.source === 'transcript') {
+      const segments = detail?.segments ?? [];
+      if (transcriptRef && segments.length > 0) {
+        // The line the user searched for, not the passage it sits in: a
+        // passage is packed paragraphs, so its start is routinely minutes
+        // early. The search is bounded to the passage, because a common
+        // word ("north") occurs all over a long transcript and only the
+        // occurrence the result showed is the right one. `start_secs`
+        // stands in for a semantic hit, where the words are nowhere.
+        const within = segments
+          .map((segment, index) => ({ segment, index }))
+          .filter(
+            ({ segment }) =>
+              target.start_secs === null ||
+              target.end_secs === null ||
+              (segment.start >= target.start_secs - 0.01 &&
+                segment.start <= target.end_secs + 0.01)
+          );
+        const pool = within.length > 0 ? within : segments.map((segment, index) => ({ segment, index }));
+        const found = findMatchIndex(pool.map(({ segment }) => segment.text), target.query);
+        const match = found !== null ? pool[found] : null;
+        const seconds = match ? match.segment.start : target.start_secs;
+        if (seconds !== null) {
+          landing = null;
+          // A little way *into* the line, not at its edge: a media element
+          // snaps a seek to the nearest frame it can decode, and landing
+          // even milliseconds short leaves the highlight on the line
+          // before. A quarter-second is inaudible inside a spoken line and
+          // comfortably past that.
+          const inside = seconds + 0.25;
+          void player?.seekTo(inside);
+          // Drives the current-segment highlight even with no audio to
+          // play: `activeIndex` derives from this, and a meeting recorded
+          // with `retain_audio` off has no player at all.
+          playbackTime = inside;
+          if (match) {
+            void tick().then(() => transcriptRef?.revealIndex(match.index));
+          } else {
+            void tick().then(() => transcriptRef?.followPlayhead());
+          }
+          return;
+        }
+      } else if (transcriptViewRef?.isReady()) {
+        // A legacy import: no segments, so the transcript is a document.
+        if (transcriptViewRef.scrollToPassage(target.query, target.lead)) {
+          landing = null;
+          return;
+        }
+      }
+      if (givingUp) landing = null;
+      return;
+    }
+
+    const view = target.source === 'summary' ? summaryViewRef : notesViewRef;
+    const landed =
+      view?.isReady() &&
+      (target.source === 'image_text'
+        ? // The matched text is inside the picture, so there is nothing in
+          // the document to search for — the image itself is the target.
+          view.scrollToImage(target.image ?? '')
+        : view.scrollToPassage(target.query, target.lead));
+
+    // A failed attempt is usually "the document is not here yet", not "the
+    // text is gone": the editor mounts holding the previous meeting's draft
+    // and is refilled a beat later, which re-runs the effect above. The
+    // bound is what stops a landing nobody can satisfy from firing much
+    // later, on an unrelated edit, and scrolling out of nowhere.
+    if (landed || givingUp) landing = null;
+  }
 
   /** Space toggles playback, ←/→ skip ±10s — unless focus is in an editor
    * or other input, which owns its keys. */
@@ -199,18 +384,38 @@
     }
   }
 
-  function clearTimer(timer: ReturnType<typeof setTimeout> | null) {
+  function schedule(key: SaveKey, delayMs: number, run: () => Promise<unknown>) {
+    const timer = timers[key];
     if (timer) clearTimeout(timer);
+    pending[key] = run;
+    timers[key] = setTimeout(() => void runPending(key), delayMs);
   }
 
-  function clearSaveTimers() {
-    clearTimer(titleTimer);
-    clearTimer(notesTimer);
-    clearTimer(transcriptTimer);
-    titleTimer = null;
-    notesTimer = null;
-    transcriptTimer = null;
-    saveRevision++;
+  async function runPending(key: SaveKey) {
+    const run = pending[key];
+    const timer = timers[key];
+    if (timer) clearTimeout(timer);
+    timers[key] = null;
+    pending[key] = null;
+    if (!run) return;
+    const revision = ++saveRevision;
+    markSaving();
+    try {
+      await run();
+      markSaved(revision);
+    } catch (e) {
+      markError(e, revision);
+    }
+  }
+
+  /** Write anything still sitting in a debounce, now. Called before the
+   * selection moves, when the tab changes, when the pane goes away, and
+   * when the window is hidden — every point where the user is done with
+   * this text even though the timer hasn't fired. */
+  function flushSaves(): Promise<unknown> {
+    return Promise.all(
+      (['title', 'summary', 'notes', 'transcript'] as SaveKey[]).map(runPending)
+    );
   }
 
   function markSaving() {
@@ -233,71 +438,52 @@
   }
 
   function scheduleTitleSave() {
-    clearTimer(titleTimer);
     const id = meetingsStore.selectedId;
     const title = titleDraft.trim();
     if (!id) return;
     if (!title) {
       saveState = 'error';
-      saveError = 'Title required';
+      saveError = t.titleRequired;
       return;
     }
-    titleTimer = setTimeout(async () => {
-      const revision = ++saveRevision;
-      markSaving();
-      try {
-        await meetingsStore.updateTitle(id, title);
-        markSaved(revision);
-      } catch (e) {
-        markError(e, revision);
-      }
-    }, 500);
+    schedule('title', 500, () => meetingsStore.updateTitle(id, title));
+  }
+
+  function scheduleSummarySave(value: string) {
+    summaryDraft = value;
+    const id = meetingsStore.selectedId;
+    if (!id) return;
+    const markdown = joinEditableMarkdown(summaryFrontmatter, titleDraft, value);
+    schedule('summary', 900, () => meetingsStore.updateSummary(id, markdown));
   }
 
   function scheduleNotesSave(value: string) {
     notesDraft = value;
-    clearTimer(notesTimer);
     const id = meetingsStore.selectedId;
     if (!id) return;
-    notesTimer = setTimeout(async () => {
-      const revision = ++saveRevision;
-      markSaving();
-      try {
-        await meetingsStore.updateNotes(
-          id,
-          joinEditableMarkdown(notesFrontmatter, titleDraft, value)
-        );
-        markSaved(revision);
-      } catch (e) {
-        markError(e, revision);
-      }
-    }, 900);
+    // Read the star ordinals at save time, not at edit time: the editor is
+    // the source of truth for where they sit now.
+    schedule('notes', 900, () =>
+      meetingsStore.updateNotes(id, value, notesViewRef?.currentStars() ?? [])
+    );
   }
 
   function scheduleTranscriptSave(value: string) {
     transcriptDraft = value;
-    clearTimer(transcriptTimer);
     const id = meetingsStore.selectedId;
     if (!id) return;
-    transcriptTimer = setTimeout(async () => {
-      const revision = ++saveRevision;
-      markSaving();
-      try {
-        await meetingsStore.updateTranscript(
-          id,
-          joinEditableMarkdown(transcriptFrontmatter, `${titleDraft} Transcript`, value)
-        );
-        markSaved(revision);
-      } catch (e) {
-        markError(e, revision);
-      }
-    }, 900);
+    const markdown = joinEditableMarkdown(
+      transcriptFrontmatter,
+      t.transcriptHeading(titleDraft),
+      value
+    );
+    schedule('transcript', 900, () => meetingsStore.updateTranscript(id, markdown));
   }
 
   /// Segment edits regenerate the transcript document (and can rename
   /// attendees) backend-side — pull those fields back into the drafts.
   function syncFromDetail(updated: MeetingDetail) {
-    const transcriptParts = splitEditableMarkdown(updated.transcript_markdown);
+    const transcriptParts = splitEditableMarkdown(updated.transcript);
     transcriptDraft = transcriptParts.body;
     transcriptFrontmatter = transcriptParts.frontmatter;
   }
@@ -315,8 +501,23 @@
     }
   }
 
+  // The pane going away, the window being hidden, or the app quitting are
+  // all "the user is done with this text" — write it rather than let the
+  // debounce die with the listener. `visibilitychange` fires with time to
+  // spare, unlike `beforeunload`, where an async save would not finish.
+  function flushOnHide() {
+    if (document.visibilityState === 'hidden') void flushSaves();
+  }
+
+  onMount(() => {
+    document.addEventListener('visibilitychange', flushOnHide);
+    window.addEventListener('blur', flushSaves);
+  });
+
   onDestroy(() => {
-    clearSaveTimers();
+    document.removeEventListener('visibilitychange', flushOnHide);
+    window.removeEventListener('blur', flushSaves);
+    void flushSaves();
   });
 </script>
 
@@ -325,18 +526,18 @@
     <PendingMeetingDetail pending={appState.pendingMeeting} />
   {:else if !meetingsStore.selectedRecord}
     <div class="flex flex-1 items-center justify-center p-6 text-center">
-      <p class="text-sm text-muted-foreground">Select a meeting to view its notes.</p>
+      <p class="text-sm text-muted-foreground">{t.selectPrompt}</p>
     </div>
   {:else}
     <div class="px-3 py-3 border-b border-border shrink-0">
       {#if showBack}
         <button
           onclick={onBack}
-          aria-label="Back to meetings"
+          aria-label={t.backAria}
           class="mb-2 inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors min-[960px]:hidden"
         >
           <ChevronLeft size={14} />
-          Meetings
+          {t.back}
         </button>
       {/if}
 
@@ -348,15 +549,15 @@
           oninput={scheduleTitleSave}
           class="font-display min-w-0 flex-1 bg-transparent px-0 py-0.5 text-lg leading-snug outline-none
             placeholder:text-muted-foreground/70"
-          aria-label="Meeting title"
+          aria-label={t.titleAria}
         />
-        <Tip text="Delete meeting">
+        <Tip text={t.deleteMeeting}>
           {#snippet children({ props })}
             <button
               {...props}
               onclick={() => (confirmDelete = true)}
               class="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors shrink-0"
-              aria-label="Delete meeting"
+              aria-label={t.deleteMeeting}
             >
               <Trash2 size={15} />
             </button>
@@ -388,7 +589,12 @@
     <div class="flex shrink-0 items-center gap-5 border-b border-border px-4">
       {#each tabs as [key, label] (key)}
         <button
-          onclick={() => (activeTab = key as DetailTab)}
+          onclick={() => {
+            // Leaving a document is finishing with it: don't make the edit
+            // wait out its debounce in a tab nobody is looking at.
+            void flushSaves();
+            activeTab = key as DetailTab;
+          }}
           class="-mb-px border-b-2 px-0.5 py-2 text-sm font-medium transition-colors
             {activeTab === key
             ? 'border-foreground text-foreground'
@@ -401,27 +607,40 @@
 
     <div class="flex min-h-0 flex-1 flex-col">
       {#if isLoading}
-        <p class="p-3 text-sm text-muted-foreground">Loading meeting...</p>
+        <p class="p-3 text-sm text-muted-foreground">{t.loading}</p>
       {:else if meetingsStore.error}
         <p class="p-3 text-sm text-destructive">{meetingsStore.error}</p>
       {:else if detail}
         {#if activeTab === 'summary'}
           {#key `${detail.record.id}:summary`}
-            <MarkdownEditor
-              bind:value={notesDraft}
-              placeholder="No summary saved yet."
-              onChange={scheduleNotesSave}
+            <EditorView
+              bind:this={summaryViewRef}
+              value={summaryDraft}
+              placeholder={t.summaryPlaceholder}
+              onChange={scheduleSummarySave}
+              pasteMeetingId={() => detail.record.id}
+              onPasteError={(message) => {
+                saveState = 'error';
+                saveError = message;
+              }}
             />
           {/key}
         {:else if activeTab === 'notes'}
           {#key `${detail.record.id}:usernotes`}
-            <UserNotesView
-              bind:this={userNotesRef}
-              notes={detail.user_notes}
+            <EditorView
+              bind:this={notesViewRef}
+              value={notesDraft}
+              onChange={scheduleNotesSave}
+              placeholder={copy.meetings.notes.placeholder}
               stars={detail.stars}
               onStarClick={detail.audio_exists
                 ? (star) => player?.seekTo(star.seconds)
                 : undefined}
+              pasteMeetingId={() => detail.record.id}
+              onPasteError={(message) => {
+                saveState = 'error';
+                saveError = message;
+              }}
             />
           {/key}
         {:else if detail.segments.length > 0}
@@ -439,9 +658,10 @@
           </div>
         {:else}
           {#key `${detail.record.id}:transcript`}
-            <MarkdownEditor
-              bind:value={transcriptDraft}
-              placeholder="No transcript saved yet."
+            <EditorView
+              bind:this={transcriptViewRef}
+              value={transcriptDraft}
+              placeholder={t.transcriptPlaceholder}
               onChange={scheduleTranscriptSave}
             />
           {/key}
@@ -466,8 +686,8 @@
 
 <ConfirmDialog
   bind:open={confirmDelete}
-  title="Delete meeting?"
-  body="Deleting this meeting will permanently delete its notes, transcript, and audio."
+  title={deleteConfirm.title(1)}
+  body={deleteConfirm.body(1)}
   busy={isDeleting}
   onConfirm={deleteSelectedMeeting}
 />

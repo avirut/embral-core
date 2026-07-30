@@ -1,3 +1,4 @@
+import { errorMessage } from '$lib/copy/errors';
 import { invoke } from "@tauri-apps/api/core";
 import type { ModelProgress, ModelStatus } from "$lib/types";
 
@@ -55,7 +56,7 @@ export const modelsStore = {
       // module scope, so it survives the SettingsForm unmounting.
       await invoke("download_asr_model", { modelId: id });
     } catch (e) {
-      _errors[id] = String(e);
+      _errors[id] = errorMessage(e);
     } finally {
       delete _downloading[id];
       await this.refresh();
@@ -68,7 +69,7 @@ export const modelsStore = {
     try {
       await invoke("delete_asr_model", { modelId: id });
     } catch (e) {
-      _errors[id] = String(e);
+      _errors[id] = errorMessage(e);
     }
     await this.refresh();
   },

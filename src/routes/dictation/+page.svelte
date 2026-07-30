@@ -3,6 +3,9 @@
     import { listen, type UnlistenFn } from "@tauri-apps/api/event";
     import { configStore } from "$lib/stores/config.svelte";
     import { themeStore } from "$lib/stores/theme.svelte";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.dictation.overlay);
 
     // The dictation overlay window: never focused, always on top, shown by
     // the backend while a session runs. A mic spectrum + status row over the
@@ -101,7 +104,7 @@
             {/each}
         </div>
         <span class="shrink-0 text-xs font-medium text-muted-foreground">
-            {phase === "listening" ? "Listening" : "Finishing up…"}
+            {phase === "listening" ? t.listening : t.finishing}
         </span>
     </div>
 

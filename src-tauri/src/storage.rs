@@ -1,14 +1,16 @@
 //! Storage roots, the database handle, and generated exports.
 //!
 //! Since R1 the SQLite database (`{storage_dir}/embral.db`) is the source of
-//! truth. `index.json` and the markdown files under `notes/` / `transcripts/`
-//! are *exports* regenerated from the DB after every mutation, so the MCP
-//! servers and any user tooling that reads files keep working unchanged.
+//! truth. `index.json` is an *export* regenerated from it after every
+//! mutation. The summary and transcript documents used to be exported as
+//! markdown files too; since v11 they are columns only, and putting a
+//! meeting on disk in readable form is the markdown export's job
+//! ([integrations.md](../../docs/integrations.md)).
 
 use anyhow::Result;
 use chrono::Utc;
 use embral_db::{Db, MeetingRow};
-use embral_types::{resolve_storage_path, MeetingRecord};
+use embral_types::resolve_storage_path;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -18,9 +20,30 @@ pub fn storage_base(storage_dir: &str) -> PathBuf {
 
 pub fn init_storage_dirs(base: &Path) -> Result<()> {
     std::fs::create_dir_all(base.join("audio"))?;
-    std::fs::create_dir_all(base.join("transcripts"))?;
-    std::fs::create_dir_all(base.join("notes"))?;
+    // Images pasted into a meeting's documents, one directory per meeting
+    // (`embral_notes::assets`).
+    std::fs::create_dir_all(base.join("assets"))?;
     Ok(())
+}
+
+/// Let the webview load files out of the storage dir over `asset:`.
+///
+/// The static scope in `tauri.conf.json` allows `$HOME`, `$DOCUMENT` and
+/// `$AUDIO`, but the storage dir is a free-form directory picker
+/// (Settings → General), so anywhere else — a second drive, most obviously —
+/// was outside it and every `convertFileSrc` URL 403'd. That is why audio
+/// playback silently died for a library on `D:\`. Called at startup and again
+/// whenever `storage_dir` changes; the scope is additive, so a moved library
+/// leaves the old directory allowed until the next launch, which is
+/// harmless — it is a read permission on the user's own former library.
+pub fn allow_asset_access(app: &tauri::AppHandle, base: &Path) {
+    use tauri::Manager;
+    if let Err(e) = app.asset_protocol_scope().allow_directory(base, true) {
+        tracing::warn!(
+            "could not allow asset access to {}: {e} — audio and images may not load",
+            base.display()
+        );
+    }
 }
 
 pub fn generate_meeting_id() -> String {
@@ -45,8 +68,25 @@ pub fn open_db(base: &Path) -> Result<Db> {
     Ok(db)
 }
 
+/// One entry of a pre-R1 `index.json`, which is the only place the markdown
+/// file paths still exist — the current export dropped them with v11, and
+/// this shape is what makes the one-time migration able to find the files.
+#[derive(serde::Deserialize)]
+struct LegacyRecord {
+    id: String,
+    title: String,
+    date: chrono::DateTime<Utc>,
+    duration_seconds: u64,
+    #[serde(default)]
+    audio_path: String,
+    #[serde(default)]
+    notes_path: String,
+    #[serde(default, alias = "raw_path")]
+    transcript_path: String,
+}
+
 /// Pre-R1 index reader, kept for the one-time migration.
-fn read_legacy_index(base: &Path) -> Result<Vec<MeetingRecord>> {
+fn read_legacy_index(base: &Path) -> Result<Vec<LegacyRecord>> {
     let path = base.join("index.json");
     if !path.exists() {
         return Ok(Vec::new());
@@ -57,7 +97,7 @@ fn read_legacy_index(base: &Path) -> Result<Vec<MeetingRecord>> {
 
 /// Build DB rows from a legacy index + its markdown files. Legacy meetings
 /// have no structured segments; their transcript text still lands in
-/// `transcript_md`, which the FTS index covers.
+/// `transcript`, which the FTS index covers.
 fn import_legacy_index(db: &Db, base: &Path) -> Result<usize> {
     let records = read_legacy_index(base)?;
     if records.is_empty() {
@@ -72,12 +112,12 @@ fn import_legacy_index(db: &Db, base: &Path) -> Result<usize> {
     let rows: Vec<MeetingRow> = records
         .iter()
         .map(|r| {
-            let notes_md = read_md(&r.notes_path);
-            let transcript_md = read_md(&r.transcript_path);
+            let summary = read_md(&r.notes_path);
+            let transcript = read_md(&r.transcript_path);
             let attendees = {
-                let from_notes = crate::commands::parse_attendees(&notes_md);
+                let from_notes = crate::commands::parse_attendees(&summary);
                 if from_notes.is_empty() {
-                    crate::commands::parse_attendees(&transcript_md)
+                    crate::commands::parse_attendees(&transcript)
                 } else {
                     from_notes
                 }
@@ -87,12 +127,10 @@ fn import_legacy_index(db: &Db, base: &Path) -> Result<usize> {
                 title: r.title.clone(),
                 started_at: r.date,
                 duration_seconds: r.duration_seconds,
-                notes_md,
-                transcript_md,
+                summary,
+                transcript,
                 attendees,
                 audio_path: r.audio_path.clone(),
-                notes_path: r.notes_path.clone(),
-                transcript_path: r.transcript_path.clone(),
             }
         })
         .collect();
@@ -133,9 +171,9 @@ pub fn prune_old_audio(db: &Db, base: &Path, days: u32) -> Result<usize> {
     Ok(pruned)
 }
 
-/// Delete whole meetings older than `days` (0 = disabled): notes,
-/// transcript, audio, and the database row (segments cascade). Returns how
-/// many meetings were removed.
+/// Delete whole meetings older than `days` (0 = disabled): the audio file
+/// and the database row, which carries both documents (segments cascade).
+/// Returns how many meetings were removed.
 pub fn prune_old_meetings(db: &Db, base: &Path, days: u32) -> Result<usize> {
     if days == 0 {
         return Ok(0);
@@ -146,11 +184,8 @@ pub fn prune_old_meetings(db: &Db, base: &Path, days: u32) -> Result<usize> {
         if row.started_at >= cutoff {
             continue;
         }
-        for indexed in [&row.notes_path, &row.transcript_path, &row.audio_path] {
-            if indexed.trim().is_empty() {
-                continue;
-            }
-            match crate::commands::resolve_indexed_path(base, indexed) {
+        if !row.audio_path.trim().is_empty() {
+            match crate::commands::resolve_indexed_path(base, &row.audio_path) {
                 Ok(path) => {
                     if path.is_file() {
                         if let Err(e) = std::fs::remove_file(&path) {
@@ -161,11 +196,49 @@ pub fn prune_old_meetings(db: &Db, base: &Path, days: u32) -> Result<usize> {
                 Err(e) => tracing::warn!("janitor: skipping file of {}: {e}", row.id),
             }
         }
+        crate::commands::remove_meeting_assets(base, &row.id);
         db.delete_meeting(&row.id)?;
         pruned += 1;
     }
     if pruned > 0 {
         export_index(db, base)?;
+    }
+    Ok(pruned)
+}
+
+/// Delete asset directories whose meeting no longer exists — the residue of
+/// a recording abandoned between the first paste and the row being written,
+/// or of a save that failed after the images landed.
+///
+/// **The live recording's directory is skipped**, and that guard is the
+/// whole subtlety: a recording in flight has images on disk and no row yet,
+/// so a sweep that only asked the database would delete the user's
+/// screenshots mid-meeting.
+pub fn prune_orphan_assets(db: &Db, base: &Path) -> Result<usize> {
+    let dir = base.join("assets");
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let live = crate::recovery::active_meeting_id(base);
+    let mut pruned = 0usize;
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if live.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        if db.get_meeting(&name)?.is_some() {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => {
+                tracing::info!("janitor: removed orphaned assets for {name}");
+                pruned += 1;
+            }
+            Err(e) => tracing::warn!("janitor: could not remove assets for {name}: {e}"),
+        }
     }
     Ok(pruned)
 }
@@ -184,6 +257,7 @@ pub fn export_index(db: &Db, base: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use embral_types::MeetingRecord;
 
     /// Boot-path migration against the real demo library fixture: a pre-R1
     /// storage dir (index.json + markdown files) imports on first open, and
@@ -221,15 +295,16 @@ mod tests {
         // Imported content carries the markdown bodies (search happens at
         // chunk level now — embral-search's own tests cover it).
         let rows = db.list_meetings(None, None).unwrap();
-        assert!(rows.iter().all(|r| !r.notes_md.is_empty()));
+        assert!(rows.iter().all(|r| !r.summary.is_empty()));
 
-        // Re-export matches the legacy shape (id + paths preserved).
+        // The documents came across into the database; the index is now just
+        // the meeting list, with audio the only path left on it.
         export_index(&db, &tmp).unwrap();
         let reread: Vec<MeetingRecord> =
             serde_json::from_str(&std::fs::read_to_string(tmp.join("index.json")).unwrap())
                 .unwrap();
         assert_eq!(reread.len(), 10);
-        assert!(reread.iter().all(|r| r.notes_path.starts_with("notes/")));
+        assert!(reread.iter().all(|r| r.audio_path.starts_with("audio/")));
 
         // Second open must not double-import.
         drop(db);
@@ -255,12 +330,10 @@ mod tests {
                 title: id.into(),
                 started_at: Utc::now() - chrono::Duration::days(days_ago),
                 duration_seconds: 60,
-                notes_md: String::new(),
-                transcript_md: "t".into(),
+                summary: String::new(),
+                transcript: "t".into(),
                 attendees: vec![],
                 audio_path: audio_rel,
-                notes_path: format!("notes/{id}.md"),
-                transcript_path: format!("transcripts/{id}.md"),
             })
             .unwrap();
         };
@@ -279,10 +352,58 @@ mod tests {
             "audio/recent.mp3"
         );
         // Transcript markdown untouched.
-        assert_eq!(db.get_meeting("old").unwrap().unwrap().transcript_md, "t");
+        assert_eq!(db.get_meeting("old").unwrap().unwrap().transcript, "t");
 
         // Re-run is a no-op.
         assert_eq!(prune_old_audio(&db, &tmp, 30).unwrap(), 0);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The orphan sweep deletes asset directories with no meeting behind
+    /// them — except the recording happening right now, which has images on
+    /// disk and no row yet. Getting that guard wrong deletes the user's
+    /// screenshots mid-meeting.
+    #[test]
+    fn the_asset_sweep_spares_the_recording_in_flight() {
+        let tmp = std::env::temp_dir().join(format!("embral-assets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // The sweep asks the database one question — "is there a meeting
+        // with this id" — and does its real work on the filesystem, so an
+        // in-memory library keeps the test about the part that matters.
+        let db = Db::open_in_memory().unwrap();
+
+        let asset = |id: &str| {
+            let dir = tmp.join("assets").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("img-01.png"), b"x").unwrap();
+        };
+        // One saved meeting, one abandoned, one recording right now.
+        db.upsert_meeting(&MeetingRow {
+            id: "saved".into(),
+            title: "Saved".into(),
+            started_at: Utc::now(),
+            duration_seconds: 60,
+            summary: String::new(),
+            transcript: String::new(),
+            attendees: vec![],
+            audio_path: String::new(),
+        })
+        .unwrap();
+        asset("saved");
+        asset("abandoned");
+        asset("recording-now");
+        crate::recovery::begin(&tmp, "recording-now");
+
+        assert_eq!(prune_orphan_assets(&db, &tmp).unwrap(), 1);
+        assert!(tmp.join("assets/saved/img-01.png").exists());
+        assert!(
+            tmp.join("assets/recording-now/img-01.png").exists(),
+            "the live recording's images must survive"
+        );
+        assert!(!tmp.join("assets/abandoned").exists());
 
         drop(db);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -292,26 +413,20 @@ mod tests {
     fn janitor_prunes_whole_meetings() {
         let tmp = std::env::temp_dir().join(format!("embral-mjanitor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        for sub in ["audio", "notes", "transcripts"] {
-            std::fs::create_dir_all(tmp.join(sub)).unwrap();
-        }
+        std::fs::create_dir_all(tmp.join("audio")).unwrap();
 
         let db = Db::open(&tmp.join("embral.db")).unwrap();
         let mk = |id: &str, days_ago: i64| {
-            for (sub, ext) in [("audio", "mp3"), ("notes", "md"), ("transcripts", "md")] {
-                std::fs::write(tmp.join(format!("{sub}/{id}.{ext}")), b"x").unwrap();
-            }
+            std::fs::write(tmp.join(format!("audio/{id}.mp3")), b"x").unwrap();
             db.upsert_meeting(&MeetingRow {
                 id: id.into(),
                 title: id.into(),
                 started_at: Utc::now() - chrono::Duration::days(days_ago),
                 duration_seconds: 60,
-                notes_md: "n".into(),
-                transcript_md: "t".into(),
+                summary: "n".into(),
+                transcript: "t".into(),
                 attendees: vec![],
                 audio_path: format!("audio/{id}.mp3"),
-                notes_path: format!("notes/{id}.md"),
-                transcript_path: format!("transcripts/{id}.md"),
             })
             .unwrap();
         };
@@ -322,13 +437,13 @@ mod tests {
         assert_eq!(prune_old_meetings(&db, &tmp, 0).unwrap(), 0);
 
         assert_eq!(prune_old_meetings(&db, &tmp, 365).unwrap(), 1);
+        // The row carries both documents, so deleting it takes them with it;
+        // audio is the one file that has to be removed by hand.
         assert!(db.get_meeting("ancient").unwrap().is_none());
-        assert!(!tmp.join("notes/ancient.md").exists());
-        assert!(!tmp.join("transcripts/ancient.md").exists());
         assert!(!tmp.join("audio/ancient.mp3").exists());
         // The recent meeting is fully intact.
         assert!(db.get_meeting("recent").unwrap().is_some());
-        assert!(tmp.join("notes/recent.md").exists());
+        assert!(tmp.join("audio/recent.mp3").exists());
 
         // Re-run is a no-op.
         assert_eq!(prune_old_meetings(&db, &tmp, 365).unwrap(), 0);

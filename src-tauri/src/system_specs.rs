@@ -64,13 +64,16 @@ mod tests {
 
     #[test]
     fn disk_matching_takes_the_longest_mount_prefix() {
+        // Forward-slash paths parse component-wise on every OS; the
+        // Windows-literal `C:\...` form only splits on Windows and made
+        // this test fail on macOS.
         let disks = vec![
-            (PathBuf::from(r"C:\"), 100),
-            (PathBuf::from(r"C:\Users"), 50),
-            (PathBuf::from(r"D:\"), 999),
+            (PathBuf::from("/"), 100),
+            (PathBuf::from("/data"), 50),
+            (PathBuf::from("/other"), 999),
         ];
-        let models = PathBuf::from(r"C:\Users\someone\AppData\Local\embral\models");
+        let models = PathBuf::from("/data/someone/embral/models");
         assert_eq!(free_disk_for(&models, &disks), 50);
-        assert_eq!(free_disk_for(Path::new(r"E:\x"), &disks), 0);
+        assert_eq!(free_disk_for(Path::new("relative/elsewhere"), &disks), 0);
     }
 }

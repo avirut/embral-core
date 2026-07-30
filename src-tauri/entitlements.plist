@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hardened-runtime entitlements for the signed macOS bundle
+     (docs/release.md). Unsigned dev builds ignore this file; the port's
+     Phase-5 notarization spike proves the mic still works signed. -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<!-- llama-server and embral-mcp are unsigned-at-build sidecars until
+	     the release lane signs them; JIT-less child processes need no
+	     further exceptions. -->
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<false/>
+</dict>
+</plist>

@@ -234,4 +234,29 @@
 	::-webkit-scrollbar-thumb:hover {
 		background-color: color-mix(in oklch, var(--muted-foreground) 45%, transparent);
 	}
+
+	/* Where a search result landed. Applied by `utils/flash.ts` and removed
+	   on a timer — it fades on its own rather than becoming state the user
+	   has to clear. The tint is the same one the palette marks matches with,
+	   so arriving looks like a continuation of the search. */
+	.embral-flash {
+		animation: embral-flash 1.4s ease-out forwards;
+		border-radius: 0.25rem;
+	}
+	@keyframes embral-flash {
+		0%,
+		45% {
+			background-color: color-mix(in oklch, var(--primary) 18%, transparent);
+			box-shadow: 0 0 0 4px color-mix(in oklch, var(--primary) 18%, transparent);
+		}
+		100% {
+			background-color: transparent;
+			box-shadow: 0 0 0 4px transparent;
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.embral-flash {
+			animation-duration: 0.01ms;
+		}
+	}
 }

@@ -6,6 +6,9 @@
     import type { TranscriptionLanguage } from "$lib/types";
     import SettingRow from "./SettingRow.svelte";
     import { Button } from "$lib/components/ui/button";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.settings.transcription.picker);
 
     /** The on-device accuracy choice, projected onto the catalog's model ids.
      * The language lives one level up (it governs cloud transcription too), so
@@ -21,7 +24,8 @@
         language: TranscriptionLanguage;
     } = $props();
 
-    const tierLabels = ["Fast", "Balanced", "Accurate"];
+    // The order is fixed; the labels come from the catalog by key.
+    const tierKeys = ["fast", "balanced", "accurate"] as const;
 
     const tier = $derived.by(() => {
         if (value === "zipformer-en-small") return 0;
@@ -53,13 +57,13 @@
 
 </script>
 
-<SettingRow title="Accuracy">
+<SettingRow title={t.label}>
     {#snippet descriptionExtra()}
         <button
             class="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
             onclick={() => appState.openSettings("transcription")}
         >
-            Manage models
+            {t.manageModels}
         </button>
     {/snippet}
     <div class="tier flex w-56 flex-col gap-1.5">
@@ -71,21 +75,21 @@
             value={tier}
             oninput={(e) => setTier(Number(e.currentTarget.value))}
             class="tier-slider"
-            aria-label="Transcription accuracy"
+            aria-label={t.accuracyAria}
         />
         <!-- Fast hugs the bar's left edge, Accurate its right, Balanced sits
              centered within it — anchored to the bar, not the thumb stops. -->
         <div class="relative flex items-baseline justify-between text-[11px]">
-            {#each tierLabels as label, t (label)}
+            {#each tierKeys as key, i (key)}
                 <button
-                    class="whitespace-nowrap transition-colors {t === 1
+                    class="whitespace-nowrap transition-colors {i === 1
                         ? 'absolute left-1/2 -translate-x-1/2'
-                        : ''} {tier === t
+                        : ''} {tier === i
                         ? 'font-medium text-foreground'
                         : 'text-muted-foreground hover:text-foreground'}"
-                    onclick={() => setTier(t)}
+                    onclick={() => setTier(i)}
                 >
-                    {label}
+                    {t.tiers[key]}
                 </button>
             {/each}
         </div>
@@ -96,14 +100,14 @@
     <div class="flex items-center justify-between gap-3 px-4 py-3">
         <p class="text-xs text-muted-foreground">
             {#if downloading}
-                Downloading the model… {pct}%
+                {t.downloading(pct)}
             {:else}
-                This level needs a one-time model download.
+                {t.needsDownload}
             {/if}
         </p>
         {#if !downloading}
             <Button size="sm" onclick={() => modelsStore.download(modelId)}>
-                Download (~{formatBytes(status.total_bytes)})
+                {t.download(formatBytes(status.total_bytes))}
             </Button>
         {/if}
     </div>

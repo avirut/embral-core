@@ -1,7 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { getCurrentWindow } from '@tauri-apps/api/window';
-import { sendNotification } from '@tauri-apps/plugin-notification';
 import type {
   InterimSegment,
   MeetingRecord,
@@ -14,6 +12,9 @@ import { meetingsStore, PENDING_MEETING_ID } from '$lib/stores/meetings.svelte';
 import { configStore } from '$lib/stores/config.svelte';
 import { dictationStore } from '$lib/stores/dictation.svelte';
 import { updaterStore } from '$lib/stores/updater.svelte';
+import { copy } from '$lib/copy';
+import { errorMessage } from '$lib/copy/errors';
+import { displayAppName } from '$lib/utils/detectedApp';
 import type { ModelProgress } from '$lib/types';
 
 /// Whether a notification event may fire, per the user's notification config.
@@ -67,14 +68,22 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
         appState.setFallbackNotice(null);
         appState.setDetectedApp(null);
         appState.setProviderCapabilities(e.payload.capabilities);
+        // Labeling starts from the setting every recording, exactly as the
+        // backend's own per-recording flag does — otherwise a meeting that
+        // stood labeling down leaves the next one's header saying so while
+        // the backend is happily labeling.
+        appState.setLiveDiarization(configStore.config?.diarization_enabled ?? true);
 
-        // Heads-up when a recording begins while the window is hidden (tray
-        // start today; auto-detection in R3 makes this the main path).
-        const visible = await getCurrentWindow().isVisible();
-        if (!visible && notificationsAllowed('recording_started')) {
-          await sendNotification({
-            title: 'Recording started',
-            body: 'embral is recording this meeting.'
+        // Notices fire whatever the window state — tray, minimized, or
+        // open; the per-event toggle is the only gate.
+        if (notificationsAllowed('recording_started')) {
+          await invoke('notify', {
+            payload: {
+              kind: 'recording_started',
+              title: copy.notifications.os.recordingStarted.title,
+              actions: [],
+              sticky: false
+            }
           });
         }
       }
@@ -96,8 +105,83 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
   );
 
   unlisteners.push(
-    await listen('recording-paused', () => {
-      appState.setPaused(true);
+    await listen<{ minutes: number }>('silence-notice', async (e) => {
+      // The silence check-in ("Still recording?"): banner in-app plus the
+      // notice, whatever the window state — this event precedes a
+      // possible auto-stop, so it has no per-event toggle; turning the
+      // feature off is silence_stop_minutes = 0.
+      appState.setSilenceNotice(e.payload.minutes);
+      await invoke('notify', {
+        payload: {
+          kind: 'silence',
+          title: copy.notifications.os.stillRecording.title,
+          actions: [
+            { id: 'keep', label: copy.meetings.silence.keep },
+            { id: 'stop', label: copy.meetings.silence.stop }
+          ],
+          sticky: true
+        }
+      });
+    })
+  );
+
+  unlisteners.push(
+    await listen('silence-cleared', () => {
+      appState.setSilenceNotice(null);
+    })
+  );
+
+  unlisteners.push(
+    await listen('recording-start-failed', async (e) => {
+      // A detected call that could not be recorded: the in-app error slot
+      // plus a notice, because the user is by definition elsewhere.
+      const reason = errorMessage(e.payload);
+      appState.setError(reason);
+      await invoke('notify', {
+        payload: {
+          kind: 'start_failed',
+          title: copy.notifications.os.startFailed.title,
+          actions: [],
+          sticky: false,
+          target: { kind: 'app' }
+        }
+      });
+    })
+  );
+
+  unlisteners.push(
+    await listen<{ kind: string; id?: string }>('notice-navigate', async (e) => {
+      // A notice's body-click: the backend already surfaced the window;
+      // land where the news lives.
+      if (e.payload.kind === 'meeting' && e.payload.id) {
+        appState.setView('idle');
+        await meetingsStore.refreshAndSelect(e.payload.id);
+      } else if (e.payload.kind === 'updates') {
+        appState.openSettings('about');
+      }
+    })
+  );
+
+  unlisteners.push(
+    await listen('meeting-dismissed', () => {
+      // Dismissed from the notice window (or anywhere): the in-app banner
+      // comes down with it.
+      appState.setDetectedApp(null);
+    })
+  );
+
+  unlisteners.push(
+    await listen('stop-requested', () => {
+      // A backend-initiated stop (call-end auto-stop, silence): performed
+      // from here so the notes draft and title travel exactly like a stop
+      // from the button; the backend falls back to a bare stop only if
+      // this listener never answers.
+      const snapshot = appState.recordingSnapshot();
+      appState.setPendingTitleHint(snapshot?.title ?? '');
+      invoke('stop_recording', {
+        userNotes: snapshot?.notes ?? null,
+        meetingTitle: snapshot?.title ?? null
+      }).catch((e) => console.error('requested stop failed:', e));
     })
   );
 
@@ -115,6 +199,7 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
       // there immediately as a pending entry (transcript in hand, notes and
       // audio in progress) instead of a separate processing screen.
       appState.setRecording(false);
+      appState.setSilenceNotice(null);
       appState.beginPendingMeeting();
       appState.setView('idle');
       void meetingsStore.select(PENDING_MEETING_ID);
@@ -131,17 +216,32 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
   // (cloud builds only ever emit this). The recording continues; the
   // banner explains the switch.
   unlisteners.push(
-    await listen<{ message: string }>('transcription-fallback', async (e) => {
+    await listen<{ speakers: number }>('diarization-disabled', (e) => {
+      // The runaway guard: more voices than a meeting plausibly has, so
+      // the backend stood labeling down and stripped what it had. Say so
+      // in the error slot — silently losing the speaker names would read
+      // as the app breaking.
+      appState.standDownDiarization();
+      appState.stripSpeakers();
+      appState.setError(copy.meetings.live.tooManySpeakers(e.payload.speakers));
+    })
+  );
+
+  unlisteners.push(
+    await listen('transcription-fallback', async (e) => {
       appState.setFallbackNotice(
-        `Switched to local transcription (${e.payload.message}).`
+        copy.notifications.notices.switchedToLocal(errorMessage(e.payload))
       );
-      const visible = await getCurrentWindow().isVisible();
       // A mid-recording provider switch is news about the recording, so it
       // rides the recording toggle now that there is no master switch.
-      if (!visible && notificationsAllowed('recording_started')) {
-        await sendNotification({
-          title: 'Switched to local transcription',
-          body: 'The recording continues on this device.'
+      if (notificationsAllowed('recording_started')) {
+        await invoke('notify', {
+          payload: {
+            kind: 'switched_to_local',
+            title: copy.notifications.os.switchedToLocal.title,
+            actions: [],
+            sticky: false
+          }
         });
       }
     })
@@ -150,8 +250,10 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
   // The session died with nothing to fall back to; live transcription is
   // over for this recording (audio capture itself continues).
   unlisteners.push(
-    await listen<{ message: string }>('transcription-failed', (e) => {
-      appState.setError(`Live transcription stopped: ${e.payload.message}`);
+    await listen('transcription-failed', (e) => {
+      appState.setError(
+        copy.notifications.notices.transcriptionStopped(errorMessage(e.payload))
+      );
     })
   );
 
@@ -159,9 +261,9 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
   // chosen: the recording and notes continue, deliberately without a
   // transcript. A notice, not an error — this is the configured behavior.
   unlisteners.push(
-    await listen<{ message: string }>('transcription-disabled', (e) => {
+    await listen('transcription-disabled', (e) => {
       appState.setFallbackNotice(
-        `Transcription is off for this recording (${e.payload.message}). Audio and notes continue.`
+        copy.notifications.notices.transcriptionOff(errorMessage(e.payload))
       );
     })
   );
@@ -181,7 +283,6 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
   unlisteners.push(
     await listen('notes-generation-started', () => {
       appState.setProcessingStep('generating-notes');
-      appState.setPendingStage('notes');
     })
   );
 
@@ -205,20 +306,25 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
       // selection, so the detail pane never blinks through an empty state.
       appState.clearPendingMeeting();
 
-      const visible = await getCurrentWindow().isVisible();
-      if (!visible && notificationsAllowed('summary_ready')) {
-        await sendNotification({
-          title: 'Meeting notes ready',
-          body: e.payload.title
+      if (notificationsAllowed('summary_ready')) {
+        await invoke('notify', {
+          payload: {
+            kind: 'notes_ready',
+            title: copy.notifications.os.notesReady.title,
+            actions: [],
+            sticky: false,
+            target: { kind: 'meeting', id: e.payload.id }
+          }
         });
       }
     })
   );
 
   unlisteners.push(
-    await listen<string>('processing-error', (e) => {
-      appState.setError(e.payload);
-      appState.setPendingError(e.payload);
+    await listen('processing-error', (e) => {
+      const message = errorMessage(e.payload);
+      appState.setError(message);
+      appState.setPendingError(message);
     })
   );
 
@@ -228,11 +334,16 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
   unlisteners.push(
     await listen<{ app: string }>('meeting-detected', async (e) => {
       appState.setDetectedApp(e.payload.app);
-      const visible = await getCurrentWindow().isVisible();
-      if (!visible && notificationsAllowed('call_detected')) {
-        await sendNotification({
-          title: 'Call in progress',
-          body: `${e.payload.app} is using your microphone. Open embral to record it.`
+      if (notificationsAllowed('call_detected')) {
+        await invoke('notify', {
+          payload: {
+            kind: 'call_detected',
+            title: copy.notifications.os.callDetected.title(
+              displayAppName(e.payload.app)
+            ),
+            actions: [{ id: 'accept', label: copy.shell.detectionBanner.record }],
+            sticky: true
+          }
         });
       }
     })
@@ -284,6 +395,10 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
   );
 
   _activeUnlisteners = unlisteners;
+  installSyncHooks();
+  // Catch up immediately too: a recording may already be running when this
+  // window's page (re)loads.
+  void syncRecordingStatus();
   scheduleStartupUpdateCheck();
   return unlisteners;
 }
@@ -292,6 +407,61 @@ export async function setupEventListeners(): Promise<UnlistenFn[]> {
 // with the startup path — and skipped outright if a recording is already
 // live (an auto-detected meeting can start before the timer fires). The
 // flag lives at module level so HMR remounts don't stack timers.
+/// Reconcile the UI with what the backend is actually doing. All of this
+/// state normally arrives as events — but a hidden webview gets throttled
+/// by the OS and can drop them wholesale (an auto-started recording once
+/// left the surfaced window showing a dead idle shell). Called on mount
+/// and whenever the window regains focus or visibility.
+export async function syncRecordingStatus(): Promise<void> {
+  const status = await invoke<{
+    recording: boolean;
+    paused: boolean;
+    started_at_ms: number;
+    labels_authoritative: boolean;
+    diarization: boolean;
+    segments: TranscriptionSegment[];
+    selected_apps: number[] | null;
+    extra_mics: string[];
+  }>('recording_status').catch(() => null);
+  if (!status) return;
+
+  if (status.recording && !appState.isRecording) {
+    // The window missed recording-started: rebuild the live view.
+    appState.setView('recording');
+    appState.setRecording(true);
+    appState.startRecordingClock(status.started_at_ms);
+    appState.setPaused(status.paused);
+    // Only the label authority survives backend-side; the session cap is
+    // display-only and absent here (0 = no cap shown).
+    appState.setProviderCapabilities({
+      labels_authoritative: status.labels_authoritative,
+      max_session_minutes: 0
+    });
+    appState.replaceSegments(status.segments);
+    appState.setLiveDiarization(status.diarization);
+    appState.setDetectedApp(null);
+  } else if (!status.recording && appState.isRecording) {
+    // The window missed the stop; the meeting persisted backend-side.
+    appState.resetToIdle();
+    await meetingsStore.load();
+  }
+  // The same throttling can strand the models statuses the record button
+  // gates on ("Configure transcription" on a fully configured machine).
+  if (!configStore.isConfigured) {
+    void configStore.load();
+  }
+}
+
+let _syncHooksInstalled = false;
+function installSyncHooks() {
+  if (_syncHooksInstalled) return;
+  _syncHooksInstalled = true;
+  window.addEventListener('focus', () => void syncRecordingStatus());
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') void syncRecordingStatus();
+  });
+}
+
 let _updateCheckScheduled = false;
 function scheduleStartupUpdateCheck() {
   if (_updateCheckScheduled) return;

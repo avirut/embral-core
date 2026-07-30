@@ -14,6 +14,8 @@
  * we can't name in it is a key we refuse to save, rather than one we save and
  * discover is dead. The values are what the user sees.
  */
+
+import { isMac } from '../platform';
 const KEYS: Record<string, string> = {
   Backquote: '`',
   Backslash: '\\',
@@ -81,15 +83,27 @@ export function comboFromEvent(e: KeyboardEvent): string | null {
   return parts.join('+');
 }
 
+/** The macOS modifier glyphs, in the order Apple writes them. The stored
+ * combo keeps the portable `Ctrl+Alt+Shift+Super` vocabulary either way —
+ * only the display changes. */
+const MAC_GLYPHS: Record<string, string> = {
+  Ctrl: '⌃',
+  Alt: '⌥',
+  Shift: '⇧',
+  Super: '⌘'
+};
+
 /**
- * A saved combo, written the way a person would read it: `Shift+Alt+Super+]`
- * rather than `Shift+Alt+Super+BracketRight`. Anything it doesn't recognize
- * passes through as-is, so a combo saved by an older build still displays.
+ * A saved combo, written the way a person would read it on this OS:
+ * `Shift + Alt + Super + ]` on Windows, `⌥⇧⌘]` on macOS (glyphs, no
+ * separators — Apple's convention). Anything it doesn't recognize passes
+ * through as-is, so a combo saved by an older build still displays.
  */
-export function formatCombo(combo: string): string {
+export function formatCombo(combo: string, mac: boolean = isMac): string {
   if (!combo) return '';
-  return combo
-    .split('+')
-    .map((token) => KEYS[token] ?? token)
-    .join(' + ');
+  const tokens = combo.split('+');
+  if (mac) {
+    return tokens.map((token) => MAC_GLYPHS[token] ?? KEYS[token] ?? token).join('');
+  }
+  return tokens.map((token) => KEYS[token] ?? token).join(' + ');
 }

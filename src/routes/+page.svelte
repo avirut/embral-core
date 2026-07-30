@@ -1,9 +1,11 @@
 <script lang="ts">
     import { onMount } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
-    import { CloudOff } from "lucide-svelte";
+    import { CloudOff, X } from "lucide-svelte";
     import { configStore } from "$lib/stores/config.svelte";
+    import { storageRoot } from "$lib/stores/storageRoot.svelte";
     import { appState } from "$lib/stores/app-state.svelte";
+    import { displayAppName } from "$lib/utils/detectedApp";
     import { themeStore } from "$lib/stores/theme.svelte";
     import { setupEventListeners } from "$lib/events";
     import TitleBar from "$lib/components/shell/TitleBar.svelte";
@@ -19,6 +21,10 @@
     import SettingsLayout from "$lib/components/settings/SettingsLayout.svelte";
     import SpeakersPage from "$lib/components/speakers/SpeakersPage.svelte";
     import DictationHome from "$lib/components/dictation/DictationHome.svelte";
+    import { copy } from "$lib/copy";
+
+    const banner = $derived(copy.shell.detectionBanner);
+    const silenceBanner = $derived(copy.meetings.silence);
 
     let userNotes = $state("");
     let meetingTitle = $state("");
@@ -52,6 +58,16 @@
             starring = false;
         }
     }
+
+    // Shadow mode borrows the transcript pane's collapse ([shell.md]
+    // §Recording): the pane renders shut while shadowed, without touching
+    // its persisted layout. Reopening it at the divider sticks for the
+    // rest of the recording; the flag clears when shadow mode ends (toggle
+    // or stop — appState.shadowMode already gates on isRecording).
+    let shadowReopened = $state(false);
+    $effect(() => {
+        if (!appState.shadowMode) shadowReopened = false;
+    });
 
     // A fresh recording gets a fresh notes draft (stops from the hotkey or
     // tray never pass through the stop button's clearing).
@@ -117,6 +133,29 @@
         }
     }
 
+    async function keepRecordingThroughSilence() {
+        try {
+            await invoke("silence_keep_recording");
+        } catch (e) {
+            appState.setError(e instanceof Error ? e.message : String(e));
+        }
+    }
+
+    async function stopFromSilence() {
+        // The same stop the header button performs: drafts travel with it
+        // (strings always, empty included — a null arg means "use the
+        // backend's mirror" and is reserved for the handshake fallback).
+        appState.setPendingTitleHint(meetingTitle);
+        try {
+            await invoke("stop_recording", {
+                userNotes,
+                meetingTitle,
+            });
+        } catch (e) {
+            appState.setError(e instanceof Error ? e.message : String(e));
+        }
+    }
+
     async function acceptDetectedMeeting() {
         appState.setDetectedApp(null);
         try {
@@ -138,11 +177,21 @@
     onMount(async () => {
         // The stop path reads the notes text and star anchors before the
         // recording view unmounts; this page owns both.
-        appState.setRecordingSnapshotProvider(() => ({
-            notes: userNotes,
-            starBlocks: notesEditorRef?.getStarBlocks() ?? new Map(),
-        }));
+        appState.setRecordingSnapshotProvider(() => {
+            // A destroyed editor must not take the stop path down with it —
+            // the notes text still delivers even if the anchors don't.
+            let starBlocks = new Map<number, number>();
+            try {
+                starBlocks = notesEditorRef?.getStarBlocks() ?? starBlocks;
+            } catch {
+                // Anchors lost; the stars keep their timestamps.
+            }
+            return { notes: userNotes, title: meetingTitle, starBlocks };
+        });
         await configStore.load();
+        // Needed before any document with an image renders — it is what
+        // turns a stored `assets/…` link into something the webview loads.
+        await storageRoot.load();
         setupEventListeners();
         // First-run goes through onboarding instead of being dropped into
         // Settings; afterwards, an unconfigured provider still lands there.
@@ -157,6 +206,22 @@
     // Re-apply whenever the configured theme changes (settings, sidebar cycle).
     $effect(() => {
         themeStore.apply(configStore.config?.theme ?? "system");
+    });
+
+    // Mirror the drafts into the backend while recording (debounced), so a
+    // stop the frontend never answers still saves the human's words.
+    let draftSyncTimer: ReturnType<typeof setTimeout> | null = null;
+    $effect(() => {
+        const notes = userNotes;
+        const title = meetingTitle;
+        if (!appState.isRecording) return;
+        if (draftSyncTimer) clearTimeout(draftSyncTimer);
+        draftSyncTimer = setTimeout(() => {
+            void invoke("sync_recording_drafts", {
+                notes,
+                meetingTitle: title,
+            }).catch(() => {});
+        }, 1000);
     });
 </script>
 
@@ -174,9 +239,9 @@
                     class="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-primary/5 px-4 py-2"
                 >
                     <p class="min-w-0 truncate text-sm">
-                        <span class="font-medium">Call in progress</span>
+                        <span class="font-medium">{banner.label}</span>
                         <span class="text-muted-foreground">
-                            — {appState.detectedApp} is using your microphone.</span
+                            {banner.detail(displayAppName(appState.detectedApp))}</span
                         >
                     </p>
                     <div class="flex shrink-0 items-center gap-2">
@@ -184,13 +249,13 @@
                             class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
                             onclick={acceptDetectedMeeting}
                         >
-                            Record
+                            {banner.record}
                         </button>
                         <button
                             class="rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                             onclick={dismissDetectedMeeting}
                         >
-                            Dismiss
+                            {banner.dismiss}
                         </button>
                     </div>
                 </div>
@@ -204,12 +269,47 @@
                         bind:meetingTitle
                         onStar={starMoment}
                     />
+                    {#if appState.silenceNoticeMinutes !== null}
+                        <div
+                            class="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-primary/5 px-4 py-2"
+                        >
+                            <p class="min-w-0 truncate text-sm">
+                                <span class="font-medium">{silenceBanner.label}</span>
+                                <span class="text-muted-foreground">
+                                    {silenceBanner.detail(appState.silenceNoticeMinutes)}</span
+                                >
+                            </p>
+                            <div class="flex shrink-0 items-center gap-2">
+                                <button
+                                    class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                                    onclick={keepRecordingThroughSilence}
+                                >
+                                    {silenceBanner.keep}
+                                </button>
+                                <button
+                                    class="rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                                    onclick={stopFromSilence}
+                                >
+                                    {silenceBanner.stop}
+                                </button>
+                            </div>
+                        </div>
+                    {/if}
                     {#if appState.fallbackNotice}
                         <div
                             class="flex shrink-0 items-center gap-2 border-b border-border bg-amber-500/10 px-4 py-1.5 text-xs text-amber-700 dark:text-amber-400"
                         >
                             <CloudOff size={12} class="shrink-0" />
-                            <span class="min-w-0 truncate">{appState.fallbackNotice}</span>
+                            <span class="min-w-0 flex-1 truncate">{appState.fallbackNotice}</span>
+                            <!-- Read once and it has done its job; the switch
+                                 already happened and nothing here is actionable. -->
+                            <button
+                                class="-mr-1 shrink-0 rounded p-1 transition-colors hover:bg-amber-500/20"
+                                aria-label={copy.common.dismiss}
+                                onclick={() => appState.setFallbackNotice(null)}
+                            >
+                                <X size={12} />
+                            </button>
                         </div>
                     {/if}
                     <ResizableSplit
@@ -218,12 +318,18 @@
                         defaultSize={340}
                         minFixed={260}
                         minFlex={320}
+                        collapsible
+                        forceCollapsed={appState.shadowMode &&
+                            !shadowReopened}
+                        onForceReopen={() => (shadowReopened = true)}
                     >
                         {#snippet left()}
                             <NotesEditor
                                 bind:this={notesEditorRef}
                                 bind:value={userNotes}
                                 onStarClick={unstarMoment}
+                                onPasteError={(message) =>
+                                    appState.setError(message)}
                             />
                         {/snippet}
                         {#snippet right()}

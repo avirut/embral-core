@@ -8,11 +8,15 @@
    * modal surface, and the vendored dialog brings a scroll lock the shell does
    * not want.
    */
+  import { copy } from '$lib/copy';
+
+  const t = $derived(copy.common);
+
   let {
     open = $bindable(false),
     title,
     body,
-    confirmLabel = 'Delete',
+    confirmLabel = t.delete,
     busy = false,
     onConfirm
   }: {
@@ -46,7 +50,7 @@
           class="h-9 rounded-md border border-border px-3 text-sm font-medium transition-colors hover:bg-accent"
           disabled={busy}
         >
-          Cancel
+          {t.cancel}
         </button>
         <button
           onclick={onConfirm}

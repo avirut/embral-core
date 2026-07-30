@@ -1,14 +1,17 @@
 <script lang="ts">
     import { onMount } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
-    import { ArrowDown, Star } from "lucide-svelte";
+    import { Star, Users, UsersRound } from "lucide-svelte";
     import { appState } from "$lib/stores/app-state.svelte";
     import { speakersStore } from "$lib/stores/speakers.svelte";
     import { formatTime } from "$lib/utils/meetingFormat";
-    import { chipClass } from "$lib/utils/speakerColors";
+    import { nameClass } from "$lib/utils/speakerColors";
     import SpeakerNameInput from "./SpeakerNameInput.svelte";
     import Tip from "./Tip.svelte";
+    import { copy } from "$lib/copy";
     import type { TranscriptionSegment } from "$lib/types";
+
+    const t = $derived(copy.meetings.live);
 
     interface Group {
         speaker: string | null;
@@ -104,8 +107,8 @@
         return items;
     });
 
-    // Speaker labels in first-appearance order — drives chip colors and the
-    // pills row (rendered only when live labels exist at all).
+    // Speaker labels in first-appearance order — drives the name colors and
+    // the speaker row (rendered only when live labels exist at all).
     let labels = $derived.by(() => {
         const seen: string[] = [];
         for (const s of appState.segments) {
@@ -118,7 +121,7 @@
         if (!speakersStore.loaded) void speakersStore.refresh();
     });
 
-    // --- Renaming a live speaker (double-click a pill). Typing a profile's
+    // --- Renaming a live speaker (click the name). Typing a profile's
     // name links it; a new name creates the profile on the spot. The rename
     // reaches the backend accumulator and future segments of that cluster
     // (`rename_live_speaker`), and the post-meeting pass keeps user-given
@@ -180,7 +183,8 @@
     });
 
     // Pinned-to-bottom auto-scroll: scrolling up unpins (new content stops
-    // yanking the viewport); the pill or reaching the bottom re-pins.
+    // yanking the viewport); the "Jump to latest" pill or reaching the
+    // bottom re-pins.
     let scrollEl = $state<HTMLElement | null>(null);
     let pinned = $state(true);
 
@@ -189,6 +193,17 @@
         pinned =
             scrollEl.scrollTop + scrollEl.clientHeight >=
             scrollEl.scrollHeight - 40;
+    }
+
+    // Speaker labeling for this recording. Turning it off drops the
+    // labels already on screen too — a half-labeled transcript reads as
+    // the app having lost track. The backend is the source of truth, so we
+    // re-read its segments rather than editing ours.
+    async function toggleDiarization() {
+        const next = !appState.liveDiarization;
+        await invoke("set_live_diarization", { enabled: next }).catch(() => {});
+        appState.setLiveDiarization(next);
+        if (!next) appState.stripSpeakers();
     }
 
     function jumpToLatest() {
@@ -208,14 +223,25 @@
 </script>
 
 <div class="flex h-full min-h-0 flex-col">
-    {#if labels.length > 0}
+    <!-- The speaker row. Present for the whole recording, because the
+         toggle has to be reachable before anyone has been labeled (and
+         after labeling has been turned off, to turn it back on). -->
+    {#if appState.isRecording}
         <div class="shrink-0 border-b border-border px-4 py-2">
-            <div class="flex flex-wrap items-center gap-1.5">
-                <span
-                    class="mr-0.5 text-[11px] font-medium tracking-wide text-muted-foreground uppercase"
-                >
-                    Speakers
-                </span>
+          <div class="flex items-center gap-x-3">
+            <!-- Names first, the control last: the row is about who is
+                 talking, and the toggle is the thing you touch once. -->
+            <div class="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1.5">
+                {#if !appState.liveDiarization}
+                    <!-- Why labeling is off, not just that it is: the
+                         guard standing it down is the app's doing, and
+                         reads as a bug unless the row says otherwise. -->
+                    <span class="text-[11px] text-muted-foreground italic">
+                        {appState.diarizationRunaway
+                            ? t.diarizationRunawayNote
+                            : t.diarizationOffNote}
+                    </span>
+                {/if}
                 {#each labels as label (label)}
                     {#if editingLabel === label}
                         <SpeakerNameInput
@@ -224,15 +250,19 @@
                                 ...speakersStore.speakers.map((p) => p.name),
                                 ...labels.filter((l) => l !== label),
                             ]}
+                            class="text-[11px] font-medium {nameClass(
+                                label,
+                                labels,
+                            )}"
                             onCommit={commitLabelEdit}
                             onCancel={() => (editingLabel = null)}
                         />
                     {:else}
-                        <Tip text="Name this speaker">
+                        <Tip text={t.nameSpeaker}>
                             {#snippet children({ props })}
                                 <button
                                     {...props}
-                                    class="rounded-full px-2 py-0.5 text-[11px] font-medium transition-opacity hover:opacity-75 {chipClass(
+                                    class="text-[11px] font-medium underline-offset-4 transition-opacity hover:underline hover:opacity-75 {nameClass(
                                         label,
                                         labels,
                                     )}"
@@ -245,6 +275,33 @@
                     {/if}
                 {/each}
             </div>
+
+            <Tip
+                text={appState.liveDiarization
+                    ? t.diarizationOff
+                    : t.diarizationOn}
+            >
+                {#snippet children({ props })}
+                    <button
+                        {...props}
+                        class="-my-0.5 -mr-1 shrink-0 rounded-md p-1 transition-colors hover:bg-accent {appState.liveDiarization
+                            ? 'text-foreground'
+                            : 'text-muted-foreground'}"
+                        aria-pressed={appState.liveDiarization}
+                        aria-label={appState.liveDiarization
+                            ? t.diarizationOff
+                            : t.diarizationOn}
+                        onclick={toggleDiarization}
+                    >
+                        {#if appState.liveDiarization}
+                            <Users size={14} />
+                        {:else}
+                            <UsersRound size={14} class="opacity-50" />
+                        {/if}
+                    </button>
+                {/snippet}
+            </Tip>
+          </div>
         </div>
     {/if}
 
@@ -279,7 +336,7 @@
                             </span>
                             {#if item.group.speaker}
                                 <span
-                                    class="rounded-full px-2 py-px text-[10px] font-medium {chipClass(
+                                    class="font-medium {nameClass(
                                         item.group.speaker,
                                         labels,
                                     )}">{item.group.speaker}</span
@@ -324,17 +381,16 @@
             {/if}
 
             {#if grouped.length === 0 && !appState.interim}
-                <p class="text-xs text-muted-foreground italic">Listening…</p>
+                <p class="text-xs text-muted-foreground italic">{t.listening}</p>
             {/if}
         </div>
 
         {#if !pinned}
             <button
                 onclick={jumpToLatest}
-                class="absolute bottom-3 left-1/2 inline-flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-background/95 px-3 py-1 text-[11px] font-medium text-muted-foreground shadow-sm transition-colors hover:text-foreground"
+                class="absolute bottom-3 left-1/2 inline-flex -translate-x-1/2 items-center rounded-full border border-border bg-background/95 px-3 py-1 text-[11px] font-medium text-muted-foreground shadow-sm transition-colors hover:text-foreground"
             >
-                Jump to latest
-                <ArrowDown size={11} />
+                {t.jumpToLatest}
             </button>
         {/if}
     </div>

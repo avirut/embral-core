@@ -1,5 +1,12 @@
+import { errorMessage } from '$lib/copy/errors';
 import { invoke } from '@tauri-apps/api/core';
-import type { MeetingDetail, MeetingRecord, SegmentEdit } from '$lib/types';
+import type {
+  MeetingDetail,
+  MeetingRecord,
+  MeetingStar,
+  PassageLanding,
+  SegmentEdit
+} from '$lib/types';
 import { ListSelection } from '$lib/utils/listSelection.svelte';
 
 function isTauri() {
@@ -30,7 +37,7 @@ async function loadDetail(id: string) {
     const detail = await invoke<MeetingDetail>('get_meeting_detail', { id });
     _details = { ..._details, [id]: detail };
   } catch (e) {
-    _error = e instanceof Error ? e.message : String(e);
+    _error = errorMessage(e);
   } finally {
     _detailLoadingId = null;
   }
@@ -61,13 +68,23 @@ async function load(limit = 100) {
       await loadDetail(_selectedId);
     }
   } catch (e) {
-    _error = e instanceof Error ? e.message : String(e);
+    _error = errorMessage(e);
   } finally {
     _isLoading = false;
   }
 }
 
-async function select(id: string) {
+/** Where a search result wanted to land, waiting for the detail pane to
+ * mount and take it. Held here rather than passed as a prop because the
+ * pane is not a child of whatever opened the meeting — the palette is a
+ * dialog somewhere else entirely. */
+let _pendingLanding = $state<PassageLanding | null>(null);
+
+async function select(id: string, landing?: PassageLanding) {
+  // Set before the await: the detail pane reacts to the selection, and a
+  // landing that arrived after it had already chosen a tab would be a frame
+  // too late.
+  _pendingLanding = landing ?? null;
   _selectedId = id;
   _selection.select(id);
   if (id !== PENDING_MEETING_ID) {
@@ -112,7 +129,7 @@ async function deleteSelected() {
     }
     if (_selectedId && _selectedId !== PENDING_MEETING_ID) await loadDetail(_selectedId);
   } catch (e) {
-    _error = e instanceof Error ? e.message : String(e);
+    _error = errorMessage(e);
     throw e;
   }
 }
@@ -150,6 +167,17 @@ export const meetingsStore = {
   get selection() {
     return _selection;
   },
+  /** Where a search result asked the detail pane to land. */
+  get pendingLanding() {
+    return _pendingLanding;
+  },
+  /** Taken once, by whoever acts on it — a landing must not fire again when
+   * the user comes back to the same meeting by an ordinary click. */
+  takeLanding(): PassageLanding | null {
+    const landing = _pendingLanding;
+    _pendingLanding = null;
+    return landing;
+  },
 
   load,
   clickRow,
@@ -175,23 +203,43 @@ export const meetingsStore = {
       upsertDetail(detail);
       return detail;
     } catch (e) {
-      _error = e instanceof Error ? e.message : String(e);
+      _error = errorMessage(e);
       throw e;
     }
   },
 
-  async updateNotes(id: string, markdown: string) {
+  /** Save the user's own notes. `stars` carries where each star sits *now*:
+   * they anchor into the notes by block ordinal, so an edit moves them and
+   * a save that omitted them would leave the anchors drifting. */
+  async updateNotes(id: string, markdown: string, stars: MeetingStar[]) {
     if (!isTauri()) return;
     _error = null;
     try {
       const detail = await invoke<MeetingDetail>('update_meeting_notes', {
+        id,
+        markdown,
+        stars
+      });
+      upsertDetail(detail);
+      return detail;
+    } catch (e) {
+      _error = errorMessage(e);
+      throw e;
+    }
+  },
+
+  async updateSummary(id: string, markdown: string) {
+    if (!isTauri()) return;
+    _error = null;
+    try {
+      const detail = await invoke<MeetingDetail>('update_meeting_summary', {
         id,
         markdown
       });
       upsertDetail(detail);
       return detail;
     } catch (e) {
-      _error = e instanceof Error ? e.message : String(e);
+      _error = errorMessage(e);
       throw e;
     }
   },
@@ -207,7 +255,7 @@ export const meetingsStore = {
       upsertDetail(detail);
       return detail;
     } catch (e) {
-      _error = e instanceof Error ? e.message : String(e);
+      _error = errorMessage(e);
       throw e;
     }
   },
@@ -223,7 +271,7 @@ export const meetingsStore = {
       upsertDetail(detail);
       return detail;
     } catch (e) {
-      _error = e instanceof Error ? e.message : String(e);
+      _error = errorMessage(e);
       throw e;
     }
   },
@@ -241,7 +289,7 @@ export const meetingsStore = {
       upsertDetail(detail);
       return detail;
     } catch (e) {
-      _error = e instanceof Error ? e.message : String(e);
+      _error = errorMessage(e);
       throw e;
     }
   },
@@ -257,7 +305,7 @@ export const meetingsStore = {
       upsertDetail(detail);
       return detail;
     } catch (e) {
-      _error = e instanceof Error ? e.message : String(e);
+      _error = errorMessage(e);
       throw e;
     }
   },
@@ -277,7 +325,7 @@ export const meetingsStore = {
         }
       }
     } catch (e) {
-      _error = e instanceof Error ? e.message : String(e);
+      _error = errorMessage(e);
       throw e;
     }
   }

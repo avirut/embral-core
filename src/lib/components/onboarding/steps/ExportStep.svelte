@@ -6,9 +6,12 @@
     import { Button } from "$lib/components/ui/button";
     import SettingRow from "$lib/components/settings/SettingRow.svelte";
     import SettingsGroup from "$lib/components/settings/SettingsGroup.svelte";
+    import { copy } from "$lib/copy";
     import type { OnboardingDraft } from "../types";
 
     let { draft }: { draft: OnboardingDraft } = $props();
+
+    const t = $derived(copy.onboarding.export);
 
     async function pickFolder() {
         const dir = await open({ directory: true });
@@ -21,34 +24,34 @@
     }
 </script>
 
-<h1 class="font-display text-2xl tracking-tight">Connect to your knowledge base</h1>
+<h1 class="font-display text-2xl tracking-tight">{t.title}</h1>
 <p class="mt-3 text-sm text-muted-foreground">
-    Export meeting notes as markdown to a local folder, like an Obsidian vault
+    {t.intro}
 </p>
 
 <div class="mt-6 space-y-4">
     <SettingsGroup>
-        <SettingRow title="Export notes when a recording ends">
+        <SettingRow title={t.exportOnEnd}>
             <Switch bind:checked={draft.obsidian_export_enabled} />
         </SettingRow>
 
         <SettingRow
-            title="Folder"
-            description={draft.obsidian_vault_dir || "No folder chosen yet."}
+            title={t.folder}
+            description={draft.obsidian_vault_dir || t.noFolder}
         >
             <Button variant="outline" size="sm" onclick={pickFolder}>
-                Browse…
+                {t.browse}
             </Button>
         </SettingRow>
 
         {#if draft.obsidian_export_enabled}
-            <SettingRow title="Include the AI summary">
+            <SettingRow title={t.includeSummary}>
                 <Switch bind:checked={draft.export_include_summary} />
             </SettingRow>
-            <SettingRow title="Include your notes">
+            <SettingRow title={t.includeNotes}>
                 <Switch bind:checked={draft.export_include_notes} />
             </SettingRow>
-            <SettingRow title="Include the transcript">
+            <SettingRow title={t.includeTranscript}>
                 <Switch bind:checked={draft.export_include_transcript} />
             </SettingRow>
         {/if}
@@ -56,7 +59,7 @@
         {#if draft.obsidian_export_enabled}
             <div class="px-4 py-3">
                 <p class="text-xs text-muted-foreground">
-                    Adjust filename format in settings
+                    {t.filenameNote}
                 </p>
             </div>
         {/if}

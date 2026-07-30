@@ -3,9 +3,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod error;
+pub use error::AppError;
+
 // --- Core types ---
 
-/// A single meeting in the index.
+/// A single meeting in the index. The summary and transcript documents are
+/// database columns, not files, so the only path here is the audio's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingRecord {
     pub id: String,
@@ -13,9 +17,6 @@ pub struct MeetingRecord {
     pub date: DateTime<Utc>,
     pub duration_seconds: u64,
     pub chunks: u32,
-    pub notes_path: String,
-    #[serde(default, alias = "raw_path")]
-    pub transcript_path: String,
     pub audio_path: String,
 }
 
@@ -37,6 +38,16 @@ impl From<&MeetingRecord> for MeetingSummary {
             duration_seconds: r.duration_seconds,
         }
     }
+}
+
+/// A session-generated numbered speaker label ("Speaker 3") — a per-meeting
+/// placeholder, not a person's name. The naming pass may only rename these,
+/// and adopt-by-name must never treat one as an identity: two meetings'
+/// "Speaker 2" are different people.
+pub fn is_generic_speaker_label(label: &str) -> bool {
+    label
+        .strip_prefix("Speaker ")
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// A single transcription segment from a WebSocket streaming session.
@@ -99,6 +110,23 @@ pub enum CloudOutOfHours {
     /// Stop transcribing. The recording and the user's notes continue; no
     /// transcript is written past the cutoff.
     Disabled,
+}
+
+/// Whether the machine's power source gets a say in who transcribes a
+/// meeting. Plugged in means a desk, which means CPU headroom; on battery
+/// the cloud spends someone else's cycles. A separate field rather than a
+/// third `TranscriptionProvider`, because the provider is a standing choice
+/// the account plumbing writes (adopting cloud at sign-in, reverting at
+/// sign-out) and this is a lens over it.
+#[cfg(feature = "cloud")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerPolicy {
+    /// The power source is nobody's business; `transcription_provider` runs.
+    #[default]
+    Off,
+    /// Cloud while on battery, this device while plugged in.
+    CloudOnBattery,
 }
 
 /// Which transport an LLM profile speaks. `Builtin` is the bundled
@@ -216,6 +244,31 @@ pub enum OpenMeetingTab {
     Transcript,
 }
 
+/// What an unanswered silence check-in does after its grace window.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SilenceUnanswered {
+    /// Stop and finalize the recording (the forgotten-recording guard).
+    #[default]
+    Stop,
+    /// Keep recording; the check-in stands down until speech resumes.
+    Keep,
+}
+
+/// Which recordings stop on their own when the detected call ends.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoStopScope {
+    /// Recordings never stop on call end.
+    Never,
+    /// Only recordings detection started (or the user accepted from the
+    /// detection prompt).
+    #[default]
+    AutoStarted,
+    /// Every recording — a call ending stops whatever is being recorded.
+    All,
+}
+
 /// What embral does when it detects a meeting app using the microphone.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -316,6 +369,12 @@ pub struct AppConfig {
     /// The language meetings and dictation are transcribed in.
     #[serde(default)]
     pub transcription_language: TranscriptionLanguage,
+    /// Cloud-edition only: whether the machine's power source overrides
+    /// `transcription_provider` for meetings. Read once, at
+    /// `start_recording`.
+    #[cfg(feature = "cloud")]
+    #[serde(default)]
+    pub transcription_power_policy: PowerPolicy,
     /// Cloud-edition only: what a cloud recording does when the account's
     /// hours run out mid-meeting.
     #[cfg(feature = "cloud")]
@@ -336,6 +395,12 @@ pub struct AppConfig {
     #[cfg(feature = "cloud")]
     #[serde(default)]
     pub cloud_account_email: String,
+    /// Random per-install id (uuid), minted at first sign-in and never
+    /// cleared — the server dedupes this install's sessions by it (the
+    /// device *name* is display-only; names collide across machines).
+    #[cfg(feature = "cloud")]
+    #[serde(default)]
+    pub cloud_device_id: String,
     pub storage_dir: String,
     pub retain_audio: bool,
     /// Model id from the local engine's catalog (e.g. `zipformer-en`) used by
@@ -406,14 +471,15 @@ pub struct AppConfig {
     pub onboarding_completed: bool,
 
     // --- Telemetry (cloud edition only, [telemetry.md]) ---
-    /// Opt-in usage telemetry. Off by default; the onboarding checkbox and
-    /// the General-settings toggle are the only writers.
+    /// Usage telemetry. On by default in the cloud edition; the onboarding
+    /// checkbox (pre-checked, on the closing page) and the General-settings
+    /// toggle are the only writers — unchecking either opts out.
     #[cfg(feature = "cloud")]
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub telemetry_enabled: bool,
-    /// Persistent per-install id (random UUID): minted when telemetry is
-    /// first enabled, cleared on opt-out — re-enabling mints a fresh one.
-    /// Empty while disabled.
+    /// Persistent per-install id (random UUID): minted at first boot (or
+    /// when telemetry is re-enabled), cleared on opt-out — re-enabling
+    /// mints a fresh one. Empty while disabled.
     #[cfg(feature = "cloud")]
     #[serde(default)]
     pub telemetry_install_id: String,
@@ -433,10 +499,18 @@ pub struct AppConfig {
     /// Consecutive seconds of mic use before detection acts (filters chimes).
     #[serde(default = "default_detection_delay_secs")]
     pub detection_delay_secs: u32,
-    /// Stop auto-started recordings after the call ends. The short settling
+    /// Which recordings stop when the detected call ends. The short settling
     /// delay before that happens is not a setting (see `autodetect`).
-    #[serde(default = "default_true")]
-    pub auto_stop_enabled: bool,
+    #[serde(default)]
+    pub auto_stop: AutoStopScope,
+    /// Minutes without a transcribed word before a recording checks in
+    /// ("Still recording?"); 0 = never. Paused spans and recordings with
+    /// transcription disabled never count as silence.
+    #[serde(default = "default_silence_stop_minutes")]
+    pub silence_stop_minutes: u32,
+    /// What an unanswered check-in does after its fixed two-minute grace.
+    #[serde(default)]
+    pub silence_stop_unanswered: SilenceUnanswered,
     /// Notify when a call is detected (prompt policy).
     #[serde(default = "default_true")]
     pub notify_call_detected: bool,
@@ -537,8 +611,21 @@ fn default_llm_idle_minutes() -> u32 {
     10
 }
 
+/// Default meeting-app allowlist, per platform. Entries are brand tokens
+/// the bidirectional-substring matcher tests against every identity the
+/// platform reports — exe names on Windows (`msedge.exe`), bundle ids and
+/// display names on macOS (`us.zoom.xos`, "Google Chrome"), which is why
+/// the macOS list says "edge"/"safari" where Windows says "msedge".
+#[cfg(windows)]
 fn default_auto_detect_apps() -> Vec<String> {
     ["zoom", "ms-teams", "teams", "chrome", "msedge", "firefox", "slack", "discord", "webex"]
+        .map(String::from)
+        .to_vec()
+}
+
+#[cfg(not(windows))]
+fn default_auto_detect_apps() -> Vec<String> {
+    ["zoom", "teams", "chrome", "edge", "safari", "firefox", "slack", "discord", "webex"]
         .map(String::from)
         .to_vec()
 }
@@ -552,6 +639,10 @@ fn default_summaries_profile_id() -> String {
 
 fn default_export_filename_template() -> String {
     "{date}-{time}-{title}".to_string()
+}
+
+fn default_silence_stop_minutes() -> u32 {
+    5
 }
 
 fn default_true() -> bool {
@@ -640,6 +731,8 @@ impl Default for AppConfig {
             transcription_provider: TranscriptionProvider::default(),
             transcription_language: TranscriptionLanguage::default(),
             #[cfg(feature = "cloud")]
+            transcription_power_policy: PowerPolicy::default(),
+            #[cfg(feature = "cloud")]
             cloud_out_of_hours: CloudOutOfHours::default(),
             #[cfg(feature = "cloud")]
             cloud_api_url: String::new(),
@@ -647,6 +740,8 @@ impl Default for AppConfig {
             cloud_session_token: String::new(),
             #[cfg(feature = "cloud")]
             cloud_account_email: String::new(),
+            #[cfg(feature = "cloud")]
+            cloud_device_id: String::new(),
             storage_dir: default_storage_dir(),
             retain_audio: true,
             local_asr_model: default_local_asr_model(),
@@ -668,7 +763,7 @@ impl Default for AppConfig {
             audio_retention_days: 0,
             onboarding_completed: false,
             #[cfg(feature = "cloud")]
-            telemetry_enabled: false,
+            telemetry_enabled: true,
             #[cfg(feature = "cloud")]
             telemetry_install_id: String::new(),
             #[cfg(feature = "cloud")]
@@ -676,7 +771,9 @@ impl Default for AppConfig {
             auto_start_policy: AutoStartPolicy::default(),
             auto_detect_apps: default_auto_detect_apps(),
             detection_delay_secs: default_detection_delay_secs(),
-            auto_stop_enabled: true,
+            auto_stop: AutoStopScope::default(),
+            silence_stop_minutes: default_silence_stop_minutes(),
+            silence_stop_unanswered: SilenceUnanswered::default(),
             notify_call_detected: true,
             record_hotkey: String::new(),
             sidebar_expanded: false,

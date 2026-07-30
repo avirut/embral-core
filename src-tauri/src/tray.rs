@@ -1,15 +1,13 @@
 //! The tray icon and the running window's taskbar icon. Both carry the bare
-//! embral mark in whichever shade the taskbar needs — white on a dark
-//! taskbar, black on a light one. The shade comes from the Windows
-//! `SystemUsesLightTheme` registry value (the *taskbar* theme; the sibling
-//! `AppsUseLightTheme` is the app theme users set independently), and a
-//! registry watcher refreshes the icons when it changes ([shell.md]). The
-//! installed icon set (Start menu, installer) is static and keeps its dark
-//! tile — only these two runtime surfaces follow the theme.
+//! embral mark in whichever shade the OS shell needs — white on a dark
+//! surface, black on a light one. The shade and the accent come from
+//! `crate::platform::theme_snapshot()`, and the platform's theme watcher
+//! refreshes the icons on change ([shell.md]). The installed icon set
+//! (Start menu, installer) is static and keeps its dark tile — only these
+//! two runtime surfaces follow the theme.
 //!
 //! While recording, the whole tray mark — circle and lines — is tinted at
-//! runtime in the Windows accent color (or the `tray_recording_color`
-//! preset).
+//! runtime in the OS accent color (or the `tray_recording_color` preset).
 
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,15 +26,11 @@ const MARK_WHITE_64: &[u8] = include_bytes!("../icons/mark-white-64.png");
 const MARK_BLACK_64: &[u8] = include_bytes!("../icons/mark-black-64.png");
 const TRAY_SIZE: u32 = 32;
 
-/// Windows' default accent blue — the disc color when the registry read
-/// fails and no override is set.
-const FALLBACK_ACCENT: [u8; 3] = [0x00, 0x78, 0xd4];
-
 /// Whether a recording is running; the refresh derives the tray icon from it.
 static RECORDING: AtomicBool = AtomicBool::new(false);
 
 /// The `tray_recording_color` override, parsed once at config load/save.
-/// `None` = follow the Windows accent color.
+/// `None` = follow the OS accent color.
 static RECORDING_COLOR: Mutex<Option<[u8; 3]>> = Mutex::new(None);
 
 pub fn create_tray(app: &App) -> Result<()> {
@@ -46,17 +40,24 @@ pub fn create_tray(app: &App) -> Result<()> {
 
     let menu = MenuBuilder::new(app).items(&[&show, &sep, &quit]).build()?;
 
-    let idle = if taskbar_is_light() {
-        MARK_BLACK_32
-    } else {
+    // Template platforms recolor the mark from its alpha channel (the
+    // white variant carries the shape); elsewhere the shade tracks the
+    // taskbar theme.
+    let idle = if crate::platform::TRAY_IDLE_IS_TEMPLATE
+        || !crate::platform::theme_snapshot().is_light
+    {
         MARK_WHITE_32
+    } else {
+        MARK_BLACK_32
     };
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(Image::from_bytes(idle)?)
+        .icon_as_template(crate::platform::TRAY_IDLE_IS_TEMPLATE)
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
                 if let Some(w) = app.get_webview_window("main") {
+                    crate::window_rescue::ensure_on_screen(&w);
                     let _ = w.show();
                     let _ = w.set_focus();
                 }
@@ -76,6 +77,7 @@ pub fn create_tray(app: &App) -> Result<()> {
                     if w.is_visible().unwrap_or(false) {
                         let _ = w.hide();
                     } else {
+                        crate::window_rescue::ensure_on_screen(&w);
                         let _ = w.show();
                         let _ = w.set_focus();
                     }
@@ -85,7 +87,13 @@ pub fn create_tray(app: &App) -> Result<()> {
         .build(app)?;
 
     refresh(app.handle())?;
-    watch_theme(app.handle().clone());
+    // Failure inside the watcher degrades to startup-time icons.
+    let handle = app.handle().clone();
+    crate::platform::watch_theme(Box::new(move || {
+        if let Err(e) = refresh(&handle) {
+            tracing::warn!("tray theme watcher: refresh failed: {e}");
+        }
+    }));
     Ok(())
 }
 
@@ -105,15 +113,19 @@ pub fn set_recording_color(hex: &str) {
 /// from the shade alone. The window may not exist yet during setup —
 /// skipped, and the next refresh catches it.
 pub fn refresh(app: &AppHandle) -> Result<()> {
-    let light = taskbar_is_light();
-    let tray_icon = if RECORDING.load(Ordering::Relaxed) {
+    let light = crate::platform::theme_snapshot().is_light;
+    let recording = RECORDING.load(Ordering::Relaxed);
+    let tray_icon = if recording {
         recording_icon()?
-    } else if light {
-        Image::from_bytes(MARK_BLACK_32)?
-    } else {
+    } else if crate::platform::TRAY_IDLE_IS_TEMPLATE || !light {
         Image::from_bytes(MARK_WHITE_32)?
+    } else {
+        Image::from_bytes(MARK_BLACK_32)?
     };
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        // The recording tint must keep its accent color, so template mode
+        // pauses for it and resumes for the idle mark.
+        let _ = tray.set_icon_as_template(crate::platform::TRAY_IDLE_IS_TEMPLATE && !recording);
         tray.set_icon(Some(tray_icon))?;
     }
     let window_bytes = if light { MARK_BLACK_64 } else { MARK_WHITE_64 };
@@ -123,11 +135,11 @@ pub fn refresh(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// The current Windows accent color as `#RRGGBB` — the swatch beside the
-/// "Windows accent" choice in settings.
+/// The current OS accent color as `#RRGGBB` — the swatch beside the
+/// system-accent choice in settings.
 #[tauri::command]
 pub fn system_accent_color() -> String {
-    let [r, g, b] = accent_color();
+    let [r, g, b] = crate::platform::theme_snapshot().accent_rgb;
     format!("#{r:02x}{g:02x}{b:02x}")
 }
 
@@ -137,7 +149,7 @@ fn recording_icon() -> Result<Image<'static>> {
     let color = RECORDING_COLOR
         .lock()
         .unwrap()
-        .unwrap_or_else(accent_color);
+        .unwrap_or_else(|| crate::platform::theme_snapshot().accent_rgb);
     let mark = Image::from_bytes(MARK_WHITE_32)?;
     let buf = tint(mark.rgba(), color);
     Ok(Image::new_owned(buf, TRAY_SIZE, TRAY_SIZE))
@@ -165,138 +177,6 @@ fn tint(rgba: &[u8], rgb: [u8; 3]) -> Vec<u8> {
     out
 }
 
-/// The DWM `AccentColor` value is ABGR (`0xAABBGGRR`).
-fn accent_to_rgb(abgr: u32) -> [u8; 3] {
-    [abgr as u8, (abgr >> 8) as u8, (abgr >> 16) as u8]
-}
-
-/// Whether the taskbar is light (missing value = dark, the Windows default).
-#[cfg(windows)]
-fn taskbar_is_light() -> bool {
-    read_hkcu_dword(
-        windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-        windows::core::w!("SystemUsesLightTheme"),
-    ) == Some(1)
-}
-
-#[cfg(not(windows))]
-fn taskbar_is_light() -> bool {
-    false
-}
-
-/// The user's Windows accent color; the stock blue when unreadable.
-#[cfg(windows)]
-fn accent_color() -> [u8; 3] {
-    read_hkcu_dword(
-        windows::core::w!("Software\\Microsoft\\Windows\\DWM"),
-        windows::core::w!("AccentColor"),
-    )
-    .map(accent_to_rgb)
-    .unwrap_or(FALLBACK_ACCENT)
-}
-
-#[cfg(not(windows))]
-fn accent_color() -> [u8; 3] {
-    FALLBACK_ACCENT
-}
-
-#[cfg(windows)]
-fn read_hkcu_dword(
-    subkey: windows::core::PCWSTR,
-    value: windows::core::PCWSTR,
-) -> Option<u32> {
-    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-
-    let mut data: u32 = 0;
-    let mut size = std::mem::size_of::<u32>() as u32;
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            subkey,
-            value,
-            RRF_RT_REG_DWORD,
-            None,
-            Some(&mut data as *mut u32 as *mut core::ffi::c_void),
-            Some(&mut size),
-        )
-    };
-    status.is_ok().then_some(data)
-}
-
-/// Refresh the icons whenever the taskbar theme or accent color key changes.
-/// Registry notifications are one-shot, so the fired registration is
-/// re-armed after each wake. Failure to set the watcher up leaves the icons
-/// correct for the values read at startup — degraded, not broken.
-#[cfg(windows)]
-fn watch_theme(app: AppHandle) {
-    use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-    use windows::Win32::System::Registry::{
-        RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_NOTIFY,
-        REG_NOTIFY_CHANGE_LAST_SET,
-    };
-    use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects, INFINITE};
-
-    std::thread::spawn(move || {
-        let paths = [
-            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("Software\\Microsoft\\Windows\\DWM"),
-        ];
-        let mut keys = [HKEY::default(); 2];
-        let mut events = [HANDLE::default(); 2];
-        for i in 0..2 {
-            let opened = unsafe {
-                RegOpenKeyExW(HKEY_CURRENT_USER, paths[i], Some(0), KEY_NOTIFY, &mut keys[i])
-            };
-            if opened.is_err() {
-                tracing::warn!("tray theme watcher: failed to open a registry key");
-                return;
-            }
-            match unsafe { CreateEventW(None, false, false, PCWSTR::null()) } {
-                Ok(e) => events[i] = e,
-                Err(_) => {
-                    tracing::warn!("tray theme watcher: failed to create a wait event");
-                    return;
-                }
-            }
-        }
-        let arm = |i: usize| -> bool {
-            unsafe {
-                RegNotifyChangeKeyValue(
-                    keys[i],
-                    false,
-                    REG_NOTIFY_CHANGE_LAST_SET,
-                    Some(events[i]),
-                    true,
-                )
-            }
-            .is_ok()
-        };
-        if !arm(0) || !arm(1) {
-            tracing::warn!("tray theme watcher: failed to arm the notifications");
-            return;
-        }
-        loop {
-            let wait = unsafe { WaitForMultipleObjects(&events, false, INFINITE) };
-            let idx = wait.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
-            if idx >= events.len() {
-                tracing::warn!("tray theme watcher: wait failed, stopping");
-                return;
-            }
-            if let Err(e) = refresh(&app) {
-                tracing::warn!("tray theme watcher: refresh failed: {e}");
-            }
-            if !arm(idx) {
-                tracing::warn!("tray theme watcher: failed to re-arm, stopping");
-                return;
-            }
-        }
-    });
-}
-
-#[cfg(not(windows))]
-fn watch_theme(_app: AppHandle) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,12 +189,6 @@ mod tests {
         assert_eq!(parse_hex("cc0000"), None);
         assert_eq!(parse_hex("#cc00"), None);
         assert_eq!(parse_hex("#zzzzzz"), None);
-    }
-
-    #[test]
-    fn accent_dword_is_abgr() {
-        // 0xAABBGGRR: alpha ff, blue d4, green 78, red 00 — Windows blue.
-        assert_eq!(accent_to_rgb(0xffd4_7800), [0x00, 0x78, 0xd4]);
     }
 
     #[test]

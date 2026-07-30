@@ -11,6 +11,12 @@ vite.config.ts.timestamp-*
 
 # Rust (the desktop app)
 /target/
+# The cloud edition's dev build, beside `target/` at the workspace root.
+# Its own directory on purpose: the feature set differs, so sharing
+# `target/` with the offline build made every switch between
+# `pnpm tauri dev` and `pnpm dev:cloud` a full workspace rebuild at 100%
+# CPU. Unanchored, so a stray copy under src-tauri/ is ignored too.
+target-cloud/
 # Build artifacts (.mcpb staging + bundle)
 /dist/
 

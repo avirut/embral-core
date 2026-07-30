@@ -6,6 +6,9 @@
   import ResizableSplit from './ResizableSplit.svelte';
   import ConfirmDialog from './ConfirmDialog.svelte';
   import { meetingsStore, PENDING_MEETING_ID } from '$lib/stores/meetings.svelte';
+  import { copy } from '$lib/copy';
+
+  const t = $derived(copy.meetings);
 
   type MobilePanel = 'list' | 'detail';
 
@@ -84,7 +87,7 @@
     dividerClass="hidden min-[960px]:block"
   >
     {#snippet left()}
-      <MeetingList onSelect={showDetail} />
+      <MeetingList onSelect={showDetail} onDelete={() => (confirmDelete = true)} />
     {/snippet}
     {#snippet right()}
       {#if multi}
@@ -92,7 +95,7 @@
              says what is selected and what can be done with it. -->
         <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-8">
           <p class="text-sm text-muted-foreground">
-            {selection.count} meetings selected
+            {t.multiSelect.selected(selection.count)}
           </p>
           <button
             onclick={() => (confirmDelete = true)}
@@ -100,9 +103,9 @@
             class="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm font-medium transition-colors hover:bg-destructive hover:text-white disabled:opacity-50"
           >
             <Trash2 size={15} />
-            Delete {count}
+            {t.multiSelect.delete(count)}
           </button>
-          <p class="text-xs text-muted-foreground">Or press Delete.</p>
+          <p class="text-xs text-muted-foreground">{t.multiSelect.hint}</p>
         </div>
       {:else}
         <MeetingDetail showBack={mobilePanel === 'detail'} onBack={showList} />
@@ -113,11 +116,9 @@
 
 <ConfirmDialog
   bind:open={confirmDelete}
-  title={count === 1 ? 'Delete meeting?' : `Delete ${count} meetings?`}
-  body={count === 1
-    ? 'Deleting this meeting will permanently delete its notes, transcript, and audio.'
-    : `Deleting these ${count} meetings will permanently delete their notes, transcripts, and audio.`}
-  confirmLabel={count === 1 ? 'Delete' : `Delete ${count}`}
+  title={t.deleteConfirm.title(count)}
+  body={t.deleteConfirm.body(count)}
+  confirmLabel={t.deleteConfirm.confirm(count)}
   busy={deleting}
   onConfirm={deleteSelected}
 />

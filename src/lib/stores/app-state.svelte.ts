@@ -4,6 +4,7 @@ import type {
   ProviderCapabilities,
   TranscriptionSegment
 } from '$lib/types';
+import { copy } from '$lib/copy';
 
 export type AppView =
   | 'idle'
@@ -35,7 +36,6 @@ export interface PendingMeeting {
   /** The encoded MP3, as soon as finalize produces it (playable well
    * before the notes finish). */
   audioPath: string | null;
-  stage: 'transcript' | 'notes';
   error: string | null;
 }
 
@@ -76,10 +76,28 @@ export interface StarredMoment {
 let _stars = $state<StarredMoment[]>([]);
 let _nextStarId = 1;
 let _recordingSnapshotProvider:
-  | (() => { notes: string; starBlocks: Map<number, number> })
+  | (() => { notes: string; title: string; starBlocks: Map<number, number> })
   | null = null;
 let _processingStep = $state<ProcessingStep>(null);
 let _error = $state<string | null>(null);
+// The silence check-in ("Still recording?"): minutes without speech, or
+// null when no check-in is up.
+let _silenceNoticeMinutes = $state<number | null>(null);
+// Shadow mode: the user has asked the screen to stop announcing that a
+// meeting is being recorded. Its own control, deliberately not tied to
+// the transcript being shut — collapsing a pane for room is not the same
+// request as going quiet. Per-recording, never remembered: a recording
+// that starts with no visible indication because of a choice made weeks
+// ago is a trap, and the tray staying lit is not enough on its own.
+let _shadowMode = $state(false);
+// Whether the running recording is labeling speakers. Mirrors the
+// backend's per-recording flag, which starts from the setting and can be
+// stood down by the header toggle or the runaway guard.
+let _liveDiarization = $state(true);
+// Which of the two stood it down. The header note names the reason,
+// because "the app found too many voices" is news to the reader, while
+// "you turned this off" is not.
+let _diarizationRunaway = $state(false);
 // Mid-recording provider swap notice (cloud -> local); shown as a quiet
 // banner in the recording view, cleared when the next recording starts.
 let _fallbackNotice = $state<string | null>(null);
@@ -180,10 +198,16 @@ export const appState = {
   startRecordingClock(startedAt: number) {
     _recordingStartedAt = startedAt;
     _recordingEndedAt = null;
+    // A recording stopped while paused leaves the flag set; every new
+    // recording starts unpaused (the backend's recorder always does).
+    _isPaused = false;
     _pausedAccumMs = 0;
     _pausedSince = null;
     _levelBands = { mic: [], system: [] };
     _stars = [];
+    // Every recording starts announcing itself; going quiet is a choice
+    // made about the meeting in front of you, not a standing setting.
+    _shadowMode = false;
   },
   get stars() {
     return _stars;
@@ -199,13 +223,18 @@ export const appState = {
     if (star) _stars = _stars.filter((s) => s.id !== id);
     return star;
   },
-  /** The live notes text and each star's notes position, supplied by the
-   * page that owns the notes editor and read at stop (before the recording
-   * view unmounts). */
+  /** The live notes text, title draft, and each star's notes position,
+   * supplied by the page that owns the notes editor and read at stop
+   * (before the recording view unmounts). */
   setRecordingSnapshotProvider(
-    fn: (() => { notes: string; starBlocks: Map<number, number> }) | null
+    fn: (() => { notes: string; title: string; starBlocks: Map<number, number> }) | null
   ) {
     _recordingSnapshotProvider = fn;
+  },
+  /** The current drafts, for stops the backend initiates (auto-stop,
+   * silence) — the stop must carry them exactly like the stop button does. */
+  recordingSnapshot() {
+    return _recordingSnapshotProvider?.() ?? null;
   },
   collectStarAnchors(): { seconds: number; note_block: number | null }[] {
     const blocks = _recordingSnapshotProvider?.().starBlocks ?? new Map<number, number>();
@@ -242,6 +271,48 @@ export const appState = {
       _pausedSince = null;
     }
   },
+  /** Wholesale adoption of the backend's accumulated segments — the
+   * focus-time reconcile (`recording_status`) replays what a hidden
+   * window's dropped events would have built. */
+  replaceSegments(segments: TranscriptionSegment[]) {
+    _segments = [...segments];
+  },
+  /** **Shadow mode**: the user asked the screen to stop saying a meeting
+   * is being recorded. Only meaningful while one is — the indicators it
+   * suppresses don't exist otherwise. */
+  get shadowMode() {
+    return _isRecording && _shadowMode;
+  },
+  setShadowMode(v: boolean) {
+    _shadowMode = v;
+  },
+  /** Speaker labeling for the running recording (the transcript header's
+   * toggle, or the backend's runaway guard standing it down). */
+  get liveDiarization() {
+    return _liveDiarization;
+  },
+  setLiveDiarization(on: boolean) {
+    _liveDiarization = on;
+    // Any deliberate flip — the header toggle, or the reconcile adopting
+    // the backend's flag — is no longer the guard's doing.
+    _diarizationRunaway = false;
+  },
+  /** The runaway guard stood labeling down: more voices than a meeting
+   * plausibly has, so the labels were not believable ([speakers.md]). */
+  standDownDiarization() {
+    _liveDiarization = false;
+    _diarizationRunaway = true;
+  },
+  /** True only while labeling is off *because* of the guard. */
+  get diarizationRunaway() {
+    return _diarizationRunaway;
+  },
+  /** Drop the labels from what is already on screen — the backend has done
+   * the same to its accumulator, and a half-labeled transcript reads as
+   * the app having lost track of who is talking. */
+  stripSpeakers() {
+    _segments = _segments.map((s) => ({ ...s, speaker: null, speaker_id: undefined }));
+  },
   addSegment(s: TranscriptionSegment) {
     _segments = [..._segments, s];
     // Single-stream: a finalized segment always supersedes the live preview.
@@ -269,7 +340,7 @@ export const appState = {
     const snapshot = _recordingSnapshotProvider?.();
     const blocks = snapshot?.starBlocks ?? new Map<number, number>();
     _pendingMeeting = {
-      title: _pendingTitleHint ?? 'New meeting',
+      title: _pendingTitleHint ?? copy.meetings.newMeetingTitle,
       durationSeconds: this.elapsedSeconds(),
       endedAt: Date.now(),
       segments: [..._segments],
@@ -279,16 +350,12 @@ export const appState = {
       })),
       userNotes: snapshot?.notes ?? '',
       audioPath: null,
-      stage: 'transcript',
       error: null
     };
     _pendingTitleHint = null;
   },
   setPendingAudioPath(path: string) {
     if (_pendingMeeting) _pendingMeeting = { ..._pendingMeeting, audioPath: path };
-  },
-  setPendingStage(stage: PendingMeeting['stage']) {
-    if (_pendingMeeting) _pendingMeeting = { ..._pendingMeeting, stage };
   },
   setPendingError(error: string) {
     if (_pendingMeeting) _pendingMeeting = { ..._pendingMeeting, error };
@@ -325,6 +392,12 @@ export const appState = {
   get fallbackNotice() {
     return _fallbackNotice;
   },
+  setSilenceNotice(minutes: number | null) {
+    _silenceNoticeMinutes = minutes;
+  },
+  get silenceNoticeMinutes() {
+    return _silenceNoticeMinutes;
+  },
   setImporting(v: boolean) {
     _isImporting = v;
     if (!v) _importFraction = null;
@@ -341,6 +414,7 @@ export const appState = {
     _providerCapabilities = null;
     _processingStep = null;
     _error = null;
+    _silenceNoticeMinutes = null;
     _isImporting = false;
     _importFraction = null;
     _recordingStartedAt = null;

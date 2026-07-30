@@ -9,6 +9,10 @@ mod hotkey;
 mod llm;
 mod mcp_clients;
 mod notes_matching;
+mod notice;
+mod ocr;
+mod platform;
+mod recovery;
 mod refinement;
 mod search_index;
 mod speaker_commands;
@@ -18,6 +22,7 @@ mod system_specs;
 mod telemetry;
 mod transcription;
 mod tray;
+mod window_rescue;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -57,7 +62,16 @@ pub struct AppState {
     /// snapshotted at start so `stop_recording` can tell the finalize
     /// pipeline whether provider labels must be kept or re-diarized.
     pub labels_authoritative: std::sync::atomic::AtomicBool,
-    /// Live speaker renames (pill edits during the recording): old label →
+    /// Whether *this recording* is labeling speakers. Starts from
+    /// `diarization_enabled` and can go false mid-recording — the
+    /// transcript header's toggle, or the runaway guard when the clusterer
+    /// keeps inventing people ([speakers.md]). It is the flag finalize
+    /// honors, not the config field.
+    pub live_diarization: std::sync::atomic::AtomicBool,
+    /// Distinct speaker labels this recording has produced, which is what
+    /// the runaway guard counts. Cleared at start.
+    pub live_speaker_labels: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Live speaker renames (label edits during the recording): old label →
     /// user-given name. Applied to already-accumulated segments when set and
     /// to every later segment by the event forwarder; cleared at start.
     pub live_label_renames:
@@ -72,6 +86,26 @@ pub struct AppState {
     /// True after the user dismissed the "call detected" prompt; suppresses
     /// re-prompting until the current call ends.
     pub detection_dismissed: std::sync::atomic::AtomicBool,
+    /// The source picker's choices for the running recording, re-read by
+    /// the capture threads on every tick. Reset to the defaults at start:
+    /// everything the machine plays, and the configured mic alone.
+    pub system_audio_wanted: std::sync::Mutex<platform::types::SystemAudioWanted>,
+    pub extra_mics: std::sync::Mutex<Vec<String>>,
+    /// The frontend's notes/title drafts, mirrored (debounced) during a
+    /// recording so a stop the frontend never answers — the handshake
+    /// fallback — still saves the human's words. Cleared at start.
+    pub recording_drafts: std::sync::Mutex<Option<(String, String)>>,
+    /// Epoch-ms the current recording started — `recording_status`'s clock
+    /// source, so a window that missed `recording-started` (hidden webviews
+    /// get throttled and drop events) can rebuild the timer on focus.
+    pub recording_started_at_ms: std::sync::atomic::AtomicU64,
+    /// Epoch-ms of the current recording's last transcribed segment — the
+    /// silence check-in's clock ([detection.md]). Rebaselined at start, on
+    /// resume, and by "Keep recording".
+    pub last_speech_at: std::sync::atomic::AtomicU64,
+    /// The silence check-in's standing: 0 = none showing, `u64::MAX` =
+    /// stood down until speech resumes, else the epoch-ms it fired.
+    pub silence_notice_at: std::sync::atomic::AtomicU64,
     /// The built-in LLM child process (llama-server), started on demand.
     pub llm: llm::LlmSidecar,
     /// The search-index runtime: the embed child process (`embral-mcp
@@ -104,10 +138,20 @@ impl AppState {
             importing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auto_started: std::sync::atomic::AtomicBool::new(false),
             labels_authoritative: std::sync::atomic::AtomicBool::new(false),
+            live_diarization: std::sync::atomic::AtomicBool::new(false),
+            live_speaker_labels: std::sync::Mutex::new(std::collections::HashSet::new()),
             live_label_renames: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             stars: tokio::sync::Mutex::new(Vec::new()),
             star_anchors: tokio::sync::Mutex::new(Vec::new()),
             detection_dismissed: std::sync::atomic::AtomicBool::new(false),
+            system_audio_wanted: std::sync::Mutex::new(
+                platform::types::SystemAudioWanted::default(),
+            ),
+            extra_mics: std::sync::Mutex::new(Vec::new()),
+            recording_drafts: std::sync::Mutex::new(None),
+            recording_started_at_ms: std::sync::atomic::AtomicU64::new(0),
+            last_speech_at: std::sync::atomic::AtomicU64::new(0),
+            silence_notice_at: std::sync::atomic::AtomicU64::new(0),
             llm: llm::LlmSidecar::default(),
             search: search_index::SearchRuntime::default(),
             dictation: tokio::sync::Mutex::new(None),
@@ -152,45 +196,13 @@ pub fn logs_dir() -> std::path::PathBuf {
         .join("logs")
 }
 
-/// Put this process in a Windows job object that kills every child when the
-/// process dies — *however* it dies. A clean quit already stops the sidecars
-/// (`RunEvent::Exit`), but a dev-loop rebuild, a crash, or a task-manager
-/// kill skips that path and used to orphan `llama-server.exe`, which then
-/// held its own files open and made every re-download fail with "access
-/// denied" (the NTFS delete-pending trap).
-#[cfg(windows)]
-fn kill_children_with_us() {
-    use windows::core::PCWSTR;
-    use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-    use windows::Win32::System::Threading::GetCurrentProcess;
-
-    unsafe {
-        let Ok(job) = CreateJobObjectW(None, PCWSTR::null()) else {
-            tracing::warn!("failed to create the child-process job object");
-            return;
-        };
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let set = SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        );
-        if set.is_err() || AssignProcessToJobObject(job, GetCurrentProcess()).is_err() {
-            tracing::warn!("failed to arm the child-process job object");
-        }
-        // The job handle is deliberately never closed: it closes when this
-        // process exits, and that close is what takes the children down.
-    }
+/// The `--child-reaper` subprocess body (see `platform::supervisor`).
+/// A no-op on Windows, where the job object covers orphan cleanup and the
+/// flag is never passed.
+pub fn run_child_reaper() {
+    #[cfg(target_os = "macos")]
+    platform::supervisor::run_reaper();
 }
-
-#[cfg(not(windows))]
-fn kill_children_with_us() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -231,12 +243,19 @@ pub fn run() {
         version = env!("CARGO_PKG_VERSION"),
         "embral starting"
     );
-    kill_children_with_us();
-    let config = config::load_config().unwrap_or_default();
+    platform::kill_children_with_us();
+    // A corrupt config.json is backed up + logged inside load_config; this
+    // arm only fires on I/O failures, and those deserve a trace too.
+    let config = config::load_config().unwrap_or_else(|e| {
+        tracing::error!("config.json unreadable ({e}); using defaults");
+        embral_types::AppConfig::default()
+    });
     tray::set_recording_color(&config.tray_recording_color);
-    // Read before the config moves into the app state: setup() needs it to
-    // decide whether this launch opens the window (see below).
+    // Read before the config moves into the app state: setup() needs these to
+    // decide whether this launch opens the window (see below) and which
+    // directory the webview may load files from.
     let needs_onboarding = !config.onboarding_completed;
+    let startup_storage_dir = config.storage_dir.clone();
 
     tauri::Builder::default()
         // Registered first, so a second launch bails out before any heavy
@@ -245,16 +264,26 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.unminimize();
+                window_rescue::ensure_on_screen(&w);
                 let _ = w.show();
                 let _ = w.set_focus();
             }
         }))
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin({
+            use tauri_plugin_window_state::StateFlags;
+            // VISIBLE is excluded: the plugin's restore would show+focus the
+            // window, fighting the start-hidden design below. The dictation
+            // overlay re-derives its own geometry on every show and must
+            // never be shown or focused by the plugin.
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
+                .with_denylist(&["dictation", "notice"])
+                .build()
+        })
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -270,6 +299,13 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // Before anything renders: the webview cannot load audio (or
+            // note images) out of a storage dir the asset scope doesn't
+            // cover, and the dir is a free-form picker.
+            storage::allow_asset_access(
+                app.handle(),
+                &storage::storage_base(&startup_storage_dir),
+            );
             tray::create_tray(app)?;
             // The app lives in the tray: launches land there rather than
             // opening the window (users open it from the tray icon), and
@@ -279,6 +315,10 @@ pub fn run() {
             // closing" box lands on the setup wizard instead of a silent
             // tray icon. The frontend already gates on the same flag.
             if let Some(w) = app.get_webview_window("main") {
+                // The state plugin restored geometry at window-ready (before
+                // this closure); repair it if the monitors changed since it
+                // was saved.
+                window_rescue::ensure_on_screen(&w);
                 if needs_onboarding {
                     let _ = w.show();
                     let _ = w.set_focus();
@@ -320,6 +360,14 @@ pub fn run() {
                                 storage::storage_base(&config.storage_dir),
                             )
                         };
+                        // Orphaned asset directories are residue, not a
+                        // retention policy, so this runs whatever the
+                        // retention settings say.
+                        if let Ok(db) = state.db().await {
+                            if let Err(e) = storage::prune_orphan_assets(&db, &base) {
+                                tracing::warn!("asset janitor failed: {e}");
+                            }
+                        }
                         if days > 0 || meeting_days > 0 || dictation_days > 0 || dictation_count > 0 {
                             match state.db().await {
                                 Ok(db) => {
@@ -392,18 +440,35 @@ pub fn run() {
                     }
                 });
             }
+            // A recording the last run never finished: turn it into an
+            // ordinary meeting, or discard it if it barely started. Runs
+            // before detection can start a new one, which would clear the
+            // scratch it reads ([recording.md] §Crash recovery).
+            commands::recover_interrupted_recording(app.handle().clone());
             // Meeting auto-detection poller (policy-gated internally).
             autodetect::spawn(app.handle().clone());
             // Search-index worker: backfills chunks at boot, embeds pending
             // passages whenever a mutation pings it.
             search_index::spawn_worker(app.handle().clone());
-            // Opt-in telemetry (cloud edition only): mirror the flag, start
-            // the flusher, count the launch, and fire the daily config
-            // snapshot when due.
+            // Telemetry (cloud edition only, on by default until opted
+            // out): mirror the flag, start the flusher, count the launch,
+            // and fire the daily config snapshot when due.
             #[cfg(feature = "cloud")]
             {
                 let state = app.state::<AppState>();
-                let enabled = state.config.blocking_lock().telemetry_enabled;
+                let enabled = {
+                    let mut config = state.config.blocking_lock();
+                    // Default-on means the id must exist before the first
+                    // flush — a first boot mints it here; opt-out clears
+                    // it and re-enabling mints a fresh one (save_config).
+                    if config.telemetry_enabled && config.telemetry_install_id.is_empty() {
+                        config.telemetry_install_id = uuid::Uuid::new_v4().to_string();
+                        if let Err(e) = config::save_config(&config) {
+                            tracing::warn!("failed to persist telemetry install id: {e}");
+                        }
+                    }
+                    config.telemetry_enabled
+                };
                 state
                     .telemetry
                     .enabled
@@ -450,7 +515,19 @@ macro_rules! app_handler_with {
             commands::start_recording,
             commands::pause_recording,
             commands::resume_recording,
+            commands::silence_keep_recording,
+            commands::sync_recording_drafts,
+            commands::request_stop_recording,
+            commands::recording_status,
+            commands::list_audio_sources,
+            commands::set_system_audio_sources,
+            commands::set_extra_mics,
+            notice::notify,
+            notice::hide_notice,
+            notice::current_notice,
+            notice::open_from_notice,
             commands::rename_live_speaker,
+            commands::set_live_diarization,
             commands::star_moment,
             commands::unstar_moment,
             commands::set_star_anchors,
@@ -463,7 +540,10 @@ macro_rules! app_handler_with {
             commands::get_meeting,
             commands::get_meeting_detail,
             commands::update_meeting_title,
+            commands::update_meeting_summary,
             commands::update_meeting_notes,
+            commands::save_note_asset,
+            commands::storage_root,
             commands::update_meeting_transcript,
             commands::delete_meeting,
             commands::delete_meetings,
@@ -472,6 +552,10 @@ macro_rules! app_handler_with {
             commands::save_config,
             commands::open_notes_folder,
             commands::list_audio_devices,
+            commands::mic_permission,
+            commands::request_mic_permission,
+            commands::accessibility_permission,
+            commands::request_accessibility_permission,
             commands::preview_export_filename,
             commands::open_logs_folder,
             commands::update_guard,
@@ -495,6 +579,9 @@ macro_rules! app_handler_with {
             speaker_commands::upsert_speaker,
             speaker_commands::delete_speaker,
             speaker_commands::delete_speakers,
+            speaker_commands::merge_speakers,
+            speaker_commands::speaker_meetings,
+            speaker_commands::speaker_segments,
             speaker_commands::confirm_name_suggestion,
             speaker_commands::dismiss_name_suggestion,
             speaker_commands::edit_segments,

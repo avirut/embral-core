@@ -7,30 +7,35 @@
     import { Button } from "$lib/components/ui/button";
     import SettingRow from "$lib/components/settings/SettingRow.svelte";
     import SettingsGroup from "$lib/components/settings/SettingsGroup.svelte";
+    import MicAccess from "$lib/components/settings/MicAccess.svelte";
     import HotkeyCapture from "$lib/components/settings/HotkeyCapture.svelte";
     import { modelsStore } from "$lib/stores/models.svelte";
     import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
     import { CLOUD_ENABLED } from "$lib/cloud";
     import type { AutoStartPolicy } from "$lib/types";
     import { BUILTIN_PROFILE_ID, CLOUD_PROFILE_ID } from "$lib/types";
+    import { copy } from "$lib/copy";
     import type { OnboardingDraft } from "../types";
 
     let { draft }: { draft: OnboardingDraft } = $props();
 
-    const policyOptions: { value: AutoStartPolicy; label: string }[] = [
-        { value: "always", label: "Automatically" },
-        { value: "prompt", label: "After asking" },
-        { value: "manual", label: "Never" },
-    ];
+    const t = $derived(copy.onboarding.meetings);
+    const providers = $derived(copy.common.providers);
+
+    let policyOptions: { value: AutoStartPolicy; label: string }[] = $derived([
+        { value: "always", label: t.autoStartOptions.always },
+        { value: "prompt", label: t.autoStartOptions.prompt },
+        { value: "manual", label: t.autoStartOptions.manual },
+    ]);
     let policyLabel = $derived(
         policyOptions.find((o) => o.value === draft.auto_start_policy)?.label ??
-            "After asking",
+            t.autoStartOptions.prompt,
     );
 
     let engineLabel = $derived(
         draft.summaries_profile_id === CLOUD_PROFILE_ID
-            ? "embral cloud"
-            : "local model",
+            ? providers.cloud
+            : providers.localModel,
     );
 
     // The summaries-on/no-model dead end: engine is on-device but the LLM
@@ -52,14 +57,15 @@
     );
 </script>
 
-<h1 class="font-display text-2xl tracking-tight">Meetings</h1>
+<h1 class="font-display text-2xl tracking-tight">{t.title}</h1>
 <p class="mt-3 text-sm text-muted-foreground">
-    All options can be adjusted later in Settings
+    {t.intro}
 </p>
 
 <div class="mt-6 space-y-4">
+    <MicAccess />
     <SettingsGroup>
-        <SettingRow title="When a call is detected, start recording…">
+        <SettingRow title={t.autoStart}>
             <Select.Root
                 type="single"
                 value={draft.auto_start_policy}
@@ -75,12 +81,12 @@
             </Select.Root>
         </SettingRow>
 
-        <SettingRow title="Summarize meetings">
+        <SettingRow title={t.summarize}>
             <Switch bind:checked={draft.summaries_enabled} />
         </SettingRow>
 
         {#if draft.summaries_enabled}
-            <SettingRow title="Write summaries with">
+            <SettingRow title={t.engine}>
                 <Select.Root
                     type="single"
                     value={draft.summaries_profile_id}
@@ -94,16 +100,16 @@
                     <Select.Trigger class="w-44">{engineLabel}</Select.Trigger>
                     <Select.Content>
                         {#if CLOUD_ENABLED}
-                            <Select.Item value={CLOUD_PROFILE_ID} label="embral cloud" />
+                            <Select.Item value={CLOUD_PROFILE_ID} label={providers.cloud} />
                         {/if}
-                        <Select.Item value={BUILTIN_PROFILE_ID} label="local model" />
+                        <Select.Item value={BUILTIN_PROFILE_ID} label={providers.localModel} />
                     </Select.Content>
                 </Select.Root>
             </SettingRow>
             {#if needsLlmNudge}
                 <div class="flex items-center justify-between gap-3 px-4 py-3">
                     <p class="text-xs text-muted-foreground">
-                        On-device summaries need the language model.
+                        {t.llmNudge}
                     </p>
                     <Button
                         variant="outline"
@@ -113,19 +119,16 @@
                             void modelsStore.download("qwen3-4b");
                         }}
                     >
-                        Download
+                        {t.download}
                     </Button>
                 </div>
             {/if}
         {/if}
 
-        <SettingRow
-            title="Recording hotkey"
-            description="Start or stop from anywhere."
-        >
+        <SettingRow title={t.hotkey} description={t.hotkeySub}>
             <HotkeyCapture
                 value={draft.record_hotkey}
-                ariaLabel="Record hotkey"
+                ariaLabel={t.hotkeyAria}
                 onChange={(combo) => (draft.record_hotkey = combo)}
             />
         </SettingRow>

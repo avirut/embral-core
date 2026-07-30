@@ -9,8 +9,9 @@ use tauri::State;
 
 use crate::commands::{
     fallback_duration_minutes, format_transcript_document, meeting_detail, require_row,
-    write_indexed_text, MeetingDetail,
+    MeetingDetail,
 };
+use embral_types::AppError;
 use crate::AppState;
 
 // --- Payloads ---------------------------------------------------------------
@@ -34,6 +35,16 @@ pub struct SpeakerProfile {
 pub struct NameSuggestionView {
     pub label: String,
     pub name: String,
+}
+
+/// One meeting a person spoke in — a row of the profile pane's record.
+#[derive(serde::Serialize)]
+pub struct SpeakerMeeting {
+    pub meeting_id: String,
+    pub title: String,
+    /// RFC3339.
+    pub started_at: String,
+    pub segment_count: i64,
 }
 
 /// One transcript edit operation.
@@ -72,7 +83,7 @@ pub(crate) enum AttendeeFix<'a> {
 pub(crate) fn name_suggestion_views(
     db: &Db,
     meeting_id: &str,
-) -> Result<Vec<NameSuggestionView>, String> {
+) -> Result<Vec<NameSuggestionView>, AppError> {
     Ok(load_name_suggestions(db, meeting_id)?
         .into_iter()
         .map(|s| NameSuggestionView {
@@ -85,7 +96,7 @@ pub(crate) fn name_suggestion_views(
 fn load_name_suggestions(
     db: &Db,
     meeting_id: &str,
-) -> Result<Vec<crate::notes_matching::NameSuggestion>, String> {
+) -> Result<Vec<crate::notes_matching::NameSuggestion>, AppError> {
     let json = db
         .get_name_suggestions(meeting_id)
         .map_err(|e| e.to_string())?;
@@ -96,15 +107,15 @@ fn save_name_suggestions(
     db: &Db,
     meeting_id: &str,
     suggestions: &[crate::notes_matching::NameSuggestion],
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let json = serde_json::to_string(suggestions).map_err(|e| e.to_string())?;
     db.set_name_suggestions(meeting_id, &json)
-        .map_err(|e| e.to_string())
+        .map_err(AppError::internal)
 }
 
 /// Drop pending suggestions for a label that no longer exists (cleared or
 /// manually renamed) — a stale suggestion's Apply would rename nothing.
-fn prune_name_suggestions(db: &Db, meeting_id: &str, label: &str) -> Result<(), String> {
+fn prune_name_suggestions(db: &Db, meeting_id: &str, label: &str) -> Result<(), AppError> {
     let mut suggestions = load_name_suggestions(db, meeting_id)?;
     let before = suggestions.len();
     suggestions.retain(|s| s.label != label);
@@ -125,7 +136,7 @@ fn regenerate_transcript(
     base: &Path,
     meeting_id: &str,
     fix: Option<AttendeeFix<'_>>,
-) -> Result<MeetingDetail, String> {
+) -> Result<MeetingDetail, AppError> {
     let mut row = require_row(db, meeting_id)?;
     let segments = db.get_segments(meeting_id).map_err(|e| e.to_string())?;
     let record = row.to_record();
@@ -148,7 +159,7 @@ fn regenerate_transcript(
         None => {}
     }
 
-    row.transcript_md = format_transcript_document(
+    row.transcript = format_transcript_document(
         &row.title,
         meeting_id,
         &start_time,
@@ -156,7 +167,6 @@ fn regenerate_transcript(
         &row.attendees,
         &format_transcript(&segments),
     );
-    write_indexed_text(base, &row.transcript_path, &row.transcript_md)?;
     db.upsert_meeting(&row).map_err(|e| e.to_string())?;
     crate::storage::export_index(db, base).map_err(|e| e.to_string())?;
     crate::search_index::sync_meeting(db, runtime, meeting_id);
@@ -178,7 +188,7 @@ fn profile(list_row: embral_db::SpeakerListRow) -> SpeakerProfile {
 
 /// One person's profile as the frontend sees it, fetched fresh — used by the
 /// commands that return the profile they just changed.
-fn profile_by_id(db: &Db, id: &str) -> Result<SpeakerProfile, String> {
+fn profile_by_id(db: &Db, id: &str) -> Result<SpeakerProfile, AppError> {
     let row = db
         .speaker_by_activity(id)
         .map_err(|e| e.to_string())?
@@ -186,7 +196,7 @@ fn profile_by_id(db: &Db, id: &str) -> Result<SpeakerProfile, String> {
     Ok(profile(row))
 }
 
-async fn storage_ctx(state: &State<'_, AppState>) -> Result<(std::path::PathBuf, std::sync::Arc<Db>), String> {
+async fn storage_ctx(state: &State<'_, AppState>) -> Result<(std::path::PathBuf, std::sync::Arc<Db>), AppError> {
     let config = state.config.lock().await.clone();
     let base = crate::storage::storage_base(&config.storage_dir);
     let db = state.db().await?;
@@ -198,7 +208,7 @@ async fn storage_ctx(state: &State<'_, AppState>) -> Result<(std::path::PathBuf,
 /// The registry as the Profiles page lists it: newest activity first, so the
 /// page's date headers mean "who you last met with".
 #[tauri::command]
-pub async fn list_speakers(state: State<'_, AppState>) -> Result<Vec<SpeakerProfile>, String> {
+pub async fn list_speakers(state: State<'_, AppState>) -> Result<Vec<SpeakerProfile>, AppError> {
     let (_, db) = storage_ctx(&state).await?;
     Ok(db
         .list_speakers_by_activity()
@@ -216,10 +226,10 @@ pub async fn upsert_speaker(
     id: Option<String>,
     name: String,
     notes: String,
-) -> Result<SpeakerProfile, String> {
+) -> Result<SpeakerProfile, AppError> {
     let name = name.trim().to_string();
     if name.is_empty() {
-        return Err("Speaker name cannot be empty".to_string());
+        return Err(AppError::SpeakerNameEmpty);
     }
     let (base, db) = storage_ctx(&state).await?;
 
@@ -246,12 +256,113 @@ pub async fn upsert_speaker(
             )?;
         }
     }
+    // Segments already carrying this name as plain text (notes-naming ran
+    // before the profile existed) become this person's history.
+    db.adopt_segments_by_name(&row.id, &name)
+        .map_err(|e| e.to_string())?;
     profile_by_id(&db, &row.id)
+}
+
+/// The meetings a person spoke in, newest first — the profile pane's record.
+#[tauri::command]
+pub async fn speaker_meetings(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<SpeakerMeeting>, AppError> {
+    let (_, db) = storage_ctx(&state).await?;
+    Ok(db
+        .speaker_meetings(&id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|m| SpeakerMeeting {
+            meeting_id: m.meeting_id,
+            title: m.title,
+            started_at: m.started_at.to_rfc3339(),
+            segment_count: m.segment_count,
+        })
+        .collect())
+}
+
+/// What one person said in one meeting — fetched when the pane expands
+/// that meeting, because a frequent speaker's whole history would be huge.
+#[tauri::command]
+pub async fn speaker_segments(
+    state: State<'_, AppState>,
+    id: String,
+    meeting_id: String,
+) -> Result<Vec<embral_types::TranscriptionSegment>, AppError> {
+    let (_, db) = storage_ctx(&state).await?;
+    db.speaker_segments(&id, &meeting_id)
+        .map_err(|e| e.to_string().into())
+}
+
+/// Fold one or more people into `target_id`: their segments repoint and
+/// relabel to the target across all meetings, their notes append to the
+/// target's, and their profiles are deleted. Affected transcript documents
+/// regenerate with the attendee swapped.
+#[tauri::command]
+pub async fn merge_speakers(
+    state: State<'_, AppState>,
+    target_id: String,
+    source_ids: Vec<String>,
+) -> Result<SpeakerProfile, AppError> {
+    crate::telemetry::track(
+        &state,
+        "profiles_merged",
+        serde_json::json!({ "count": source_ids.len() + 1 }),
+    );
+    let (base, db) = storage_ctx(&state).await?;
+    let target = db
+        .get_speaker(&target_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Profile {target_id} not found"))?;
+    let mut notes = target.notes.clone();
+
+    for source_id in source_ids.iter().filter(|id| **id != target_id) {
+        let Some(source) = db.get_speaker(source_id).map_err(|e| e.to_string())? else {
+            continue;
+        };
+        let affected = db
+            .merge_speaker_segments(source_id, &target_id, &target.name)
+            .map_err(|e| e.to_string())?;
+        for meeting_id in &affected {
+            // A pending "Speaker N looks like <source>" would now apply a
+            // name that no longer names anyone.
+            prune_name_suggestions(&db, meeting_id, &source.name)?;
+            regenerate_transcript(
+                &db,
+                &state.search,
+                &base,
+                meeting_id,
+                Some(AttendeeFix::Swap(source.name.as_str(), &target.name)),
+            )?;
+        }
+        if !source.notes.trim().is_empty() {
+            if !notes.trim().is_empty() {
+                notes.push_str("\n\n");
+            }
+            notes.push_str(source.notes.trim());
+        }
+        db.delete_speaker(source_id).map_err(|e| e.to_string())?;
+    }
+
+    if notes != target.notes {
+        db.upsert_speaker(&SpeakerRow {
+            id: target_id.clone(),
+            name: target.name.clone(),
+            notes,
+        })
+        .map_err(|e| e.to_string())?;
+    }
+    // Any stray plain-text segments with the target's name join it too.
+    db.adopt_segments_by_name(&target_id, &target.name)
+        .map_err(|e| e.to_string())?;
+    profile_by_id(&db, &target_id)
 }
 
 /// Remove a person. Transcript labels survive as plain text.
 #[tauri::command]
-pub async fn delete_speaker(state: State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn delete_speaker(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
     let (_, db) = storage_ctx(&state).await?;
     db.delete_speaker(&id).map_err(|e| e.to_string())?;
     Ok(())
@@ -260,7 +371,7 @@ pub async fn delete_speaker(state: State<'_, AppState>, id: String) -> Result<()
 /// Remove several people at once (the list's multi-select). Same rule as the
 /// single delete: transcript labels survive as plain text.
 #[tauri::command]
-pub async fn delete_speakers(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
+pub async fn delete_speakers(state: State<'_, AppState>, ids: Vec<String>) -> Result<(), AppError> {
     let (_, db) = storage_ctx(&state).await?;
     for id in &ids {
         db.delete_speaker(id).map_err(|e| e.to_string())?;
@@ -278,7 +389,7 @@ pub async fn confirm_name_suggestion(
     meeting_id: String,
     label: String,
     name: String,
-) -> Result<MeetingDetail, String> {
+) -> Result<MeetingDetail, AppError> {
     crate::telemetry::track(
         &state,
         "name_suggestion",
@@ -290,7 +401,7 @@ pub async fn confirm_name_suggestion(
         .iter()
         .position(|s| s.label == label && s.name == name)
     else {
-        return Err("That suggestion is no longer pending".to_string());
+        return Err(AppError::SuggestionNotPending);
     };
     suggestions.remove(pos);
     suggestions.retain(|s| s.label != label);
@@ -316,6 +427,10 @@ pub async fn confirm_name_suggestion(
     };
     db.assign_speaker_label(&meeting_id, &label, &speaker_id, &name)
         .map_err(|e| e.to_string())?;
+    // Other meetings where notes-naming already applied this name as plain
+    // text join this person's history too.
+    db.adopt_segments_by_name(&speaker_id, &name)
+        .map_err(|e| e.to_string())?;
     save_name_suggestions(&db, &meeting_id, &suggestions)?;
     regenerate_transcript(
         &db,
@@ -331,7 +446,7 @@ pub async fn dismiss_name_suggestion(
     state: State<'_, AppState>,
     meeting_id: String,
     label: String,
-) -> Result<MeetingDetail, String> {
+) -> Result<MeetingDetail, AppError> {
     crate::telemetry::track(
         &state,
         "name_suggestion",
@@ -353,7 +468,7 @@ pub async fn edit_segments(
     state: State<'_, AppState>,
     meeting_id: String,
     edit: SegmentEdit,
-) -> Result<MeetingDetail, String> {
+) -> Result<MeetingDetail, AppError> {
     let kind = match &edit {
         SegmentEdit::Split { .. } => "split",
         SegmentEdit::Delete { .. } => "delete",
@@ -365,7 +480,7 @@ pub async fn edit_segments(
     let (base, db) = storage_ctx(&state).await?;
     let mut segments = db.get_segments(&meeting_id).map_err(|e| e.to_string())?;
     if segments.is_empty() {
-        return Err("This meeting has no structured transcript to edit".to_string());
+        return Err(AppError::NoStructuredTranscript);
     }
 
     let mut swap: Option<(String, String)> = None;
@@ -394,7 +509,7 @@ pub async fn edit_segments(
         } => {
             let to = to.trim().to_string();
             if to.is_empty() {
-                return Err("Speaker name cannot be empty".to_string());
+                return Err(AppError::SpeakerNameEmpty);
             }
             let speaker_id = speaker_id.filter(|id| !id.is_empty());
             for seg in segments.iter_mut() {

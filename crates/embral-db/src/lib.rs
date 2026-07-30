@@ -1,10 +1,16 @@
 //! SQLite storage layer for Embral.
 //!
 //! The database (`{storage_dir}/embral.db`) is the **source of truth** for
-//! meetings and their structured transcript segments. Markdown files and
-//! `index.json` remain on disk as *generated exports* written by the app
-//! after each mutation — the MCP servers and any user tooling keep reading
-//! those — but every read inside the app comes from here.
+//! meetings, their two documents, and their structured transcript segments.
+//! `index.json` remains on disk as a *generated export* written after each
+//! mutation, and the markdown export writes meetings into a vault one-way
+//! ([integrations.md](../../../docs/integrations.md)); every read inside the
+//! app comes from here.
+//!
+//! A meeting has two documents and they are easy to confuse: `summary` is
+//! what the LLM wrote, `notes` is what the user typed. Before v12 the first
+//! was called `notes_md` and the second `user_notes`, so "notes" meant
+//! opposite things on either side of the command layer.
 //!
 //! Concurrency: a single `Connection` behind a `Mutex`. All operations are
 //! short (row-level CRUD and FTS queries); callers on the async runtime treat
@@ -52,25 +58,28 @@ fn register_vec_extension() {
     });
 }
 
-/// One meeting, as stored. Field set mirrors what the commands layer needs to
-/// render `MeetingDetail` and regenerate the markdown/index exports.
+/// One meeting, as stored. Field set mirrors what the commands layer needs
+/// to render `MeetingDetail` and regenerate the index export. The user's own
+/// notes are not here — they are read and written on their own
+/// (`get_notes` / `set_notes`), so an `upsert_meeting` can never clobber
+/// them with a stale copy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeetingRow {
     pub id: String,
     pub title: String,
     pub started_at: DateTime<Utc>,
     pub duration_seconds: u64,
-    pub notes_md: String,
-    pub transcript_md: String,
+    pub summary: String,
+    pub transcript: String,
     pub attendees: Vec<String>,
-    /// Storage-relative export paths (same values as the old index.json).
+    /// Storage-relative path to the meeting's audio. The one file a meeting
+    /// still owns — the summary and transcript documents are columns, not
+    /// files (v11).
     pub audio_path: String,
-    pub notes_path: String,
-    pub transcript_path: String,
 }
 
 impl MeetingRow {
-    /// The index.json-compatible record for this row.
+    /// The index.json record for this row.
     pub fn to_record(&self) -> MeetingRecord {
         MeetingRecord {
             id: self.id.clone(),
@@ -78,8 +87,6 @@ impl MeetingRow {
             date: self.started_at,
             duration_seconds: self.duration_seconds,
             chunks: 1,
-            notes_path: self.notes_path.clone(),
-            transcript_path: self.transcript_path.clone(),
             audio_path: self.audio_path.clone(),
         }
     }
@@ -104,6 +111,16 @@ pub struct SpeakerListRow {
     /// The newest meeting this person is linked to; `None` if they have never
     /// been seen in one (a profile created by hand).
     pub last_seen: Option<DateTime<Utc>>,
+}
+
+/// One meeting a person spoke in — a row of the profile pane's record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeakerMeetingRow {
+    pub meeting_id: String,
+    pub title: String,
+    pub started_at: DateTime<Utc>,
+    /// How many of the meeting's segments are theirs.
+    pub segment_count: i64,
 }
 
 /// One saved dictation.
@@ -222,32 +239,28 @@ impl Db {
     pub fn upsert_meeting(&self, m: &MeetingRow) -> Result<()> {
         let now = rfc3339(&Utc::now());
         self.lock().execute(
-            "INSERT INTO meetings (id, title, started_at, duration_seconds, notes_md,
-                                   transcript_md, attendees, audio_path, notes_path,
-                                   transcript_path, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+            "INSERT INTO meetings (id, title, started_at, duration_seconds, summary,
+                                   transcript, attendees, audio_path,
+                                   created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                started_at = excluded.started_at,
                duration_seconds = excluded.duration_seconds,
-               notes_md = excluded.notes_md,
-               transcript_md = excluded.transcript_md,
+               summary = excluded.summary,
+               transcript = excluded.transcript,
                attendees = excluded.attendees,
                audio_path = excluded.audio_path,
-               notes_path = excluded.notes_path,
-               transcript_path = excluded.transcript_path,
                updated_at = excluded.updated_at",
             params![
                 m.id,
                 m.title,
                 rfc3339(&m.started_at),
                 m.duration_seconds as i64,
-                m.notes_md,
-                m.transcript_md,
+                m.summary,
+                m.transcript,
                 serde_json::to_string(&m.attendees)?,
                 m.audio_path,
-                m.notes_path,
-                m.transcript_path,
                 now,
             ],
         )?;
@@ -520,6 +533,109 @@ impl Db {
         Ok(n)
     }
 
+    /// Merge one person's segments into another: repoint every segment
+    /// linked to `source_id` at `target_id` and relabel it with the
+    /// target's name, across all meetings. Returns the affected meeting
+    /// ids so the caller can regenerate those transcript documents.
+    pub fn merge_speaker_segments(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        target_name: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT meeting_id FROM segments WHERE speaker_id = ?1",
+        )?;
+        let meetings: Vec<String> = stmt
+            .query_map(params![source_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        conn.execute(
+            "UPDATE segments SET speaker_id = ?2, speaker = ?3 WHERE speaker_id = ?1",
+            params![source_id, target_id, target_name],
+        )?;
+        Ok(meetings)
+    }
+
+    /// Link every unlinked segment whose label matches this person's name,
+    /// case-insensitively, across all meetings. Names arrive through more
+    /// than one door — typed live, applied by the notes-naming pass — and
+    /// not every door sets the registry link; this is the catch-up that
+    /// runs whenever a profile is created, renamed, or merged into. The
+    /// label text itself does not change, so no transcript document needs
+    /// regenerating. Returns rows changed.
+    ///
+    /// A generic "Speaker N" name adopts nothing: those labels are
+    /// per-meeting placeholders, and two meetings' "Speaker 2" are
+    /// different people.
+    pub fn adopt_segments_by_name(&self, speaker_id: &str, name: &str) -> Result<usize> {
+        if embral_types::is_generic_speaker_label(name) {
+            return Ok(0);
+        }
+        let n = self.lock().execute(
+            "UPDATE segments SET speaker_id = ?1
+             WHERE speaker_id IS NULL AND lower(speaker) = lower(?2)",
+            params![speaker_id, name],
+        )?;
+        Ok(n)
+    }
+
+    /// The meetings a person spoke in, newest first — the profile pane's
+    /// record.
+    pub fn speaker_meetings(&self, speaker_id: &str) -> Result<Vec<SpeakerMeetingRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.title, m.started_at, COUNT(*)
+               FROM segments seg
+               JOIN meetings m ON m.id = seg.meeting_id
+              WHERE seg.speaker_id = ?1
+              GROUP BY m.id
+              ORDER BY m.started_at DESC",
+        )?;
+        let rows = stmt.query_map(params![speaker_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (meeting_id, title, started_at, segment_count) = row?;
+            out.push(SpeakerMeetingRow {
+                meeting_id,
+                title,
+                started_at: parse_rfc3339(&started_at)?,
+                segment_count,
+            });
+        }
+        Ok(out)
+    }
+
+    /// What one person said in one meeting, in transcript order.
+    pub fn speaker_segments(
+        &self,
+        speaker_id: &str,
+        meeting_id: &str,
+    ) -> Result<Vec<TranscriptionSegment>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT speaker, speaker_id, text, start_secs, end_secs FROM segments
+             WHERE meeting_id = ?1 AND speaker_id = ?2 ORDER BY idx",
+        )?;
+        let rows = stmt.query_map(params![meeting_id, speaker_id], |row| {
+            Ok(TranscriptionSegment {
+                speaker: row.get(0)?,
+                speaker_id: row.get(1)?,
+                text: row.get(2)?,
+                start: row.get(3)?,
+                end: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     // --- Pending name suggestions (from the user's typed notes) ---
 
     /// Persist a meeting's pending name suggestions (a JSON array; `[]`
@@ -570,24 +686,74 @@ impl Db {
 
     // --- The user's raw live notes ---
 
-    pub fn set_user_notes(&self, meeting_id: &str, notes: &str) -> Result<()> {
+    pub fn set_notes(&self, meeting_id: &str, notes: &str) -> Result<()> {
         self.lock().execute(
-            "UPDATE meetings SET user_notes = ?2 WHERE id = ?1",
+            "UPDATE meetings SET notes = ?2 WHERE id = ?1",
             params![meeting_id, notes],
         )?;
         Ok(())
     }
 
-    pub fn get_user_notes(&self, meeting_id: &str) -> Result<String> {
+    pub fn get_notes(&self, meeting_id: &str) -> Result<String> {
         Ok(self
             .lock()
             .query_row(
-                "SELECT user_notes FROM meetings WHERE id = ?1",
+                "SELECT notes FROM meetings WHERE id = ?1",
                 params![meeting_id],
                 |r| r.get(0),
             )
             .optional()?
             .unwrap_or_default())
+    }
+
+    // --- Text read out of a meeting's images ---
+
+    /// Every image of this meeting that has been read, newest name last.
+    /// Ordered by filename, which is also paste order (`img-01`, `img-02`, …),
+    /// so a chunk's position tracks where the image sits in the notes.
+    pub fn image_text(&self, meeting_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT filename, ocr_text FROM image_text
+             WHERE meeting_id = ?1 AND ocr_engine IS NOT NULL
+             ORDER BY filename",
+        )?;
+        let rows = stmt
+            .query_map(params![meeting_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Which of this meeting's images have already been read — the filenames
+    /// only, so the sweep can diff them against the asset directory without
+    /// pulling every passage into memory.
+    pub fn image_text_filenames(&self, meeting_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT filename FROM image_text WHERE meeting_id = ?1")?;
+        let rows = stmt
+            .query_map(params![meeting_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record what an engine read. `engine` names which one, so a library
+    /// that has moved between machines says where each passage came from.
+    pub fn set_image_text(
+        &self,
+        meeting_id: &str,
+        filename: &str,
+        ocr_text: &str,
+        engine: &str,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO image_text (meeting_id, filename, ocr_text, ocr_engine)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(meeting_id, filename)
+             DO UPDATE SET ocr_text = excluded.ocr_text, ocr_engine = excluded.ocr_engine",
+            params![meeting_id, filename, ocr_text, engine],
+        )?;
+        Ok(())
     }
 
     // --- Dictation history ---
@@ -690,8 +856,8 @@ impl Db {
 
 }
 
-const MEETING_COLS: &str = "id, title, started_at, duration_seconds, notes_md, transcript_md,
-                            attendees, audio_path, notes_path, transcript_path";
+const MEETING_COLS: &str = "id, title, started_at, duration_seconds, summary, transcript,
+                            attendees, audio_path";
 
 fn row_to_speaker(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpeakerRow> {
     Ok(SpeakerRow {
@@ -711,12 +877,10 @@ fn row_to_meeting(row: &rusqlite::Row<'_>) -> rusqlite::Result<MeetingRow> {
             rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
         })?,
         duration_seconds: row.get::<_, i64>(3)? as u64,
-        notes_md: row.get(4)?,
-        transcript_md: row.get(5)?,
+        summary: row.get(4)?,
+        transcript: row.get(5)?,
         attendees: serde_json::from_str(&attendees).unwrap_or_default(),
         audio_path: row.get(7)?,
-        notes_path: row.get(8)?,
-        transcript_path: row.get(9)?,
     })
 }
 
@@ -741,12 +905,10 @@ mod tests {
             title: title.to_string(),
             started_at: Utc.with_ymd_and_hms(2026, 6, day, 10, 0, 0).unwrap(),
             duration_seconds: 600,
-            notes_md: notes.to_string(),
-            transcript_md: transcript.to_string(),
+            summary: notes.to_string(),
+            transcript: transcript.to_string(),
             attendees: vec!["Alice".into(), "Bob".into()],
             audio_path: format!("audio/{id}.mp3"),
-            notes_path: format!("notes/{id}.md"),
-            transcript_path: format!("transcripts/{id}.md"),
         }
     }
 
@@ -771,7 +933,7 @@ mod tests {
         let mut m = mk("m1", "Old Title", 1, "old", "t");
         db.upsert_meeting(&m).unwrap();
         m.title = "New Title".into();
-        m.notes_md = "new notes".into();
+        m.summary = "new notes".into();
         db.upsert_meeting(&m).unwrap();
 
         let got = db.get_meeting("m1").unwrap().unwrap();
@@ -884,7 +1046,7 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].id, "m1");
         assert_eq!(recs[0].chunks, 1);
-        assert_eq!(recs[0].notes_path, "notes/m1.md");
+        assert_eq!(recs[0].audio_path, "audio/m1.mp3");
     }
 
     #[test]
@@ -992,6 +1154,119 @@ mod tests {
         );
         // No-op rename touches nothing.
         assert!(db.relabel_speaker_segments("sp-a", "Alicia").unwrap().is_empty());
+    }
+
+    #[test]
+    fn speaker_record_lists_meetings_and_their_lines() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_meeting(&mk("m1", "A", 1, "", "")).unwrap();
+        db.upsert_meeting(&mk("m2", "B", 2, "", "")).unwrap();
+        db.upsert_speaker(&mk_speaker("sp-a", "Alice")).unwrap();
+        db.replace_segments(
+            "m1",
+            &[
+                seg(Some("Alice"), Some("sp-a"), 0.0),
+                seg(Some("Bob"), None, 2.0),
+                seg(Some("Alice"), Some("sp-a"), 4.0),
+            ],
+        )
+        .unwrap();
+        db.replace_segments("m2", &[seg(Some("Alice"), Some("sp-a"), 0.0)])
+            .unwrap();
+
+        let record = db.speaker_meetings("sp-a").unwrap();
+        assert_eq!(record.len(), 2);
+        assert_eq!(record[0].meeting_id, "m2"); // newest first
+        assert_eq!(record[1].segment_count, 2); // Bob's line is not hers
+
+        let lines = db.speaker_segments("sp-a", "m1").unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].start, 0.0);
+        assert_eq!(lines[1].start, 4.0);
+    }
+
+    #[test]
+    fn merge_repoints_and_relabels_across_meetings() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_meeting(&mk("m1", "A", 1, "", "")).unwrap();
+        db.upsert_meeting(&mk("m2", "B", 2, "", "")).unwrap();
+        db.upsert_speaker(&mk_speaker("sp-john", "John")).unwrap();
+        db.upsert_speaker(&mk_speaker("sp-js", "John Smith")).unwrap();
+        db.replace_segments(
+            "m1",
+            &[
+                seg(Some("John"), Some("sp-john"), 0.0),
+                seg(Some("Bob"), None, 2.0),
+            ],
+        )
+        .unwrap();
+        db.replace_segments("m2", &[seg(Some("John"), Some("sp-john"), 0.0)])
+            .unwrap();
+
+        let mut affected = db
+            .merge_speaker_segments("sp-john", "sp-js", "John Smith")
+            .unwrap();
+        affected.sort();
+        assert_eq!(affected, vec!["m1".to_string(), "m2".to_string()]);
+
+        let m1 = db.get_segments("m1").unwrap();
+        assert_eq!(m1[0].speaker.as_deref(), Some("John Smith"));
+        assert_eq!(m1[0].speaker_id.as_deref(), Some("sp-js"));
+        assert_eq!(m1[1].speaker.as_deref(), Some("Bob")); // untouched
+        assert_eq!(
+            db.get_segments("m2").unwrap()[0].speaker_id.as_deref(),
+            Some("sp-js")
+        );
+
+        // Nothing is linked to the source anymore.
+        assert!(db
+            .merge_speaker_segments("sp-john", "sp-js", "John Smith")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn adopt_links_name_only_segments() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_meeting(&mk("m1", "A", 1, "", "")).unwrap();
+        db.upsert_meeting(&mk("m2", "B", 2, "", "")).unwrap();
+        db.upsert_speaker(&mk_speaker("sp-a", "Alice B")).unwrap();
+        db.replace_segments(
+            "m1",
+            &[
+                seg(Some("alice b"), None, 0.0),         // case aside, hers
+                seg(Some("Alice B"), Some("sp-x"), 2.0), // already someone's
+                seg(Some("Speaker 2"), None, 4.0),       // not hers
+            ],
+        )
+        .unwrap();
+        db.replace_segments("m2", &[seg(Some("Alice B"), None, 0.0)])
+            .unwrap();
+
+        assert_eq!(db.adopt_segments_by_name("sp-a", "Alice B").unwrap(), 2);
+
+        let m1 = db.get_segments("m1").unwrap();
+        assert_eq!(m1[0].speaker_id.as_deref(), Some("sp-a"));
+        assert_eq!(m1[0].speaker.as_deref(), Some("alice b")); // label untouched
+        assert_eq!(m1[1].speaker_id.as_deref(), Some("sp-x")); // never stolen
+        assert_eq!(m1[2].speaker_id, None);
+        assert_eq!(
+            db.get_segments("m2").unwrap()[0].speaker_id.as_deref(),
+            Some("sp-a")
+        );
+
+        // Adopted segments count toward the person's activity.
+        let row = db.speaker_by_activity("sp-a").unwrap().unwrap();
+        assert_eq!(
+            row.last_seen.unwrap(),
+            Utc.with_ymd_and_hms(2026, 6, 2, 10, 0, 0).unwrap()
+        );
+
+        // A generic name adopts nothing: two meetings' "Speaker 2" are
+        // different people.
+        db.upsert_speaker(&mk_speaker("sp-g", "Speaker 2")).unwrap();
+        assert_eq!(db.adopt_segments_by_name("sp-g", "Speaker 2").unwrap(), 0);
+        assert_eq!(db.get_segments("m1").unwrap()[2].speaker_id, None);
     }
 
     #[test]
@@ -1250,13 +1525,42 @@ mod tests {
     }
 
     #[test]
-    fn user_notes_roundtrip() {
+    fn notes_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_meeting(&mk("m1", "T", 1, "", "")).unwrap();
-        assert_eq!(db.get_user_notes("m1").unwrap(), "");
-        db.set_user_notes("m1", "- remember the budget").unwrap();
-        assert_eq!(db.get_user_notes("m1").unwrap(), "- remember the budget");
-        assert_eq!(db.get_user_notes("missing").unwrap(), "");
+        assert_eq!(db.get_notes("m1").unwrap(), "");
+        db.set_notes("m1", "- remember the budget").unwrap();
+        assert_eq!(db.get_notes("m1").unwrap(), "- remember the budget");
+        assert_eq!(db.get_notes("missing").unwrap(), "");
+    }
+
+    #[test]
+    fn image_text_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_meeting(&mk("m1", "T", 1, "", "")).unwrap();
+        assert!(db.image_text("m1").unwrap().is_empty());
+
+        db.set_image_text("m1", "img-02.png", "Q4 forecast", "windows").unwrap();
+        db.set_image_text("m1", "img-01.png", "Q3 revenue", "windows").unwrap();
+        // Paste order, not insert order — the filenames carry it.
+        assert_eq!(
+            db.image_text("m1").unwrap(),
+            vec![
+                ("img-01.png".to_string(), "Q3 revenue".to_string()),
+                ("img-02.png".to_string(), "Q4 forecast".to_string()),
+            ]
+        );
+
+        // Reading an image again replaces what was there rather than
+        // stacking a second row on the same file.
+        db.set_image_text("m1", "img-01.png", "Q3 revenue 4.2M", "windows").unwrap();
+        assert_eq!(db.image_text("m1").unwrap().len(), 2);
+        assert_eq!(db.image_text("m1").unwrap()[0].1, "Q3 revenue 4.2M");
+
+        // An image that read as blank is still an answer: it stays out of
+        // the index but must not look pending to the sweep.
+        db.set_image_text("m1", "img-03.png", "", "windows").unwrap();
+        assert_eq!(db.image_text_filenames("m1").unwrap().len(), 3);
     }
 
     #[test]

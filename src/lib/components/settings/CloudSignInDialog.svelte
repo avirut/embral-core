@@ -6,6 +6,9 @@
     import { Button } from "$lib/components/ui/button";
     import { appState } from "$lib/stores/app-state.svelte";
     import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.settings.cloudSignIn);
 
     function goToAccount() {
         cloudAuth.promptOpen = false;
@@ -19,11 +22,9 @@
 >
     <Dialog.Content class="sm:max-w-md">
         <Dialog.Header>
-            <Dialog.Title>Sign in to use embral cloud</Dialog.Title>
+            <Dialog.Title>{t.title}</Dialog.Title>
             <Dialog.Description>
-                Cloud transcription and summaries run on embral's servers and
-                need an account. Sign in to turn them on — everything stays on
-                this device until you do.
+                {t.description}
             </Dialog.Description>
         </Dialog.Header>
         <Dialog.Footer class="gap-2 sm:justify-end">
@@ -32,9 +33,9 @@
                 size="sm"
                 onclick={() => (cloudAuth.promptOpen = false)}
             >
-                Not now
+                {t.notNow}
             </Button>
-            <Button size="sm" onclick={goToAccount}>Go to Account</Button>
+            <Button size="sm" onclick={goToAccount}>{t.goToAccount}</Button>
         </Dialog.Footer>
     </Dialog.Content>
 </Dialog.Root>

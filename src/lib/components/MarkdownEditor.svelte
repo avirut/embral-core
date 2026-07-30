@@ -1,8 +1,12 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { Editor } from '@tiptap/core';
-  import StarterKit from '@tiptap/starter-kit';
-  import { Markdown } from 'tiptap-markdown';
+  import { markdownExtensions } from '$lib/editor/extensions';
+  import { imagePaste } from '$lib/editor/imagePaste';
+  import { findImagePos, findTextPos } from '$lib/editor/locate';
+  import { flashNodeAt, landingFlash } from '$lib/editor/landingFlash';
+  import { afterScrollTo } from '$lib/utils/flash';
+  import { storageRoot } from '$lib/stores/storageRoot.svelte';
   import {
     starAnchors,
     starAtCursor as starAtCursorIn,
@@ -18,7 +22,9 @@
     autofocus = false,
     readonly = false,
     onChange,
-    onStarClick
+    onStarClick,
+    pasteMeetingId,
+    onPasteError
   }: {
     value?: string;
     placeholder?: string;
@@ -30,6 +36,12 @@
      * calls this with the star's id (remove while recording, seek in the
      * saved-notes view). */
     onStarClick?: (id: number) => void;
+    /** Enables image paste. Returns the meeting the document belongs to;
+     * `undefined` means "the recording happening now", which the backend
+     * resolves for itself. Absent prop = pasting an image does nothing. */
+    pasteMeetingId?: () => string | undefined;
+    /** How this surface reports a failed image paste. */
+    onPasteError?: (message: string) => void;
   } = $props();
 
   let editorEl: HTMLDivElement;
@@ -48,9 +60,12 @@
 
   onMount(() => {
     const extensions = [
-      StarterKit,
-      Markdown.configure({ transformPastedText: true }),
-      ...(onStarClick ? [starAnchors(onStarClick)] : [])
+      ...markdownExtensions(storageRoot.value),
+      landingFlash(),
+      ...(onStarClick ? [starAnchors(onStarClick)] : []),
+      ...(pasteMeetingId && !readonly
+        ? [imagePaste({ meetingId: pasteMeetingId, onError: onPasteError })]
+        : [])
     ];
     editor = new Editor({
       element: editorEl,
@@ -66,15 +81,48 @@
           style: surfacePadding
         }
       },
-      onUpdate: ({ editor }) => {
-        if (!applyingExternalValue) {
-          const next = editor.storage.markdown.getMarkdown();
-          value = next;
-          onChange?.(next);
-        }
+      onUpdate: ({ editor, transaction }) => {
+        // Save only what the user actually did. `onUpdate` fires on *any*
+        // transaction, including programmatic ones — star anchoring on
+        // mount, most notably — and a save triggered by one of those writes
+        // the editor's re-serialized markdown over the stored document
+        // without anybody typing. That is how merely opening a tab could
+        // destroy something the schema can't model. `docChanged` rules out
+        // selection-only transactions; `addToHistory: false` is the flag
+        // our own programmatic edits already carry (`starGutter.ts`).
+        const programmatic = transaction.getMeta('addToHistory') === false;
+        if (applyingExternalValue || programmatic || !transaction.docChanged) return;
+        const next = editor.storage.markdown.getMarkdown();
+        value = next;
+        onChange?.(next);
       }
     });
+    reportFidelity(value, editor.storage.markdown.getMarkdown());
   });
+
+  /** Tripwire: what came in should survive a parse and re-serialize. When it
+   * doesn't, this editor's schema cannot represent something in the
+   * document, and editing here would save the loss (see
+   * `editor/extensions.ts`). Once the contract is complete this never
+   * fires — it exists to name whatever we failed to anticipate, in the log,
+   * with the text that went missing. */
+  function reportFidelity(incoming: string, reparsed: string) {
+    if (incoming.trim().length === 0) return;
+    // Normalization is expected and fine (bullet markers, spacing, escapes),
+    // so compare what markdown is *about*: links, images, and table rows.
+    const shapes = [/!\[[^\]]*\]\([^)]*\)/g, /(?<!!)\[[^\]]*\]\([^)]*\)/g, /^\|.*\|$/gm];
+    for (const shape of shapes) {
+      const before = incoming.match(shape)?.length ?? 0;
+      const after = reparsed.match(shape)?.length ?? 0;
+      if (after < before) {
+        console.warn(
+          `[embral] the editor cannot represent this document: ${before - after} ` +
+            `of ${before} ${shape.source} dropped on load. Editing it would save the loss.`
+        );
+        return;
+      }
+    }
+  }
 
   $effect(() => {
     if (!editor) return;
@@ -119,6 +167,62 @@
       `[data-star-id="${id}"]`
     ) as HTMLElement | null;
     el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  /** Bring a document position into view and mark it, so the user can see
+   * where they were sent. Returns whether there was anything to go to.
+   *
+   * The mark is a ProseMirror decoration rather than a class on the element:
+   * ProseMirror rebuilds the DOM it owns from document state, so a class set
+   * by hand vanishes at the next redraw — which for a document the user is
+   * about to type in is right away. */
+  function reveal(pos: number | null): boolean {
+    if (!editor || pos === null || !editor.state.doc.nodeAt(pos)) return false;
+    const view = editor.view;
+    const node = view.nodeDOM(pos) ?? view.domAtPos(pos).node;
+    const el = (node instanceof HTMLElement ? node : node?.parentElement) ?? null;
+    if (!el) {
+      flashNodeAt(view, pos);
+      return true;
+    }
+    // Arm the wait before scrolling: it measures where the target is now,
+    // and marks it once the scroll has arrived rather than while it is
+    // still travelling — over a long document the highlight would be over
+    // before the reader could see it.
+    afterScrollTo(view.dom, el, () => flashNodeAt(view, pos));
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    return true;
+  }
+
+  /**
+   * Land inside the passage a search result matched: on the query, looked
+   * for from where the passage begins.
+   *
+   * Bounding it matters for a common word — searching "north" would
+   * otherwise stop at the first "North Carolina" rather than the
+   * "Northstar" the palette showed. When the query is nowhere in the
+   * passage (a semantic hit) the passage's own opening line is the answer.
+   */
+  export function scrollToPassage(query: string, lead: string): boolean {
+    if (!editor) return false;
+    const { doc } = editor.state;
+    const passageStart = findTextPos(doc, lead);
+    const target = findTextPos(doc, query, passageStart ?? 0) ?? passageStart;
+    return reveal(target);
+  }
+
+  /** Scroll to a pasted image by filename — how an `image_text` hit lands,
+   * since the text it matched is inside the picture. */
+  export function scrollToImage(filename: string): boolean {
+    return editor ? reveal(findImagePos(editor.state.doc, filename)) : false;
+  }
+
+  /** Whether there is a document to look in yet. The editor is built in
+   * `onMount`, so a caller that reacts to this component appearing can
+   * arrive a beat too early — and "no editor" has to be told apart from
+   * "searched and found nothing", which is a real answer. */
+  export function isReady(): boolean {
+    return editor !== undefined;
   }
 
   onDestroy(() => editor?.destroy());

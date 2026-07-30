@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Upload, LoaderCircle } from 'lucide-svelte';
+  import { Upload, LoaderCircle, Trash2 } from 'lucide-svelte';
   import { meetingsStore, PENDING_MEETING_ID } from '$lib/stores/meetings.svelte';
   import { appState } from '$lib/stores/app-state.svelte';
   import type { MeetingRecord } from '$lib/types';
@@ -13,10 +13,26 @@
   import { importRecording } from '$lib/utils/importRecording';
   import OverlayScroll from '$lib/components/OverlayScroll.svelte';
   import Tip from '$lib/components/Tip.svelte';
+  import * as ContextMenu from '$lib/components/ui/context-menu';
+  import { copy } from '$lib/copy';
 
-  let { onSelect }: { onSelect?: () => void } = $props();
+  const t = $derived(copy.meetings.list);
+
+  let { onSelect, onDelete }: { onSelect?: () => void; onDelete?: () => void } = $props();
 
   const selection = $derived(meetingsStore.selection);
+
+  /** How many meetings the row menu's Delete would take (the pending
+   * meeting has no row to delete). */
+  const menuCount = $derived(
+    selection.ids.filter((id) => id !== PENDING_MEETING_ID).length
+  );
+
+  /** The menu acts on the selection, so a right-click outside it moves the
+   * selection first — exactly what a plain click would have done. */
+  function onRowContextMenu(id: string, event: MouseEvent) {
+    if (!selection.has(id)) void meetingsStore.clickRow(id, event, visibleOrder);
+  }
 
   /** A row is either a saved meeting or the one still being processed. */
   type Row = { kind: 'pending' } | { kind: 'record'; record: MeetingRecord };
@@ -38,10 +54,11 @@
     }));
 
     if (appState.pendingMeeting) {
-      if (groups[0]?.label === 'Today') {
+      const todayLabel = copy.meetings.dateGroups.today;
+      if (groups[0]?.label === todayLabel) {
         groups[0].rows.unshift({ kind: 'pending' });
       } else {
-        groups.unshift({ label: 'Today', rows: [{ kind: 'pending' }] });
+        groups.unshift({ label: todayLabel, rows: [{ kind: 'pending' }] });
       }
     }
     return groups;
@@ -93,10 +110,10 @@
   <OverlayScroll>
     <div class="pb-16">
     {#if meetingsStore.isLoading}
-      <p class="px-3 py-4 text-sm text-muted-foreground">Loading meetings...</p>
+      <p class="px-3 py-4 text-sm text-muted-foreground">{t.loading}</p>
     {:else if groups.length === 0}
       <p class="px-3 py-4 text-sm text-muted-foreground">
-        No meetings yet...
+        {t.empty}
       </p>
     {:else}
       {#each groups as group (group.label)}
@@ -119,7 +136,7 @@
                 >
                   <span class="inline-flex items-center gap-1.5 truncate">
                     <LoaderCircle size={11} class="shrink-0 animate-spin" />
-                    Finishing up…
+                    {t.finishingUp}
                   </span>
                   <span class="shrink-0 tabular-nums">
                     {formatDuration(pending.durationSeconds)}
@@ -129,20 +146,37 @@
             {/if}
           {:else}
             {@const record = row.record}
-            <button
-              onclick={(e) => onRowClick(record.id, e)}
-              class={rowClass(record.id)}
-            >
-              <h3 class="font-display line-clamp-2 text-sm leading-snug">{record.title}</h3>
-              <div
-                class="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-muted-foreground"
-              >
-                <span class="truncate">{rowDate(record, group.label)}</span>
-                <span class="shrink-0 tabular-nums">
-                  {formatDuration(record.duration_seconds)}
-                </span>
-              </div>
-            </button>
+            <ContextMenu.Root>
+              <ContextMenu.Trigger>
+                {#snippet child({ props })}
+                  <button
+                    {...props}
+                    onclick={(e) => onRowClick(record.id, e)}
+                    oncontextmenu={(e) => {
+                      onRowContextMenu(record.id, e);
+                      (props as { oncontextmenu?: (ev: MouseEvent) => void }).oncontextmenu?.(e);
+                    }}
+                    class={rowClass(record.id)}
+                  >
+                    <h3 class="font-display line-clamp-2 text-sm leading-snug">{record.title}</h3>
+                    <div
+                      class="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-muted-foreground"
+                    >
+                      <span class="truncate">{rowDate(record, group.label)}</span>
+                      <span class="shrink-0 tabular-nums">
+                        {formatDuration(record.duration_seconds)}
+                      </span>
+                    </div>
+                  </button>
+                {/snippet}
+              </ContextMenu.Trigger>
+              <ContextMenu.Content>
+                <ContextMenu.Item variant="destructive" onSelect={() => onDelete?.()}>
+                  <Trash2 />
+                  {t.menuDelete(menuCount)}
+                </ContextMenu.Item>
+              </ContextMenu.Content>
+            </ContextMenu.Root>
           {/if}
         {/each}
       {/each}
@@ -150,13 +184,13 @@
     </div>
   </OverlayScroll>
 
-  <Tip side="left" text="Import a recording">
+  <Tip side="left" text={t.import}>
     {#snippet children({ props })}
       <button
         {...props}
         onclick={importRecording}
         class="absolute right-3 bottom-3 flex h-10 w-10 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-md transition-colors hover:bg-primary/90"
-        aria-label="Import a recording"
+        aria-label={t.import}
       >
         <Upload size={17} />
       </button>

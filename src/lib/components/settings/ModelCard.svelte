@@ -6,9 +6,12 @@
     import type { ModelStatus } from "$lib/types";
     import { modelsStore } from "$lib/stores/models.svelte";
     import { formatBytes } from "$lib/utils/bytes";
+    import { copy } from "$lib/copy";
     import { Button } from "$lib/components/ui/button";
 
     let { model }: { model: ModelStatus } = $props();
+
+    const t = $derived(copy.settings.models.card);
 
     let downloading = $derived(modelsStore.isDownloading(model.id));
     let pct = $derived(Math.round((modelsStore.fraction(model.id) ?? 0) * 100));
@@ -42,12 +45,12 @@
                         style="width: {pct}%"
                     ></div>
                 </div>
-                <p class="text-xs text-muted-foreground">Downloading… {pct}%</p>
+                <p class="text-xs text-muted-foreground">{t.downloading(pct)}</p>
             </div>
         {:else}
             <div class="flex gap-2">
                 <Button size="sm" onclick={() => modelsStore.download(model.id)}>
-                    {model.present ? "Re-download" : "Download"}
+                    {model.present ? t.redownload : t.download}
                 </Button>
                 {#if model.present}
                     <Button
@@ -55,7 +58,7 @@
                         size="sm"
                         onclick={() => modelsStore.remove(model.id)}
                     >
-                        Remove
+                        {t.remove}
                     </Button>
                 {/if}
             </div>

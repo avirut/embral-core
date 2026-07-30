@@ -71,6 +71,10 @@ pub struct Hit {
     pub start_secs: Option<f64>,
     pub end_secs: Option<f64>,
     pub text: String,
+    /// Which image this passage was read out of — `Some` only for
+    /// `image_text`. There is nothing in the document to scroll to for an
+    /// image hit, so this is what a caller points at.
+    pub image_filename: Option<String>,
     /// FTS-provided excerpt with `[bracketed]` match markers; absent for
     /// hits the vector leg alone surfaced.
     pub snippet: Option<String>,
@@ -319,6 +323,7 @@ struct Candidate {
     start_secs: Option<f64>,
     end_secs: Option<f64>,
     text: String,
+    image_filename: Option<String>,
 }
 
 fn load_candidates(
@@ -331,7 +336,8 @@ fn load_candidates(
     let id_list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
     let sql = format!(
         "SELECT c.id, c.meeting_id, c.dictation_id, c.source, c.text, c.speakers,
-                c.start_secs, c.end_secs, m.title, m.started_at, d.created_at
+                c.start_secs, c.end_secs, m.title, m.started_at, d.created_at,
+                c.image_filename
          {JOINS} WHERE c.id IN ({})",
         id_list.join(", ")
     );
@@ -353,12 +359,26 @@ fn load_candidates(
                 r.get::<_, Option<f64>>(7)?,
                 r.get::<_, Option<String>>(8)?,
                 started_at.or(created_at),
+                r.get::<_, Option<String>>(11)?,
             ),
         ))
     })?;
     for row in rows {
-        let (id, (meeting_id, dictation_id, source, text, speakers, start_secs, end_secs, title, date)) =
-            row?;
+        let (
+            id,
+            (
+                meeting_id,
+                dictation_id,
+                source,
+                text,
+                speakers,
+                start_secs,
+                end_secs,
+                title,
+                date,
+                image_filename,
+            ),
+        ) = row?;
         let date = date
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&Utc))
@@ -375,6 +395,7 @@ fn load_candidates(
                 start_secs,
                 end_secs,
                 text,
+                image_filename,
             },
         );
     }
@@ -521,6 +542,7 @@ pub fn search(db: &Db, args: &SearchArgs, query_vector: Option<&[f32]>) -> Resul
                     start_secs: c.start_secs,
                     end_secs: c.end_secs,
                     text: c.text.clone(),
+                    image_filename: c.image_filename.clone(),
                     snippet: fts.map(|(_, s)| s.clone()),
                     fts_rank: fts.map(|(r, _)| *r),
                     semantic_rank,
@@ -548,7 +570,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
 
         let mut budget = meeting("m-budget", "Budget Review", 1, &["Alice", "Bob"]);
-        budget.notes_md = "# Budget Review\n\n## Key Takeaways\n\nSpending freeze until Q4.".into();
+        budget.summary = "# Budget Review\n\n## Key Takeaways\n\nSpending freeze until Q4.".into();
         db.upsert_meeting(&budget).unwrap();
         db.replace_segments(
             "m-budget",
@@ -558,7 +580,7 @@ mod tests {
             ],
         )
         .unwrap();
-        db.set_user_notes("m-budget", "freeze confirmed by finance").unwrap();
+        db.set_notes("m-budget", "freeze confirmed by finance").unwrap();
 
         let hiring = meeting("m-hiring", "Hiring Sync", 20, &["Alice", "Dana"]);
         db.upsert_meeting(&hiring).unwrap();

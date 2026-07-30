@@ -9,3 +9,15 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 dirs = "5"
 anyhow = "1"
+
+# Debug info is the bulk of a debug build here — this workspace links
+# onnxruntime and sherpa-onnx, whose artifacts run to gigabytes each — and
+# nobody steps into a dependency. Our own crates keep full debug info;
+# everything vendored keeps none, which leaves dependency frames in a
+# backtrace without file and line but changes nothing at runtime.
+#
+# Profiles are only honored in the workspace root manifest, so this is the
+# one place it can live. Changing it invalidates every dependency
+# artifact: the next build after an edit here is a full one.
+[profile.dev.package."*"]
+debug = false

@@ -3,6 +3,9 @@
     // in-flight model, alive on whatever step the user is on (the store is
     // module-scoped, so downloads outlive the step that started them).
     import { modelsStore } from "$lib/stores/models.svelte";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.onboarding.download);
 
     let active = $derived(
         modelsStore.statuses.filter((m) => modelsStore.isDownloading(m.id)),
@@ -37,19 +40,18 @@
             ></div>
         </div>
         <p class="text-xs text-muted-foreground">
-            Downloading {active.length}
-            {active.length === 1 ? "model" : "models"} · {pct}%
+            {t.active(active.length, pct)}
         </p>
     </div>
 {:else if failed.length > 0}
     <p class="text-xs text-destructive">
-        {failed[0].display_name} failed to download.
+        {t.failed(failed[0].display_name)}
         <button
             type="button"
             class="underline underline-offset-2"
             onclick={() => void modelsStore.download(failed[0].id)}
         >
-            Retry
+            {t.retry}
         </button>
     </p>
 {/if}

@@ -46,14 +46,25 @@ describe('comboFromEvent', () => {
   });
 });
 
+// The `mac` flag is always passed explicitly here: its default reads the
+// host platform, and these assertions must not change meaning between a
+// Windows and a macOS checkout.
 describe('formatCombo', () => {
   it('shows the glyph, not the code name', () => {
-    expect(formatCombo('Alt+Shift+Super+BracketRight')).toBe('Alt + Shift + Super + ]');
-    expect(formatCombo('Ctrl+KeyR')).toBe('Ctrl + R');
+    expect(formatCombo('Alt+Shift+Super+BracketRight', false)).toBe('Alt + Shift + Super + ]');
+    expect(formatCombo('Ctrl+KeyR', false)).toBe('Ctrl + R');
+  });
+
+  it('speaks mac glyphs on macos, in stored order, without separators', () => {
+    expect(formatCombo('Alt+Shift+Super+BracketRight', true)).toBe('⌥⇧⌘]');
+    expect(formatCombo('Ctrl+KeyR', true)).toBe('⌃R');
+    // Unknown tokens still pass through.
+    expect(formatCombo('Ctrl+Mystery', true)).toBe('⌃Mystery');
   });
 
   it('passes through combos saved by older builds', () => {
-    expect(formatCombo('Ctrl+Shift+R')).toBe('Ctrl + Shift + R');
-    expect(formatCombo('')).toBe('');
+    expect(formatCombo('Ctrl+Shift+R', false)).toBe('Ctrl + Shift + R');
+    expect(formatCombo('', false)).toBe('');
+    expect(formatCombo('', true)).toBe('');
   });
 });

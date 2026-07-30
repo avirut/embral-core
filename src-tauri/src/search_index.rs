@@ -144,12 +144,12 @@ impl EmbedPipe {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        crate::platform::hide_console_tokio(&mut cmd);
+        crate::platform::prepare_spawn_tokio(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("spawn embed worker: {e}"))?;
+        if let Some(pid) = child.id() {
+            crate::platform::watch_child(pid);
+        }
         let stdin = child.stdin.take().ok_or("no stdin pipe")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("no stdout pipe")?);
         let mut pipe = EmbedPipe { child, stdin, stdout };
@@ -222,6 +222,34 @@ pub fn after_delete(db: &Db) {
     }
 }
 
+/// Read every image nothing has read yet, a batch at a time.
+///
+/// The OS call is synchronous and takes ~100 ms an image, so it runs on a
+/// blocking thread; the loop ends when a pass reads nothing, which is both
+/// "all caught up" and "this machine has no engine".
+async fn drain_ocr(state: &tauri::State<'_, AppState>) {
+    let Ok(db) = state.db().await else { return };
+    let base = {
+        let config = state.config.lock().await;
+        crate::storage::storage_base(&config.storage_dir)
+    };
+    loop {
+        let (db, base) = (db.clone(), base.clone());
+        let read = tokio::task::spawn_blocking(move || {
+            crate::ocr::sweep(&db, &base, crate::ocr::SWEEP_BATCH)
+        })
+        .await;
+        match read {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("the OCR sweep panicked: {e}");
+                break;
+            }
+        }
+    }
+}
+
 /// The background embedding worker: backfill once at boot, then drain
 /// pending chunks (newest owners first) whenever a mutation pings, in
 /// small batches so the palette never waits long on the DB lock.
@@ -248,6 +276,13 @@ pub fn spawn_worker(handle: tauri::AppHandle) {
             if state.search.idle_for() > IDLE_EVICT {
                 state.search.shutdown().await;
             }
+
+            // OCR first: an image read this pass becomes chunks that the
+            // embedding drain below picks up without waiting for another
+            // wake-up. It runs whether or not the embedding model is
+            // present — FTS alone already makes the text findable.
+            drain_ocr(&state).await;
+
             if !embral_search::model::present() {
                 continue;
             }

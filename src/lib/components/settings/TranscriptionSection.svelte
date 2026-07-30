@@ -7,8 +7,11 @@
     import SettingsGroup from "./SettingsGroup.svelte";
     import SettingRow from "./SettingRow.svelte";
     import { Input } from "$lib/components/ui/input";
+    import { copy } from "$lib/copy";
 
     let { draft }: { draft: AppConfig } = $props();
+
+    const t = $derived(copy.settings.transcription);
 
     let vocabularyInput = $state("");
 
@@ -50,7 +53,7 @@
         <p
             class="pb-2 text-xs font-medium tracking-wider text-muted-foreground uppercase"
         >
-            Speech recognition
+            {t.speechRecognition}
         </p>
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
             {#each speechModels as model (model.id)}
@@ -63,7 +66,7 @@
         <p
             class="pb-2 text-xs font-medium tracking-wider text-muted-foreground uppercase"
         >
-            Supporting models
+            {t.supportingModels}
         </p>
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
             {#each supportingModels as model (model.id)}
@@ -76,10 +79,10 @@
          that can't do anything is noise, and the list is kept in config
          for models that can. -->
     {#if selectedModel?.supports_hotwords !== false}
-        <SettingsGroup label="Vocabulary boost">
+        <SettingsGroup label={t.vocabulary._group}>
             <SettingRow
-                title="Custom vocabulary"
-                description="Names and jargon to listen for more carefully"
+                title={t.vocabulary.custom.label}
+                description={t.vocabulary.custom.sub}
                 vertical
             >
                 <Input
@@ -90,7 +93,7 @@
                             addVocabularyWord();
                         }
                     }}
-                    placeholder="Type a word and press Enter"
+                    placeholder={t.vocabulary.custom.placeholder}
                     class="max-w-sm"
                 />
                 {#if draft.vocabulary.length > 0}
@@ -103,7 +106,7 @@
                                 <button
                                     type="button"
                                     class="rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
-                                    aria-label={`Remove ${word}`}
+                                    aria-label={t.vocabulary.remove(word)}
                                     onclick={() => removeVocabularyWord(word)}
                                 >
                                     <X size={11} />

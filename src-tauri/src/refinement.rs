@@ -51,12 +51,14 @@ pub fn run_post_meeting_integrations(
     export_md: &str,
 ) {
     if config.obsidian_export_enabled && !config.obsidian_vault_dir.trim().is_empty() {
+        let base = crate::storage::storage_base(&config.storage_dir);
         match embral_notes::integrations::export_to_obsidian(
             &config.obsidian_vault_dir,
             record,
             export_md,
             &config.export_filename_template,
             config.export_metadata_format,
+            Some(&base),
         ) {
             Ok(path) => tracing::info!("Obsidian export written to {}", path.display()),
             Err(e) => tracing::warn!("Obsidian export failed: {}", e),
@@ -77,6 +79,7 @@ pub async fn refine_notes(
     meeting_title: Option<&str>,
     transcript: &str,
     user_notes: Option<&str>,
+    image_text: &[(String, String)],
 ) -> Result<String> {
     embral_notes::refine_notes(
         notes_cfg,
@@ -87,6 +90,7 @@ pub async fn refine_notes(
         transcript,
         user_notes,
         &config.summary_prompt,
+        image_text,
     )
     .await
 }

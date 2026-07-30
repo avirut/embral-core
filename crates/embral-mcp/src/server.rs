@@ -60,6 +60,7 @@ pub enum SourceArg {
     Transcript,
     UserNotes,
     Summary,
+    ImageText,
 }
 
 impl SourceArg {
@@ -68,6 +69,7 @@ impl SourceArg {
             SourceArg::Transcript => embral_search::Source::Transcript,
             SourceArg::UserNotes => embral_search::Source::UserNotes,
             SourceArg::Summary => embral_search::Source::Summary,
+            SourceArg::ImageText => embral_search::Source::ImageText,
         }
     }
 }
@@ -79,7 +81,9 @@ pub struct SearchMeetingsArgs {
     pub query: String,
     pub mode: Option<SearchMode>,
     /// Restrict where passages come from: verbatim speech ("transcript"),
-    /// the user's own notes ("user_notes"), or AI summaries ("summary").
+    /// the user's own notes ("user_notes"), AI summaries ("summary"), or
+    /// text read out of images the user pasted into a meeting —
+    /// screenshots of slides, whiteboards, diagrams ("image_text").
     pub sources: Option<Vec<SourceArg>>,
     /// Only meetings these people were in (attendee names). "Meetings Jane
     /// attended" filters here; "what Jane said" belongs in `speakers`;

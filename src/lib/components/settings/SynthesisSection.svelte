@@ -8,8 +8,11 @@
     import { Switch } from "$lib/components/ui/switch";
     import { modelsStore } from "$lib/stores/models.svelte";
     import { usesLocalLlm } from "$lib/utils/llmUsage";
+    import { copy } from "$lib/copy";
 
     let { draft }: { draft: AppConfig } = $props();
+
+    const t = $derived(copy.settings.synthesis);
 
     onMount(() => {
         modelsStore.refresh();
@@ -36,7 +39,7 @@
         <p
             class="pb-2 text-xs font-medium tracking-wider text-muted-foreground uppercase"
         >
-            Local LLM
+            {t.localLlm}
         </p>
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
             {#each llmModels as model (model.id)}
@@ -49,7 +52,7 @@
         <p
             class="pb-2 text-xs font-medium tracking-wider text-muted-foreground uppercase"
         >
-            Search
+            {t.search}
         </p>
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
             {#each searchModels as model (model.id)}
@@ -59,14 +62,14 @@
     </div>
 
     {#if localLlmInUse}
-        <SettingsGroup label="Performance">
+        <SettingsGroup label={t.performance._group}>
             <SettingRow
-                title="Keep the built-in model loaded"
-                description="Responds instantly but holds ~3 GB of memory. Applies while summaries or dictation cleanup run on this device."
+                title={t.performance.keepWarm.label}
+                description={t.performance.keepWarm.sub}
             >
                 <Switch bind:checked={draft.llm_keep_warm} />
             </SettingRow>
-            <SettingRow title="Unload after idle">
+            <SettingRow title={t.performance.unloadIdle.label}>
                 <div class="flex items-center gap-2">
                     <Input
                         type="number"
@@ -75,7 +78,9 @@
                         disabled={draft.llm_keep_warm}
                         class="w-16 text-right"
                     />
-                    <span class="text-xs text-muted-foreground">minutes</span>
+                    <span class="text-xs text-muted-foreground"
+                        >{t.performance.unloadIdle.unit}</span
+                    >
                 </div>
             </SettingRow>
         </SettingsGroup>

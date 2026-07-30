@@ -7,14 +7,20 @@
     // the Meetings section migrates onto it in the P3 restyle.)
     import type {
         CloudOutOfHours,
+        PowerPolicy,
         TranscriptionLanguage,
         TranscriptionProvider,
     } from "$lib/types";
     import SettingRow from "./SettingRow.svelte";
     import SpeechModelPicker from "./SpeechModelPicker.svelte";
     import * as Select from "$lib/components/ui/select";
+    import { Switch } from "$lib/components/ui/switch";
     import { CLOUD_ENABLED } from "$lib/cloud";
     import { cloudAuth } from "$lib/stores/cloudAuth.svelte";
+    import { copy } from "$lib/copy";
+
+    const t = $derived(copy.settings.transcription.block);
+    const providers = $derived(copy.common.providers);
 
     let {
         providerLabel,
@@ -24,6 +30,8 @@
         onProviderChange,
         outOfHours,
         onOutOfHoursChange,
+        powerPolicy,
+        onPowerPolicyChange,
         language,
         onLanguageChange,
         accuracyModel,
@@ -39,6 +47,10 @@
         onProviderChange: (v: TranscriptionProvider) => void;
         outOfHours: CloudOutOfHours | undefined;
         onOutOfHoursChange: (v: CloudOutOfHours) => void;
+        /** Meetings only for now: dictation passes neither, and the row is
+         * left out entirely. */
+        powerPolicy?: PowerPolicy;
+        onPowerPolicyChange?: (v: PowerPolicy) => void;
         language: TranscriptionLanguage;
         onLanguageChange: (v: TranscriptionLanguage) => void;
         /** The effective English model id the accuracy picker shows. */
@@ -46,11 +58,21 @@
         onAccuracyChange: (id: string) => void;
     } = $props();
 
-    // The device transcribes when it is the primary, or where an
-    // out-of-hours cloud session lands. Only cloud-with-"disable" never
-    // needs the accuracy tier (or the model behind it).
+    // Whether the cloud is reachable from this configuration at all — the
+    // power policy routes to it on battery whatever the provider row says,
+    // so the out-of-hours question applies then too.
+    let cloudPossible = $derived(
+        provider === "cloud" || powerPolicy === "cloud_on_battery",
+    );
+
+    // The device transcribes when it is the primary, where an out-of-hours
+    // cloud session lands, or whenever the power policy is on (plugged in is
+    // the device). Only cloud-with-"disable" never needs the accuracy tier.
     let deviceTranscribes = $derived(
-        !CLOUD_ENABLED || provider !== "cloud" || outOfHours !== "disabled",
+        !CLOUD_ENABLED ||
+            provider !== "cloud" ||
+            powerPolicy === "cloud_on_battery" ||
+            outOfHours !== "disabled",
     );
 </script>
 
@@ -71,20 +93,40 @@
             }}
         >
             <Select.Trigger class="w-56"
-                >{provider === "cloud" ? "embral cloud" : "local model"}</Select.Trigger
+                >{provider === "cloud"
+                    ? providers.cloud
+                    : providers.localModel}</Select.Trigger
             >
             <Select.Content>
                 <!-- Cloud first — the one order every engine select shares
                      ([shell.md](../../../../docs/shell.md)). -->
-                <Select.Item value="cloud" label="embral cloud" />
-                <Select.Item value="local" label="local model" />
+                <Select.Item value="cloud" label={providers.cloud} />
+                <Select.Item value="local" label={providers.localModel} />
             </Select.Content>
         </Select.Root>
     </SettingRow>
 
-    {#if provider === "cloud"}
+    {#if onPowerPolicyChange}
         <SettingRow
-            title="When cloud hours run out"
+            title={t.powerPolicy.label}
+            description={t.powerPolicy.sub}
+        >
+            <Switch
+                checked={powerPolicy === "cloud_on_battery"}
+                onCheckedChange={(on) => {
+                    // Turning it on can send a meeting to the cloud, so it
+                    // needs an account exactly as the provider row does.
+                    if (!on) onPowerPolicyChange("off");
+                    else if (cloudAuth.requireSignedIn())
+                        onPowerPolicyChange("cloud_on_battery");
+                }}
+            />
+        </SettingRow>
+    {/if}
+
+    {#if cloudPossible}
+        <SettingRow
+            title={t.outOfHours.label}
             description={outOfHours === "disabled" ? disabledNote : ""}
         >
             <Select.Root
@@ -96,19 +138,25 @@
             >
                 <Select.Trigger class="w-56"
                     >{outOfHours === "disabled"
-                        ? "Disable transcription"
-                        : "Switch to this device"}</Select.Trigger
+                        ? t.outOfHours.disable
+                        : t.outOfHours.switchToDevice}</Select.Trigger
                 >
                 <Select.Content>
-                    <Select.Item value="local" label="Switch to this device" />
-                    <Select.Item value="disabled" label="Disable transcription" />
+                    <Select.Item
+                        value="local"
+                        label={t.outOfHours.switchToDevice}
+                    />
+                    <Select.Item
+                        value="disabled"
+                        label={t.outOfHours.disable}
+                    />
                 </Select.Content>
             </Select.Root>
         </SettingRow>
     {/if}
 {/if}
 
-<SettingRow title="Language">
+<SettingRow title={t.language.label}>
     <Select.Root
         type="single"
         value={language}
@@ -117,11 +165,13 @@
         }}
     >
         <Select.Trigger class="w-56"
-            >{language === "multilingual" ? "All languages" : "English"}</Select.Trigger
+            >{language === "multilingual"
+                ? t.language.all
+                : t.language.english}</Select.Trigger
         >
         <Select.Content>
-            <Select.Item value="english" label="English" />
-            <Select.Item value="multilingual" label="All languages" />
+            <Select.Item value="english" label={t.language.english} />
+            <Select.Item value="multilingual" label={t.language.all} />
         </Select.Content>
     </Select.Root>
 </SettingRow>

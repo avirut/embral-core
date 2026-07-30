@@ -106,13 +106,12 @@ fn handle_dictation_key(app: &AppHandle, state_change: ShortcutState) {
 async fn toggle_recording(app: AppHandle) {
     let state = app.state::<AppState>();
     let recording = state.recorder.lock().await.is_some();
-    let result = if recording {
-        crate::commands::stop_recording(app.clone(), app.state(), None, None).await
-    } else {
-        crate::commands::start_recording(app.clone(), app.state()).await
-    };
-    if let Err(e) = result {
-        tracing::warn!("hotkey toggle failed: {e}");
+    if recording {
+        // Through the frontend, like every backend-initiated stop, so the
+        // notes and title drafts travel with it.
+        crate::commands::request_stop(&app);
+    } else if let Err(e) = crate::commands::start_recording(app.clone(), app.state()).await {
+        tracing::warn!("hotkey start failed: {e}");
     }
 }
 
