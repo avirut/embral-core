@@ -9,6 +9,7 @@
   import { formatTime } from '$lib/utils/meetingFormat';
   import { cn } from '$lib/utils';
   import SpeakerNameInput from './SpeakerNameInput.svelte';
+  import * as ContextMenu from '$lib/components/ui/context-menu';
   import { tip } from '$lib/tip.svelte';
   import CopyParts from './CopyParts.svelte';
   import { copy } from '$lib/copy';
@@ -33,18 +34,25 @@
 
   let busy = $state(false);
   let error = $state<string | null>(null);
-  // Row index whose speaker is being edited, and its draft value.
+  // Sentence whose speaker is being edited (via the context menu), and its
+  // draft value. The sentence lifts out as its own turn while the caret is
+  // in it (see the grouping rule below).
   let editingRow = $state<number | null>(null);
   let rowSpeakerDraft = $state('');
+  // Turn whose speaker is being edited via its header name.
+  let editingTurn = $state<number | null>(null);
+  let turnDraft = $state('');
   // Label being renamed via its header name.
   let editingLabel = $state<string | null>(null);
   let labelDraft = $state('');
-  // Row armed for click-to-split.
-  let splittingRow = $state<number | null>(null);
-  // The row under the pointer (or holding focus). Rows mount their action
+  // Turn armed for click-to-split.
+  let splittingTurn = $state<number | null>(null);
+  // The turn under the pointer (or holding focus). Turns mount their action
   // cluster and play affordance only while hovered — a thousand rows of
   // always-mounted icons and tooltips is what made this tab slow.
-  let hoverRow = $state<number | null>(null);
+  let hoverTurn = $state<number | null>(null);
+  // The sentence a right-click landed on — the context menu's target.
+  let menuSeg = $state<number | null>(null);
 
   onMount(() => {
     if (!speakersStore.loaded) void speakersStore.refresh();
@@ -76,18 +84,63 @@
     return seen;
   });
 
+  // --- Turns: the list reads as one block per speaker turn — consecutive
+  // sentences from the same label flow together as a paragraph — because a
+  // row per sentence made long transcripts a wall to scroll. The sentences
+  // and their timings are untouched underneath: each is still its own
+  // clickable span (seek, split target, context-menu target). A turn also
+  // breaks at a starred moment (its marker row sits between turns) and at
+  // a sentence whose speaker is being edited, which lifts out on its own
+  // while the caret is in it.
+  interface TurnItem {
+    seg: TranscriptionSegment;
+    index: number;
+  }
+  interface Turn {
+    speaker: string | null;
+    start: number;
+    /** Index of the turn's first segment — the stable render key. */
+    first: number;
+    items: TurnItem[];
+  }
+  const turns = $derived.by(() => {
+    const out: Turn[] = [];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const last = out[out.length - 1];
+      if (
+        !last ||
+        (seg.speaker ?? null) !== last.speaker ||
+        starMarkers.has(i) ||
+        editingRow === i ||
+        editingRow === i - 1
+      ) {
+        out.push({ speaker: seg.speaker ?? null, start: seg.start, first: i, items: [] });
+      }
+      out[out.length - 1].items.push({ seg, index: i });
+    }
+    return out;
+  });
+  /** Segment index → its turn's ordinal, for scroll and render targets. */
+  const turnOf = $derived.by(() => {
+    const map: number[] = [];
+    turns.forEach((turn, g) => turn.items.forEach(({ index }) => (map[index] = g)));
+    return map;
+  });
+
   // --- Progressive render: an instant first screen, the rest mounted in
   // idle time. Long transcripts made the tab switch stall for seconds when
-  // every row mounted synchronously.
-  const INITIAL_ROWS = 200;
+  // every row mounted synchronously. Counted in turns — the worst case
+  // (every sentence its own turn) is the old per-row behavior.
+  const INITIAL_TURNS = 200;
   const RENDER_BATCH = 400;
-  let renderCount = $state(INITIAL_ROWS);
-  const fullyRendered = $derived(renderCount >= segments.length);
+  let renderCount = $state(INITIAL_TURNS);
+  const fullyRendered = $derived(renderCount >= turns.length);
 
   $effect(() => {
     if (fullyRendered) return;
     const grow = () =>
-      (renderCount = Math.min(segments.length, renderCount + RENDER_BATCH));
+      (renderCount = Math.min(turns.length, renderCount + RENDER_BATCH));
     if (typeof requestIdleCallback === 'function') {
       const id = requestIdleCallback(grow);
       return () => cancelIdleCallback(id);
@@ -96,11 +149,12 @@
     return () => clearTimeout(timeout);
   });
 
-  /** Mount up to a target row now — scroll targets can sit past the
-   * rendered window while the idle growth is still catching up. */
+  /** Mount up to a target segment's turn now — scroll targets can sit past
+   * the rendered window while the idle growth is still catching up. */
   async function ensureRendered(index: number) {
-    if (index < renderCount) return;
-    renderCount = Math.min(segments.length, index + 50);
+    const g = turnOf[index] ?? turns.length - 1;
+    if (g < renderCount) return;
+    renderCount = Math.min(turns.length, g + 30);
     await tick();
   }
 
@@ -117,12 +171,18 @@
     return -1;
   });
 
-  let rowEls: (HTMLElement | null)[] = [];
+  // Sentence spans by segment index — scroll targets for playback follow
+  // and search landings stay sentence-precise inside the grouped turns.
+  let sentenceEls: (HTMLElement | null)[] = [];
   let following = $state(true);
-  let autoScrolling = false;
 
-  function onListScroll() {
-    if (!autoScrolling) following = false;
+  // Unfollow only on the user's own scrolling — wheel, touch, or grabbing
+  // the scrollbar (a pointerdown whose target is the scroller itself).
+  // Watching the scroll *event* needed an "is this scroll ours" flag whose
+  // timer raced the smooth-scroll animation, and a follow scroll that
+  // outlasted it read as the user scrolling off.
+  function unfollowIfScrollbar(e: PointerEvent) {
+    if (e.target === e.currentTarget) following = false;
   }
 
   function jumpToCurrent() {
@@ -150,7 +210,6 @@
     if (index < 0 || index >= segments.length) return;
     following = true;
     await ensureRendered(index);
-    autoScrolling = true;
     // Centre by arithmetic rather than `scrollIntoView`: the list is
     // virtualized, so rows keep rendering after the scroll starts and the
     // target drifts under it — a smooth `scrollIntoView` reliably finished
@@ -158,32 +217,27 @@
     // layout has settled.
     centreRow(index);
     requestAnimationFrame(() => centreRow(index));
-    setTimeout(() => {
-      centreRow(index);
-      autoScrolling = false;
-    }, 200);
+    setTimeout(() => centreRow(index), 200);
   }
 
-  function centreRow(index: number) {
-    const el = rowEls[index];
+  function centreRow(index: number, behavior: ScrollBehavior = 'auto') {
+    const el = sentenceEls[index];
     const scroller = el?.closest<HTMLElement>('.overflow-y-auto');
     if (!el || !scroller) return;
     const row = el.getBoundingClientRect();
     const box = scroller.getBoundingClientRect();
-    scroller.scrollTop += row.top - box.top - (box.height - row.height) / 2;
+    scroller.scrollTo({
+      top: scroller.scrollTop + row.top - box.top - (box.height - row.height) / 2,
+      behavior
+    });
   }
 
-  async function scrollActiveIntoView(
-    behavior: ScrollBehavior,
-    block: ScrollLogicalPosition = 'nearest'
-  ) {
+  /** Playback follow keeps the current sentence in the middle of the
+   * viewport — riding the bottom edge left no read-ahead below the line. */
+  async function scrollActiveIntoView(behavior: ScrollBehavior) {
     if (activeIndex < 0) return;
     await ensureRendered(activeIndex);
-    const el = rowEls[activeIndex];
-    if (!el) return;
-    autoScrolling = true;
-    el.scrollIntoView({ block, behavior });
-    setTimeout(() => (autoScrolling = false), 350);
+    centreRow(activeIndex, behavior);
   }
 
   $effect(() => {
@@ -218,6 +272,9 @@
     try {
       const updated = await fn();
       if (updated) onDetailChange?.(updated);
+      // An edit can prune a newly-orphaned profile (a corrected typo);
+      // refresh so it leaves the suggestion lists too.
+      void speakersStore.refresh();
     } catch (e) {
       error = errorMessage(e);
     } finally {
@@ -226,9 +283,11 @@
   }
 
   function startRowEdit(index: number) {
+    if (busy) return;
     editingRow = index;
     rowSpeakerDraft = segments[index]?.speaker ?? '';
-    splittingRow = null;
+    editingTurn = null;
+    splittingTurn = null;
   }
 
   async function commitRowEdit(index: number) {
@@ -245,21 +304,52 @@
     );
   }
 
+  function startTurnEdit(g: number) {
+    if (busy) return;
+    editingTurn = g;
+    turnDraft = turns[g]?.speaker ?? '';
+    editingRow = null;
+    splittingTurn = null;
+  }
+
+  /** Rename a whole turn: one reassign per sentence, same name. The turn
+   * is captured up front — reassigns never shift indexes, so the list
+   * re-deriving underneath doesn't move the targets. */
+  async function commitTurnEdit(g: number) {
+    const turn = turns[g];
+    const speaker = turnDraft.trim();
+    editingTurn = null;
+    if (!turn || !speaker || speaker === turn.speaker) return;
+    const speaker_id = registryIdFor(speaker);
+    await apply(async () => {
+      let updated: MeetingDetail | undefined;
+      for (const { index } of turn.items) {
+        updated = await meetingsStore.editSegments(meetingId, {
+          kind: 'reassign',
+          index,
+          speaker,
+          speaker_id
+        });
+      }
+      return updated;
+    });
+  }
+
   async function deleteRow(index: number) {
     await apply(() => meetingsStore.editSegments(meetingId, { kind: 'delete', index }));
   }
 
-  function armSplit(index: number) {
-    splittingRow = splittingRow === index ? null : index;
+  function armSplit(g: number) {
+    splittingTurn = splittingTurn === g ? null : g;
     editingRow = null;
+    editingTurn = null;
   }
 
   async function splitAtSelection(index: number) {
-    if (splittingRow !== index) return;
     const selection = window.getSelection();
     if (!selection || selection.rangeCount === 0) return;
     const offset = selection.getRangeAt(0).startOffset;
-    splittingRow = null;
+    splittingTurn = null;
     if (offset <= 0 || offset >= (segments[index]?.text.length ?? 0)) return;
     await apply(() =>
       meetingsStore.editSegments(meetingId, {
@@ -268,6 +358,20 @@
         char_offset: offset
       })
     );
+  }
+
+  /** A sentence click: the split target while its turn is armed, ignored
+   * mid-text-selection (copying, not seeking), otherwise a seek — which
+   * also re-pins the follow: "go here" is the opposite of scrolling off. */
+  function onSentenceClick(g: number, index: number) {
+    if (splittingTurn === g) {
+      void splitAtSelection(index);
+      return;
+    }
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    if (onSeek) following = true;
+    onSeek?.(segments[index].start);
   }
 
   function startLabelEdit(label: string) {
@@ -411,128 +515,179 @@
   {/if}
 
   <div class="relative min-h-0 flex-1">
-  <div onscroll={onListScroll} class="h-full space-y-1 overflow-y-auto pr-1">
-    {#each segments.slice(0, renderCount) as seg, i (i)}
-      {#each starMarkers.get(i) ?? [] as star (star)}
+  <!-- svelte-ignore a11y_no_static_element_interactions -- the handlers
+       only detect the user scrolling off; scrolling stays native. -->
+  <div
+    onwheel={() => (following = false)}
+    ontouchmove={() => (following = false)}
+    onpointerdown={unfollowIfScrollbar}
+    class="h-full space-y-1 overflow-y-auto pr-1"
+  >
+    {#each turns.slice(0, renderCount) as turn, g (turn.first)}
+      {#each starMarkers.get(turn.first) ?? [] as star (star)}
         {@render starRow(star)}
       {/each}
-      <!-- svelte-ignore a11y_no_static_element_interactions -- hover
-           tracking only; the row's controls carry their own semantics. -->
-      <div
-        bind:this={rowEls[i]}
-        onpointerenter={() => (hoverRow = i)}
-        onpointerleave={() => (hoverRow = null)}
-        onfocusin={() => (hoverRow = i)}
-        class={cn(
-          'rounded-md border-l-2 border-transparent px-2 py-1.5 transition-colors duration-150 hover:bg-accent/40',
-          activeIndex === i && 'border-l-foreground/60 bg-accent/50',
-          splittingRow === i && 'bg-primary/5 ring-1 ring-primary/40'
-        )}
-      >
-        <div class="flex items-center gap-2">
-          {#if onSeek}
-            <button
-              use:tip={t.playFromHere}
-              class="relative w-9 shrink-0 text-left font-mono text-[10px] tabular-nums text-muted-foreground transition-colors hover:text-foreground"
-              aria-label={t.playFrom(formatTime(seg.start))}
-              onclick={() => onSeek?.(seg.start)}
-            >
-              <span class={hoverRow === i ? 'opacity-0' : ''}>{formatTime(seg.start)}</span>
-              {#if hoverRow === i}
-                <span class="absolute inset-y-0 left-0 flex items-center">
-                  <Play size={11} fill="currentColor" />
-                </span>
-              {/if}
-            </button>
-          {:else}
-            <span class="w-9 shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
-              {formatTime(seg.start)}
-            </span>
-          {/if}
-          {#if editingRow === i}
-            <SpeakerNameInput
-              bind:value={rowSpeakerDraft}
-              suggestions={nameSuggestions(seg.speaker)}
-              class={cn('text-[10px] font-medium', nameClass(seg.speaker ?? '', labels))}
-              onCommit={() => commitRowEdit(i)}
-              onCancel={() => (editingRow = null)}
-            />
-          {:else if seg.speaker}
-            <button
-              use:tip={t.changeSpeaker}
-              class={cn(
-                'shrink-0 text-[10px] font-medium underline-offset-4 transition-opacity hover:underline hover:opacity-75',
-                nameClass(seg.speaker, labels)
-              )}
-              disabled={busy}
-              onclick={() => startRowEdit(i)}
-            >
-              {seg.speaker}
-            </button>
-          {/if}
-          <span class="min-w-0 flex-1"></span>
-          {#if hoverRow === i || splittingRow === i}
-            <!-- Mounted, not revealed: these existed opacity-0 on every row
-                 and their tooltip trees dominated the tab's render cost. -->
-            <div class="flex h-5 shrink-0 items-center gap-0.5">
-              {#if !seg.speaker}
-                <!-- Labeled rows edit by clicking the name itself; this is
-                     the affordance for rows that have no name to click. -->
-                <button
-                  use:tip={t.assignSpeaker}
-                  class="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                  aria-label={t.assignSpeaker}
-                  disabled={busy}
-                  onclick={() => startRowEdit(i)}
-                >
-                  <UserPen size={12} />
-                </button>
-              {/if}
-              <button
-                use:tip={t.splitSegment}
-                class={cn(
-                  'rounded p-1 hover:bg-accent',
-                  splittingRow === i
-                    ? 'text-primary'
-                    : 'text-muted-foreground hover:text-foreground'
-                )}
-                aria-label={t.splitSegment}
-                disabled={busy}
-                onclick={() => armSplit(i)}
-              >
-                {#if splittingRow === i}<X size={12} />{:else}<Scissors size={12} />{/if}
-              </button>
-              <button
-                use:tip={t.deleteSegment}
-                class="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                aria-label={t.deleteSegment}
-                disabled={busy}
-                onclick={() => deleteRow(i)}
-              >
-                <Trash2 size={12} />
-              </button>
-            </div>
-          {:else}
-            <!-- Height placeholder so hovering a row never reflows it. -->
-            <div class="h-5 shrink-0"></div>
-          {/if}
-        </div>
-        {#if splittingRow === i}
-          <p class="mt-0.5 pl-11 text-[10px] text-primary">
-            {t.splitHint}
-          </p>
-        {/if}
-        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
-        <p
+      <ContextMenu.Root>
+        <!-- svelte-ignore a11y_no_static_element_interactions -- hover
+             tracking only; the turn's controls carry their own semantics. -->
+        <div
+          onpointerenter={() => (hoverTurn = g)}
+          onpointerleave={() => (hoverTurn = null)}
+          onfocusin={() => (hoverTurn = g)}
           class={cn(
-            'mt-0.5 pl-11 text-[15px] leading-relaxed',
-            splittingRow === i && 'cursor-text select-text'
+            'rounded-md border-l-2 border-transparent px-2 py-1.5 transition-colors duration-150 hover:bg-accent/40',
+            activeIndex >= 0 && turnOf[activeIndex] === g && 'border-l-foreground/60',
+            splittingTurn === g && 'bg-primary/5 ring-1 ring-primary/40'
           )}
-          onclick={() => splitAtSelection(i)}
         >
-          {seg.text}
-        </p>
-      </div>
+          <div class="flex items-center gap-2">
+            {#if onSeek}
+              <button
+                use:tip={t.playFromHere}
+                class="relative w-9 shrink-0 text-left font-mono text-[10px] tabular-nums text-muted-foreground transition-colors hover:text-foreground"
+                aria-label={t.playFrom(formatTime(turn.start))}
+                onclick={() => {
+                  following = true;
+                  onSeek?.(turn.start);
+                }}
+              >
+                <span class={hoverTurn === g ? 'opacity-0' : ''}>{formatTime(turn.start)}</span>
+                {#if hoverTurn === g}
+                  <span class="absolute inset-y-0 left-0 flex items-center">
+                    <Play size={11} fill="currentColor" />
+                  </span>
+                {/if}
+              </button>
+            {:else}
+              <span class="w-9 shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+                {formatTime(turn.start)}
+              </span>
+            {/if}
+            {#if editingTurn === g}
+              <SpeakerNameInput
+                bind:value={turnDraft}
+                suggestions={nameSuggestions(turn.speaker)}
+                class={cn('text-[11px] font-medium', nameClass(turn.speaker ?? '', labels))}
+                onCommit={() => commitTurnEdit(g)}
+                onCancel={() => (editingTurn = null)}
+              />
+            {:else if editingRow === turn.first && turn.items.length === 1}
+              <SpeakerNameInput
+                bind:value={rowSpeakerDraft}
+                suggestions={nameSuggestions(turn.speaker)}
+                class={cn('text-[11px] font-medium', nameClass(turn.speaker ?? '', labels))}
+                onCommit={() => commitRowEdit(turn.first)}
+                onCancel={() => (editingRow = null)}
+              />
+            {:else if turn.speaker}
+              <button
+                use:tip={t.changeTurnSpeaker}
+                class={cn(
+                  'shrink-0 text-[11px] font-medium underline-offset-4 transition-opacity hover:underline hover:opacity-75',
+                  nameClass(turn.speaker, labels)
+                )}
+                disabled={busy}
+                onclick={() => startTurnEdit(g)}
+              >
+                {turn.speaker}
+              </button>
+            {/if}
+            <span class="min-w-0 flex-1"></span>
+            {#if hoverTurn === g || splittingTurn === g}
+              <!-- Mounted, not revealed: these existed opacity-0 on every row
+                   and their tooltip trees dominated the tab's render cost. -->
+              <div class="flex h-5 shrink-0 items-center gap-0.5">
+                {#if !turn.speaker}
+                  <!-- Labeled turns edit by clicking the name itself; this is
+                       the affordance for turns that have no name to click. -->
+                  <button
+                    use:tip={t.assignSpeaker}
+                    class="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                    aria-label={t.assignSpeaker}
+                    disabled={busy}
+                    onclick={() => startTurnEdit(g)}
+                  >
+                    <UserPen size={12} />
+                  </button>
+                {/if}
+                <button
+                  use:tip={t.splitSegment}
+                  class={cn(
+                    'rounded p-1 hover:bg-accent',
+                    splittingTurn === g
+                      ? 'text-primary'
+                      : 'text-muted-foreground hover:text-foreground'
+                  )}
+                  aria-label={t.splitSegment}
+                  disabled={busy}
+                  onclick={() => armSplit(g)}
+                >
+                  {#if splittingTurn === g}<X size={12} />{:else}<Scissors size={12} />{/if}
+                </button>
+              </div>
+            {:else}
+              <!-- Height placeholder so hovering a turn never reflows it. -->
+              <div class="h-5 shrink-0"></div>
+            {/if}
+          </div>
+          {#if splittingTurn === g}
+            <p class="mt-0.5 pl-11 text-[10px] text-primary">
+              {t.splitHint}
+            </p>
+          {/if}
+          <ContextMenu.Trigger>
+            {#snippet child({ props })}
+              <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+              <p
+                {...props}
+                oncontextmenu={(e: MouseEvent) => {
+                  const el = (e.target as HTMLElement).closest<HTMLElement>('[data-seg]');
+                  menuSeg = el ? Number(el.dataset.seg) : null;
+                  if (menuSeg === null) return;
+                  (props as { oncontextmenu?: (ev: MouseEvent) => void }).oncontextmenu?.(e);
+                }}
+                class="mt-0.5 pl-11 text-[15px] leading-relaxed"
+              >
+                {#each turn.items as item (item.index)}
+                  <span
+                    bind:this={sentenceEls[item.index]}
+                    data-seg={item.index}
+                    class={cn(
+                      'rounded-sm transition-colors duration-150',
+                      splittingTurn === g
+                        ? 'cursor-text select-text hover:bg-primary/10'
+                        : onSeek && 'cursor-pointer hover:bg-accent/70',
+                      activeIndex === item.index && 'bg-accent/80'
+                    )}
+                    onclick={() => onSentenceClick(g, item.index)}
+                  >{item.seg.text}</span>{' '}
+                {/each}
+              </p>
+            {/snippet}
+          </ContextMenu.Trigger>
+        </div>
+        <ContextMenu.Content>
+          {#if onSeek}
+            <ContextMenu.Item
+              onSelect={() => menuSeg !== null && onSeek?.(segments[menuSeg]?.start ?? 0)}
+            >
+              <Play />
+              {t.playFrom(formatTime(menuSeg !== null ? (segments[menuSeg]?.start ?? 0) : 0))}
+            </ContextMenu.Item>
+          {/if}
+          <ContextMenu.Item onSelect={() => menuSeg !== null && startRowEdit(menuSeg)}>
+            <UserPen />
+            {t.changeSpeaker}
+          </ContextMenu.Item>
+          <ContextMenu.Item
+            variant="destructive"
+            onSelect={() => menuSeg !== null && deleteRow(menuSeg)}
+          >
+            <Trash2 />
+            {t.deleteSegment}
+          </ContextMenu.Item>
+        </ContextMenu.Content>
+      </ContextMenu.Root>
     {/each}
     {#if fullyRendered}
       {#each starMarkers.get(segments.length) ?? [] as star (star)}

@@ -33,3 +33,8 @@ pub use theme::{theme_snapshot, watch_theme};
 /// Windows tray icons are plain images; the taskbar shade drives which
 /// mark is shown instead.
 pub const TRAY_IDLE_IS_TEMPLATE: bool = false;
+
+/// On Windows the menu belongs to right-click only: left-click toggles
+/// the window, and a menu popping on the same click races that toggle —
+/// the menu flashed, or swallowed the click entirely.
+pub const TRAY_MENU_ON_LEFT_CLICK: bool = false;

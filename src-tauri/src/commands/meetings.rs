@@ -353,16 +353,48 @@ pub async fn delete_meetings(state: State<'_, AppState>, ids: Vec<String>) -> Re
     let base = crate::storage::storage_base(&config.storage_dir);
     let db = state.db().await?;
 
+    let mut linked: Vec<String> = Vec::new();
     for id in &ids {
         let Some(row) = db.get_meeting(id).map_err(|e| e.to_string())? else {
             continue;
         };
+        collect_linked_speakers(&db, id, &mut linked)?;
         remove_indexed_file(&base, &row.audio_path)?;
         remove_meeting_assets(&base, id);
         db.delete_meeting(id).map_err(|e| e.to_string())?;
     }
+    prune_released_speakers(&db, linked)?;
     crate::storage::export_index(&db, &base).map_err(|e| e.to_string())?;
     crate::search_index::after_delete(&db);
+    Ok(())
+}
+
+/// The registry ids a meeting's segments link to — remembered before the
+/// delete so profiles the meeting was the last home of can be pruned.
+fn collect_linked_speakers(
+    db: &embral_db::Db,
+    meeting_id: &str,
+    into: &mut Vec<String>,
+) -> Result<(), AppError> {
+    for seg in db.get_segments(meeting_id).map_err(|e| e.to_string())? {
+        if let Some(id) = seg.speaker_id {
+            if !into.contains(&id) {
+                into.push(id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deleting a meeting orphans the people who only ever spoke in it; a
+/// profile with no history left and no notes goes with the meeting.
+fn prune_released_speakers(db: &embral_db::Db, linked: Vec<String>) -> Result<(), AppError> {
+    let pruned = db
+        .prune_orphaned_speakers(&linked)
+        .map_err(|e| e.to_string())?;
+    if !pruned.is_empty() {
+        tracing::info!(count = pruned.len(), "pruned orphaned speaker profiles");
+    }
     Ok(())
 }
 
@@ -373,9 +405,12 @@ pub async fn delete_meeting(state: State<'_, AppState>, id: String) -> Result<()
     let db = state.db().await?;
     let row = require_row(&db, &id)?;
 
+    let mut linked: Vec<String> = Vec::new();
+    collect_linked_speakers(&db, &id, &mut linked)?;
     remove_indexed_file(&base, &row.audio_path)?;
     remove_meeting_assets(&base, &id);
     db.delete_meeting(&id).map_err(|e| e.to_string())?;
+    prune_released_speakers(&db, linked)?;
     crate::storage::export_index(&db, &base).map_err(|e| e.to_string())?;
     crate::search_index::after_delete(&db);
     Ok(())

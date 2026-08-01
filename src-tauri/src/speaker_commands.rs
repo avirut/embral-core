@@ -482,6 +482,15 @@ pub async fn edit_segments(
     if segments.is_empty() {
         return Err(AppError::NoStructuredTranscript);
     }
+    // Whoever these segments pointed at before the edit may be about to
+    // lose their last link — remembered so the orphans can be pruned once
+    // the edit lands.
+    let mut linked_before: Vec<String> = segments
+        .iter()
+        .filter_map(|s| s.speaker_id.clone())
+        .collect();
+    linked_before.sort();
+    linked_before.dedup();
 
     let mut swap: Option<(String, String)> = None;
     let mut removed: Option<String> = None;
@@ -535,6 +544,15 @@ pub async fn edit_segments(
 
     db.replace_segments(&meeting_id, &segments)
         .map_err(|e| e.to_string())?;
+    // A profile the edit just unlinked from its last segments was usually a
+    // typo or a half-name on its way out; without notes or history it
+    // leaves the registry with the label.
+    let pruned = db
+        .prune_orphaned_speakers(&linked_before)
+        .map_err(|e| e.to_string())?;
+    if !pruned.is_empty() {
+        tracing::info!(count = pruned.len(), "pruned orphaned speaker profiles");
+    }
     let fix = match (&swap, &removed) {
         (Some((f, t)), _) => Some(AttendeeFix::Swap(f.as_str(), t.as_str())),
         (_, Some(name)) => Some(AttendeeFix::Remove(name.as_str())),

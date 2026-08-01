@@ -135,11 +135,12 @@ export const meetings = {
     renameSpeaker:
       "Rename this speaker (type another speaker's name to merge; right-click to remove from the transcript)",
     playFrom: (time: string) => `Play from ${time}`,
-    changeSpeaker: "Change this segment's speaker",
+    changeSpeaker: "Change this sentence's speaker",
+    changeTurnSpeaker: "Change this turn's speaker",
     assignSpeaker: 'Assign a speaker',
-    splitSegment: 'Split segment',
-    deleteSegment: 'Delete segment',
-    splitHint: 'Click inside the text where the new segment should start.',
+    splitSegment: 'Split a sentence',
+    deleteSegment: 'Delete sentence',
+    splitHint: 'Click inside a sentence where the split should happen.',
     jumpToCurrent: 'Jump to current'
   },
 

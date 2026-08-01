@@ -39,6 +39,26 @@
     return map;
   });
 
+  // Same-speaker sentences read as one turn, broken at starred moments —
+  // the same grouping the saved transcript editor uses, minus the editing.
+  interface Turn {
+    speaker: string | null;
+    start: number;
+    first: number;
+    texts: string[];
+  }
+  const turns = $derived.by(() => {
+    const out: Turn[] = [];
+    for (let i = 0; i < pending.segments.length; i++) {
+      const seg = pending.segments[i];
+      const last = out[out.length - 1];
+      if (!last || (seg.speaker ?? null) !== last.speaker || starMarkers.has(i)) {
+        out.push({ speaker: seg.speaker ?? null, start: seg.start, first: i, texts: [] });
+      }
+      out[out.length - 1].texts.push(seg.text);
+    }
+    return out;
+  });
 </script>
 
 <div class="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
@@ -91,8 +111,8 @@
         {#if pending.segments.length === 0}
           <p class="text-sm text-muted-foreground">{t.noSpeech}</p>
         {:else}
-          {#each pending.segments as seg, i (i)}
-            {#each starMarkers.get(i) ?? [] as star (star)}
+          {#each turns as turn (turn.first)}
+            {#each starMarkers.get(turn.first) ?? [] as star (star)}
               {@render starRow(star)}
             {/each}
             <div class="rounded-md px-2 py-1.5">
@@ -100,20 +120,20 @@
                 <span
                   class="w-9 shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground"
                 >
-                  {formatTime(seg.start)}
+                  {formatTime(turn.start)}
                 </span>
-                {#if seg.speaker}
+                {#if turn.speaker}
                   <span
-                    class="shrink-0 text-[10px] font-medium {nameClass(
-                      seg.speaker,
+                    class="shrink-0 text-[11px] font-medium {nameClass(
+                      turn.speaker,
                       labels
                     )}"
                   >
-                    {seg.speaker}
+                    {turn.speaker}
                   </span>
                 {/if}
               </div>
-              <p class="mt-0.5 pl-11 text-[15px] leading-relaxed">{seg.text}</p>
+              <p class="mt-0.5 pl-11 text-[15px] leading-relaxed">{turn.texts.join(' ')}</p>
             </div>
           {/each}
           {#each starMarkers.get(pending.segments.length) ?? [] as star (star)}

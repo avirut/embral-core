@@ -497,6 +497,32 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Delete each candidate speaker that is orphaned: no segment anywhere
+    /// links to it and its notes are empty. A profile with notes survives —
+    /// words the user wrote outrank tidiness — and one still linked
+    /// somewhere is no orphan. Unknown ids are skipped. Returns the ids
+    /// actually deleted.
+    pub fn prune_orphaned_speakers(&self, candidates: &[String]) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut deleted = Vec::new();
+        for id in candidates {
+            if deleted.contains(id) {
+                continue;
+            }
+            let n = conn.execute(
+                "DELETE FROM speakers
+                  WHERE id = ?1
+                    AND trim(notes) = ''
+                    AND NOT EXISTS (SELECT 1 FROM segments WHERE speaker_id = ?1)",
+                params![id],
+            )?;
+            if n > 0 {
+                deleted.push(id.clone());
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Relabel every segment linked to `speaker_id` (across meetings) with a
     /// new display name. Returns the affected meeting ids so the caller can
     /// regenerate those meetings' transcript documents.
@@ -1113,6 +1139,33 @@ mod tests {
         let got = db.get_segments("m1").unwrap();
         assert_eq!(got[0].speaker.as_deref(), Some("Alice")); // label survives
         assert_eq!(got[0].speaker_id, None); // link cleared
+    }
+
+    #[test]
+    fn prune_deletes_only_unlinked_noteless_speakers() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_meeting(&mk("m1", "T", 1, "", "")).unwrap();
+        // Orphan: no segments, no notes — the typo profile.
+        db.upsert_speaker(&mk_speaker("sp-typo", "Jhon")).unwrap();
+        // Still linked: keeps its history.
+        db.upsert_speaker(&mk_speaker("sp-live", "John")).unwrap();
+        db.replace_segments("m1", &[seg(Some("John"), Some("sp-live"), 0.0)])
+            .unwrap();
+        // Unlinked but annotated: the user's words protect it.
+        let mut noted = mk_speaker("sp-noted", "Maya");
+        noted.notes = "prefers async updates".into();
+        db.upsert_speaker(&noted).unwrap();
+
+        let candidates: Vec<String> = ["sp-typo", "sp-live", "sp-noted", "sp-ghost"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let deleted = db.prune_orphaned_speakers(&candidates).unwrap();
+
+        assert_eq!(deleted, vec!["sp-typo".to_string()]);
+        assert!(db.get_speaker("sp-typo").unwrap().is_none());
+        assert!(db.get_speaker("sp-live").unwrap().is_some());
+        assert!(db.get_speaker("sp-noted").unwrap().is_some());
     }
 
     #[test]

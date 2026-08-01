@@ -54,6 +54,11 @@ pub fn create_tray(app: &App) -> Result<()> {
         .icon(Image::from_bytes(idle)?)
         .icon_as_template(crate::platform::TRAY_IDLE_IS_TEMPLATE)
         .menu(&menu)
+        // On Windows the menu belongs to right-click only — popping it on
+        // left-click too raced the toggle below (the menu flashed, or
+        // swallowed the click). On macOS the menu on click *is* the
+        // platform convention, so the toggle never fires there.
+        .show_menu_on_left_click(crate::platform::TRAY_MENU_ON_LEFT_CLICK)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
                 if let Some(w) = app.get_webview_window("main") {

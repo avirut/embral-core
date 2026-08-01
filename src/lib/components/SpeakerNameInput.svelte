@@ -81,17 +81,19 @@
   }
 </script>
 
-<span class="relative inline-block">
-  <!-- The invisible mirror is what sizes the field: same classes, same
-       text, so the box is exactly as wide as its content and the name's
-       glyphs hold still when the caret arrives. The input overlays it
-       absolutely — in flow it would contribute its own intrinsic width
-       and stretch the box. (`size`-based widths are character
-       approximations and shifted the text; CSS field-sizing is absent
-       from WKWebView.) -->
-  <span aria-hidden="true" class="invisible whitespace-pre {className}"
-    >{value || ' '}</span
-  >
+<!-- The name's classes sit on the wrapper, not only on the mirror: a
+     box's line height can never be shorter than its own font's, and this
+     wrapper otherwise inherits the row's larger font — which made the
+     editing box taller than the idle name and shifted the row on click. -->
+<span class="relative inline-block {className}">
+  <!-- The invisible mirror is what sizes the field: same font (inherited
+       from the wrapper), same text, so the box is exactly as wide as its
+       content and the name's glyphs hold still when the caret arrives.
+       The input overlays it absolutely — in flow it would contribute its
+       own intrinsic width and stretch the box. (`size`-based widths are
+       character approximations and shifted the text; CSS field-sizing is
+       absent from WKWebView.) -->
+  <span aria-hidden="true" class="invisible whitespace-pre">{value || ' '}</span>
   <input
     bind:this={inputEl}
     bind:value

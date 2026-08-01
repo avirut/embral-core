@@ -1034,6 +1034,7 @@ pub fn recover_interrupted_recording(app: AppHandle) {
             found.stars,
             found.user_notes,
             found.user_title,
+            Vec::new(),
         )
         .await;
     });
@@ -1199,6 +1200,14 @@ pub async fn stop_recording(
         // the exact timestamp; a missing anchor just means no notes line).
         let anchors =
             std::mem::take(&mut *app_bg.state::<AppState>().star_anchors.lock().await);
+        // Names the user renamed away from during the session — finalize
+        // prunes their profiles if nothing ends up linked to them. Generic
+        // "Speaker N" labels never had profiles to begin with.
+        let superseded_labels: Vec<String> =
+            std::mem::take(&mut *app_bg.state::<AppState>().live_label_renames.lock().await)
+                .into_keys()
+                .filter(|label| !embral_types::is_generic_speaker_label(label))
+                .collect();
         let stars: Vec<Star> = star_seconds
             .into_iter()
             .map(|seconds| Star {
@@ -1222,6 +1231,7 @@ pub async fn stop_recording(
             stars,
             user_notes,
             user_title,
+            superseded_labels,
         )
         .await;
         // The meeting is committed (or its save failed and said so): the

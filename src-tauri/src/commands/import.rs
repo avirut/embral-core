@@ -172,6 +172,7 @@ pub async fn import_recording(
             Vec::new(), // no stars on imports
             None,
             user_title,
+            Vec::new(), // no live session, no superseded names
         )
         .await;
     });

@@ -46,6 +46,11 @@ pub(crate) async fn finalize_meeting(
     stars: Vec<Star>,
     user_notes: Option<String>,
     user_title: Option<String>,
+    // Names renamed away from during the live session. A profile created
+    // for one never gets linked — the pipeline only links final names — so
+    // this is the only place it can be recognized as an orphan. Imports and
+    // crash recovery have no live session and pass none.
+    superseded_labels: Vec<String>,
 ) {
     // --- Speaker pipeline (before formatting, so names reach the transcript,
     // the notes LLM, and the attendee list). Authoritative provider labels
@@ -401,6 +406,33 @@ pub(crate) async fn finalize_meeting(
     // against it — and the sync below indexes it in the same breath.
     crate::ocr::store(&db, &meeting_id, &image_readings);
     crate::search_index::sync_meeting(&db, &app.state::<AppState>().search, &meeting_id);
+
+    // The segments are committed, so a superseded live name's profile can
+    // be judged for what it is: if nothing links to it and it carries no
+    // notes, it was a mislabel corrected mid-meeting, and it goes.
+    if !superseded_labels.is_empty() {
+        match db.list_speakers() {
+            Ok(speakers) => {
+                let candidates: Vec<String> = speakers
+                    .into_iter()
+                    .filter(|p| {
+                        superseded_labels
+                            .iter()
+                            .any(|label| p.name.eq_ignore_ascii_case(label))
+                    })
+                    .map(|p| p.id)
+                    .collect();
+                match db.prune_orphaned_speakers(&candidates) {
+                    Ok(pruned) if !pruned.is_empty() => {
+                        tracing::info!(count = pruned.len(), "pruned orphaned speaker profiles");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("could not prune orphaned speakers: {e}"),
+                }
+            }
+            Err(e) => tracing::warn!("could not list speakers for orphan pruning: {e}"),
+        }
+    }
 
     if !config.retain_audio {
         let _ = std::fs::remove_file(&final_mp3_path);
