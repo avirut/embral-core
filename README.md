@@ -28,7 +28,7 @@ are downloaded on first run and everything after that happens on-device.
 
 This is the **offline core** of embral — the complete source of the
 on-device edition. The packaged app distributed on the
-[releases page](https://github.com/avirut/embral-core/releases) is the same
+[releases page](https://github.com/embralapp/embral-core/releases) is the same
 app plus an optional paid cloud tier (faster transcription, cloud
 summaries); its cloud code is not part of this repository.
 

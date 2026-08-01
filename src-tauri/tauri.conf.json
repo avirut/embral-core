@@ -38,7 +38,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5NzYzNzI3OTE4NTk2RjEKUldUeGxvV1JKemQycVJmZnJuU0twSmNqeUpxdnhHREJDSFpRWFBoNENIOGs0WCszbnpzYjF0eDUK",
       "endpoints": [
-        "https://github.com/avirut/embral-core/releases/latest/download/latest.json"
+        "https://github.com/embralapp/embral-core/releases/latest/download/latest.json"
       ]
     }
   },
