@@ -583,21 +583,29 @@ fn deliver(text: &str, copy: bool, paste: bool) {
     if !copy && !paste {
         return;
     }
-    let mut clipboard = match arboard::Clipboard::new() {
-        Ok(c) => c,
+    let mut guard = match clipboard().lock() {
+        Ok(g) => g,
         Err(e) => {
-            tracing::warn!("clipboard unavailable: {e}");
+            tracing::warn!("clipboard mutex poisoned: {e}");
             return;
         }
     };
-    let previous = clipboard.get_text().ok();
-    if let Err(e) = clipboard.set_text(text.to_string()) {
+    let Some(cb) = guard.as_mut() else {
+        tracing::warn!("clipboard unavailable");
+        return;
+    };
+    let previous = cb.get_text().ok();
+    if let Err(e) = cb.set_text(text.to_string()) {
         tracing::warn!("clipboard write failed: {e}");
         return;
     }
     if !paste {
         return;
     }
+    // Drop the mutex guard (not the clipboard) before the chord: the target
+    // reads through arboard's own server thread, and the restore thread
+    // below wants the same lock.
+    drop(guard);
     if let Err(e) = crate::platform::paste_keystroke() {
         // The text is still on the clipboard and in history — a failed
         // paste degrades, it doesn't lose the dictation.
@@ -610,12 +618,43 @@ fn deliver(text: &str, copy: bool, paste: bool) {
         if let Some(prev) = previous {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(600));
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    let _ = cb.set_text(prev);
+                if let Ok(mut guard) = clipboard().lock() {
+                    if let Some(cb) = guard.as_mut() {
+                        let _ = cb.set_text(prev);
+                    }
                 }
             });
         }
     }
+}
+
+/// The app's one clipboard handle, alive for the whole process.
+///
+/// **On X11 this is a correctness requirement, not an optimisation.** The
+/// clipboard there is an ownership protocol, not a buffer: the owning client
+/// serves the bytes when a target asks for them, which happens *after* the
+/// paste chord is delivered. arboard's `Drop` destroys its selection window
+/// and hands off to a clipboard manager if one is running — so a
+/// per-call handle meant the window was already gone by the time the target
+/// asked, and the paste arrived empty (measured on Cinnamon, which runs no
+/// such manager: dictation pasted nothing at all while reporting success).
+/// Plain "copy to clipboard" had the same hole — the text would vanish the
+/// moment `deliver` returned.
+///
+/// Holding one handle for the process fixes both, and matches what a user
+/// means by "it's on my clipboard": ours until they copy something else.
+/// Inert on Windows and macOS, whose clipboards really are buffers — the
+/// handle there is a cheap wrapper with no OS-level lock held.
+fn clipboard() -> &'static std::sync::Mutex<Option<arboard::Clipboard>> {
+    static CLIPBOARD: std::sync::OnceLock<std::sync::Mutex<Option<arboard::Clipboard>>> =
+        std::sync::OnceLock::new();
+    CLIPBOARD.get_or_init(|| {
+        std::sync::Mutex::new(
+            arboard::Clipboard::new()
+                .inspect_err(|e| tracing::warn!("clipboard unavailable: {e}"))
+                .ok(),
+        )
+    })
 }
 
 /// The overlay's fixed size: a status row over up to ~4 lines of live
@@ -644,20 +683,12 @@ fn show_overlay(app: &AppHandle) -> Result<(), AppError> {
             .visible(false)
             .build()
             .map_err(|e| format!("overlay window failed: {e}"))?;
-            // Display-only: clicks pass straight through, so the overlay
-            // can never steal focus from the paste target on any platform.
-            let _ = window.set_ignore_cursor_events(true);
             // Platform panel behaviors (macOS: join every Space, ride
             // full-screen apps). Native-window access is main-thread work.
             {
                 let styled = window.clone();
                 let _ = window.run_on_main_thread(move || {
-                    #[cfg(target_os = "macos")]
-                    if let Ok(ns_window) = styled.ns_window() {
-                        crate::platform::style_overlay(ns_window);
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    let _ = &styled;
+                    crate::platform::style_overlay(&styled);
                 });
             }
             window
@@ -675,6 +706,18 @@ fn show_overlay(app: &AppHandle) -> Result<(), AppError> {
         ));
     }
     window.show().map_err(|e| e.to_string())?;
+    // Display-only: clicks pass straight through, so the overlay can never
+    // steal focus from the paste target on any platform.
+    //
+    // **After `show()`, not at build time.** On Linux this reaches tao's
+    // `CursorIgnoreEvents`, which unwraps the widget's GDK window — and that
+    // does not exist until the window is realized. Setting it on the
+    // still-invisible window aborted the whole process (a panic in a
+    // non-unwinding context, so not even catchable): the first use of
+    // dictation killed the app. Both calls travel the same ordered window-
+    // request channel, so "after show" is ordering, not a race, and doing it
+    // on every show rather than once at creation is idempotent.
+    let _ = window.set_ignore_cursor_events(true);
     Ok(())
 }
 

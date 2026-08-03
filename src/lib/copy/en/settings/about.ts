@@ -14,6 +14,10 @@ export const about = {
     blocked: (reason: string) => `${reason} — finish it, then update.`,
     installing: 'Installing…',
     restartAndUpdate: 'Restart and update',
+    // Shown only where installing the update runs the package manager, so
+    // the authentication dialog isn't a surprise (Linux .deb/.rpm; an
+    // AppImage swaps itself in place and asks nothing).
+    needsPassword: 'Your system will ask for your password to install this.',
     checkForUpdates: 'Check for updates'
   },
 

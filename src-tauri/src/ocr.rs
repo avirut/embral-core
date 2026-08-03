@@ -177,6 +177,19 @@ mod tests {
         0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
+    /// Whether this platform has an OCR engine at all. Windows and macOS
+    /// read with an in-box one; Linux ships none by design
+    /// (`platform/linux/ocr.rs`), and `Recognized::Unavailable` means the
+    /// sweep stamps nothing and leaves images pending. The two sweep tests
+    /// below assert both shapes rather than skipping on the stub platform,
+    /// so "the engine is missing" stays a tested behavior and not a hole.
+    fn ocr_available() -> bool {
+        !matches!(
+            crate::platform::recognize_text(TINY_PNG),
+            crate::platform::types::Recognized::Unavailable
+        )
+    }
+
     fn meeting(id: &str) -> embral_db::MeetingRow {
         embral_db::MeetingRow {
             id: id.to_string(),
@@ -206,6 +219,17 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.upsert_meeting(&meeting("m1")).unwrap();
 
+        if !ocr_available() {
+            // No engine here: nothing is stamped, so the image stays pending
+            // and a platform that grows an engine would still find it. The
+            // sweep is a no-op rather than a destructive one, which is the
+            // whole of the contract on this platform.
+            assert_eq!(sweep(&db, &base, SWEEP_BATCH), 0);
+            assert!(db.image_text_filenames("m1").unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
         assert_eq!(sweep(&db, &base, SWEEP_BATCH), 1);
         assert_eq!(db.image_text_filenames("m1").unwrap(), vec!["img-01.png"]);
         assert!(db.image_text_filenames("live").unwrap().is_empty());
@@ -233,6 +257,16 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         db.upsert_meeting(&meeting("m1")).unwrap();
+
+        if !ocr_available() {
+            // Without an engine there is no way to tell "not an image" from
+            // "not read yet", so nothing is retired — the file stays pending
+            // rather than being wrongly stamped as answered.
+            assert_eq!(sweep(&db, &base, SWEEP_BATCH), 0);
+            assert!(db.image_text("m1").unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
 
         assert_eq!(sweep(&db, &base, SWEEP_BATCH), 1);
         assert_eq!(db.image_text("m1").unwrap(), vec![("notes.txt".to_string(), String::new())]);

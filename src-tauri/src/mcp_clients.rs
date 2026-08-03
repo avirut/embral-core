@@ -437,6 +437,61 @@ mod tests {
         assert_eq!(v["mcpServers"]["embral"]["command"], r"C:\apps\embral-mcp.exe");
     }
 
+    /// Linux port check, run manually because it reads the developer's real
+    /// `~/.claude.json`:
+    /// `cargo test -p embral --lib linux_registration_probe -- --ignored --nocapture`.
+    ///
+    /// Registration on Linux has three moving parts the unit tests above
+    /// cannot cover, because they all touch the machine: the sidecar has to
+    /// resolve, `claude` has to be findable on a PATH a desktop launch
+    /// inherits, and the merge has to survive a *real* config — Claude Code's
+    /// own file is tens of kilobytes of nested project state, not the tidy
+    /// fixtures above. Nothing is written; the merge runs in memory and every
+    /// top-level key is checked to survive it.
+    #[test]
+    #[ignore = "manual probe; reads the real ~/.claude.json (never writes)"]
+    fn linux_registration_probe() {
+        let (bin, exists) = server_binary().expect("sidecar path resolves");
+        eprintln!("sidecar: {} (present: {exists})", bin.display());
+        assert!(exists, "stage the sidecar first: node scripts/prepare-sidecar.mjs --debug");
+        assert_eq!(bin.file_name().unwrap(), "embral-mcp", "no .exe suffix on Linux");
+
+        let claude = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(crate::platform::find_cli("claude"));
+        eprintln!("claude: {claude:?}");
+        assert!(claude.is_some(), "find_cli must resolve a real claude");
+
+        let path = claude_code_config().expect("home dir");
+        let before = std::fs::read_to_string(&path).expect("read the real config");
+        eprintln!("config: {} ({} bytes)", path.display(), before.len());
+
+        let after = upsert_mcp_server(&before, bin.to_str().unwrap()).expect("merge");
+        let a: serde_json::Value = serde_json::from_str(&before).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&after).unwrap();
+
+        // Every pre-existing top-level key survives, byte-identical.
+        for (k, v) in a.as_object().unwrap() {
+            if k == "mcpServers" {
+                continue;
+            }
+            assert_eq!(b.get(k), Some(v), "top-level key {k:?} was altered");
+        }
+        // Any MCP server already registered is left alone.
+        if let Some(existing) = a.get("mcpServers").and_then(|m| m.as_object()) {
+            for (k, v) in existing {
+                if k != "embral" {
+                    assert_eq!(b["mcpServers"].get(k), Some(v), "clobbered server {k:?}");
+                }
+            }
+        }
+        assert_eq!(b["mcpServers"]["embral"]["command"], bin.to_str().unwrap());
+        eprintln!(
+            "merge preserved {} top-level keys and added mcpServers.embral",
+            a.as_object().unwrap().len()
+        );
+    }
+
     #[test]
     fn upsert_handles_empty_and_updates_in_place() {
         let fresh = upsert_mcp_server("", "a.exe").unwrap();

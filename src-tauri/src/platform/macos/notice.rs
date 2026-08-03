@@ -18,7 +18,6 @@
 //! out of Mission Control and the Window menu, which is what
 //! `skip_taskbar` (a Windows/Linux-only flag) cannot do here.
 
-use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder};
@@ -45,9 +44,14 @@ fn panel_class(window_class: &AnyClass) -> Option<&'static AnyClass> {
     })
 }
 
-/// Apply the macOS panel behaviors to the notice's NSWindow. Must run on
-/// the main thread (the caller uses the window's main-thread hook).
-pub fn style_notice(native_window: *mut c_void) {
+/// Apply the macOS panel behaviors to the notice's NSWindow. Takes the
+/// Tauri window and extracts the native handle here, so the caller needs no
+/// `cfg` (`platform/mod.rs`). Must run on the main thread — the caller uses
+/// the window's main-thread hook.
+pub fn style_notice(window: &tauri::WebviewWindow) {
+    let Ok(native_window) = window.ns_window() else {
+        return;
+    };
     if native_window.is_null() {
         return;
     }

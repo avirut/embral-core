@@ -329,7 +329,7 @@ pub const MODELS: &[KnownModel] = &[
     },
     // The llama.cpp runtime is the one per-platform binary in the catalog;
     // each target carries its own entry (same id, its own artifact —
-    // upstream ships a .zip on Windows and a .tar.gz on macOS).
+    // upstream ships a .zip on Windows and a .tar.gz on macOS and Linux).
     #[cfg(windows)]
     KnownModel {
         id: "llama-server",
@@ -357,6 +357,26 @@ pub const MODELS: &[KnownModel] = &[
         source: ModelSource::TarAll {
             url: "https://github.com/ggml-org/llama.cpp/releases/download/b9925/llama-b9925-bin-macos-arm64.tar.gz",
             bytes: 11_146_856,
+            exe: (FileRole::LlamaServer, "llama-server"),
+        },
+    },
+    // Upstream's ubuntu-x64 build. It is glibc-linked against Ubuntu's, so
+    // it runs on the port's declared floor (Debian 12 / Ubuntu 22.04, glibc
+    // 2.35) and newer — but a future catalog bump has to keep checking that,
+    // or this entry moves to a self-built artifact
+    // ([260801-linux-port.md](../../../docs/plans/260801-linux-port.md)).
+    #[cfg(target_os = "linux")]
+    KnownModel {
+        id: "llama-server",
+        display_name: "Summary engine",
+        kind: ModelKind::Llm,
+        languages: &["*"],
+        note: "Local runtime for summaries and dictation cleanup",
+        supports_hotwords: false,
+        native_punctuation: false,
+        source: ModelSource::TarAll {
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b9925/llama-b9925-bin-ubuntu-x64.tar.gz",
+            bytes: 15_898_134,
             exe: (FileRole::LlamaServer, "llama-server"),
         },
     },
@@ -905,12 +925,42 @@ mod tests {
         );
     }
 
+    /// Without a Linux arm in the catalog every summary path here dies with
+    /// "no runtime entry", so this test is the guard on that whole feature
+    /// existing on the platform at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn llm_pack_has_runtime_and_weights() {
+        let runtime = find("llama-server").unwrap();
+        assert_eq!(runtime.kind, ModelKind::Llm);
+        assert!(!runtime.kind.is_asr());
+        // A tar, like macOS — and the tar path's mode-bit and symlink
+        // handling is already `cfg(unix)`, so it carries over unchanged.
+        assert!(matches!(runtime.source, ModelSource::TarAll { .. }));
+        assert_eq!(
+            runtime
+                .role_path(FileRole::LlamaServer)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "llama-server"
+        );
+        // The weights are portable; only the runtime is per-target.
+        assert!(find("qwen3-4b").is_some());
+    }
+
     /// Live probe of the real runtime download + spawn — run manually:
     /// `cargo test -p embral-engine --lib llama_runtime_downloads -- --ignored --nocapture`.
     /// Proves the tar source end-to-end on this machine: the archive
     /// extracts flat, the exe keeps its mode bits, and its @rpath dylibs
     /// resolve from the flattened dir.
-    #[cfg(target_os = "macos")]
+    ///
+    /// The Linux arm below is the same probe and carries more weight there:
+    /// it is the only thing that proves upstream's *ubuntu*-x64 build
+    /// actually runs on the distribution in front of you, glibc floor and
+    /// bundled `.so`s included. A green `cargo test` says nothing about
+    /// that — only spawning the binary does.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     #[ignore = "manual probe; downloads the ~11 MB runtime and spawns it"]
     async fn llama_runtime_downloads_and_runs() {

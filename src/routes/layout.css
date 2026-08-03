@@ -183,10 +183,22 @@
 	   element a scroll-chaining boundary, which broke touchpad gestures:
 	   a two-finger scroll latches onto the scroller under the pointer at
 	   its first tick, and a gesture starting at a scroll limit latched
-	   onto something that refused to move, going dead until re-started. */
+	   onto something that refused to move, going dead until re-started.
+
+	   And the document itself never scrolls: the shell is a fixed-viewport
+	   layout and every scrolling pane is an inner container, so a document
+	   scrollbar is always an accident. It stops being cosmetic where
+	   scrollbars consume layout space (they do here — the themed
+	   `::-webkit-scrollbar` opts out of overlay bars; on GTK they always
+	   do): a tooltip that lands half a pixel past the window edge spawns a
+	   document scrollbar, the viewport narrows, the tooltip's collision
+	   logic pulls it back in, the scrollbar leaves, and the layout
+	   oscillates forever — measured on Linux (`scrollWidth` flapping
+	   960↔961 with the stop-recording tip at `right: 960.5`). */
 	html,
 	body {
 		overscroll-behavior: none;
+		overflow: hidden;
 	}
 
 	/* Reserve the scrollbar gutter in scrollable containers so centered

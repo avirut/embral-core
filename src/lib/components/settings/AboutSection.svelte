@@ -1,4 +1,5 @@
 <script lang="ts">
+
 	import { errorMessage } from '$lib/copy/errors';
     import { onMount } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
@@ -69,11 +70,21 @@
         }
     }
 
+    // Whether installing an update runs the package manager, which means an
+    // authentication dialog the user should see coming. Backend-resolved: only
+    // it can tell a .deb/.rpm install from an AppImage.
+    let needsPassword = $state(false);
+
     onMount(async () => {
         try {
             version = await getVersion();
         } catch {
             version = "dev";
+        }
+        try {
+            needsPassword = await invoke<boolean>("update_needs_authentication");
+        } catch {
+            needsPassword = false;
         }
     });
 
@@ -173,7 +184,9 @@
                 : t.updates.upToDate}
             description={updaterStore.blocked
                 ? t.updates.blocked(updaterStore.blocked)
-                : ""}
+                : updaterStore.available && needsPassword
+                  ? t.updates.needsPassword
+                  : ""}
         >
             {#if updaterStore.available}
                 <Button

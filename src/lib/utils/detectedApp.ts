@@ -9,6 +9,10 @@ type AppKey = keyof typeof copy.settings.meetings.autoStart.apps.names;
 const TOKENS: { token: string; key: AppKey }[] = [
   { token: 'zoom', key: 'zoom' },
   { token: 'teams', key: 'teams' },
+  // Chromium before Chrome only for readability — the two cannot collide,
+  // since neither name is a substring of the other. Without its own entry a
+  // Linux Chromium would fall through to the cleaned-stem path below.
+  { token: 'chromium', key: 'chromium' },
   { token: 'chrome', key: 'chrome' },
   { token: 'edge', key: 'edge' },
   { token: 'safari', key: 'safari' },

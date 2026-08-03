@@ -31,13 +31,17 @@ pub fn flush_soon(state: &crate::AppState) {
 pub fn normalize_detected_app(process: &str) -> &'static str {
     let p = process.to_ascii_lowercase();
     for known in [
-        "zoom", "teams", "chrome", "msedge", "firefox", "slack", "discord", "webex",
+        // `chromium` is its own token, not folded into `chrome`: neither
+        // string contains the other, so a Linux Chromium user would
+        // otherwise report as "other" and be invisible.
+        "zoom", "teams", "chrome", "chromium", "msedge", "firefox", "slack", "discord", "webex",
     ] {
         if p.contains(known) {
             return match known {
                 "zoom" => "zoom",
                 "teams" => "teams",
                 "chrome" => "chrome",
+                "chromium" => "chromium",
                 "msedge" => "msedge",
                 "firefox" => "firefox",
                 "slack" => "slack",
@@ -77,6 +81,15 @@ mod tests {
         assert_eq!(normalize_detected_app("Zoom.exe"), "zoom");
         assert_eq!(normalize_detected_app("ms-teams.exe"), "teams");
         assert_eq!(normalize_detected_app("msedge.exe"), "msedge");
+        // Linux identities are bare process names.
+        assert_eq!(normalize_detected_app("teams-for-linux"), "teams");
+        assert_eq!(normalize_detected_app("msedge"), "msedge");
+        // Chromium is its own bucket, and must not be swallowed by "chrome"
+        // (nor vice versa) — neither name contains the other.
+        assert_eq!(normalize_detected_app("chromium"), "chromium");
+        assert_eq!(normalize_detected_app("chromium-browser"), "chromium");
+        assert_eq!(normalize_detected_app("chrome"), "chrome");
+        assert_eq!(normalize_detected_app("google-chrome"), "chrome");
         // Anything unknown collapses to "other" — exe names never leave.
         assert_eq!(normalize_detected_app("obscure-voip-tool.exe"), "other");
     }

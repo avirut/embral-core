@@ -62,6 +62,14 @@ pub fn create_tray(app: &App) -> Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
                 if let Some(w) = app.get_webview_window("main") {
+                    // `unminimize` first, matching the single-instance rescue
+                    // (`lib.rs`): a window that was minimised rather than
+                    // hidden stays invisible through `show()` alone, and on
+                    // Wayland the two states are harder to tell apart than
+                    // elsewhere — the app reporting itself visible while
+                    // nothing is on screen is exactly the reachable-nowhere
+                    // failure this menu item exists to prevent.
+                    let _ = w.unminimize();
                     crate::window_rescue::ensure_on_screen(&w);
                     let _ = w.show();
                     let _ = w.set_focus();

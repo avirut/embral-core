@@ -10,6 +10,23 @@ describe('displayAppName', () => {
     expect(displayAppName('webex.exe')).toBe('Webex');
   });
 
+  it('maps Linux identities, which are bare process names', () => {
+    // No `.exe` to strip here — pulse reports the binary name directly.
+    expect(displayAppName('zoom')).toBe('Zoom');
+    // The Linux Teams client's binary; `teams` catches it by substring.
+    expect(displayAppName('teams-for-linux')).toBe('Teams');
+    // Edge is `msedge` on Linux as on Windows, not macOS's bare `edge`.
+    expect(displayAppName('msedge')).toBe('Edge');
+    // Chromium is its own name, not "Chrome": neither string contains the
+    // other, so without its own token this would fall through to the
+    // cleaned-stem path and read as a raw process name.
+    expect(displayAppName('chromium')).toBe('Chromium');
+    expect(displayAppName('chromium-browser')).toBe('Chromium');
+    // And Chrome still resolves to Chrome, not Chromium.
+    expect(displayAppName('google-chrome')).toBe('Chrome');
+    expect(displayAppName('chrome')).toBe('Chrome');
+  });
+
   it('cleans up anything outside the known set', () => {
     // Raw exe text must never reach the user, even for unknown apps
     // (the Always policy detects any mic holder).

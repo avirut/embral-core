@@ -167,6 +167,70 @@ mod tests {
         assert!(!match_app(&exe(""), &allow));
     }
 
+    /// Linux identities, taken verbatim from a live Zoom-in-Chrome call and
+    /// the real process names of the Linux clients. The vocabulary is bare
+    /// process names — no `.exe`, no bundle ids — so these are the fixtures
+    /// that prove the platform-keyed default list actually matches what
+    /// `mic_users.rs` reports there ([260801-linux-port.md] Phase 2).
+    ///
+    /// [260801-linux-port.md]: ../../../docs/plans/260801-linux-port.md
+    #[test]
+    fn matcher_handles_linux_identities() {
+        // The Linux default list, verbatim from embral-types.
+        let allow = list(&[
+            "zoom", "teams", "chrome", "chromium", "msedge", "firefox", "slack", "discord",
+            "webex",
+        ]);
+
+        // A real browser call, measured: pulse reports the binary and an
+        // app name with " input" appended for a record stream. Either
+        // identity alone must be enough.
+        let browser_call = crate::platform::types::AppId {
+            pid: 4564, // Chrome's audio.mojom.AudioService child, not the browser
+            exe: Some("chrome".into()),
+            bundle_id: None,
+            display_name: Some("Google Chrome input".into()),
+        };
+        assert!(match_app(&browser_call, &allow), "a Zoom call in Chrome is detected");
+        // And with only the suffixed display name to go on.
+        let name_only = crate::platform::types::AppId {
+            pid: 4564,
+            exe: None,
+            bundle_id: None,
+            display_name: Some("Google Chrome input".into()),
+        };
+        assert!(match_app(&name_only, &allow), "the suffixed name still matches");
+
+        // The native Linux clients, by their actual binary names.
+        for binary in [
+            "zoom",             // zoom desktop
+            "teams-for-linux",  // the Teams client's real binary
+            "slack",
+            "discord",
+            "firefox",
+            "msedge",           // Edge is msedge on Linux, as on Windows
+            "chromium",
+            "chromium-browser", // some distros' package name
+        ] {
+            assert!(match_app(&exe(binary), &allow), "{binary} must be detected");
+        }
+
+        // Things that must not trip detection.
+        for binary in ["gnome-terminal", "code", "spotify", "pipewire", "pulseaudio"] {
+            assert!(!match_app(&exe(binary), &allow), "{binary} is not a meeting");
+        }
+
+        // Chrome and Chromium stay distinct — the pair substring matching
+        // cannot collapse, which is why both need their own entry. With only
+        // `chrome` allowed, a Chromium call goes undetected.
+        let chrome_only = list(&["chrome"]);
+        assert!(match_app(&exe("google-chrome"), &chrome_only));
+        assert!(
+            !match_app(&exe("chromium"), &chrome_only),
+            "this is exactly why the Linux list carries chromium separately"
+        );
+    }
+
     #[test]
     fn matcher_accepts_any_identity_the_platform_has() {
         let allow = list(&["zoom", "chrome", "slack"]);

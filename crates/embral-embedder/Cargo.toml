@@ -17,3 +17,7 @@ ort = "=2.0.0-rc.12"
 # Pure-Rust feature set (fancy-regex instead of oniguruma, rust esaxx):
 # tokenizers' default C++ deps would open a second C++-runtime front.
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+[build-dependencies]
+# Compiles isoc23_shim.c on linux-gnu targets only (see build.rs).
+cc = "1"

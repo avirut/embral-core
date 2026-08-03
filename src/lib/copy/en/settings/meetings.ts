@@ -34,6 +34,10 @@ export const meetings = {
         edge: 'Edge',
         // Rendered on macOS only (the grid is platform-keyed detector data).
         safari: 'Safari',
+        // Rendered on Linux only, and a separate row from Chrome rather than
+        // folded into it: the detector's substring match is bidirectional,
+        // but neither "chrome" nor "chromium" contains the other.
+        chromium: 'Chromium',
         firefox: 'Firefox',
         slack: 'Slack',
         discord: 'Discord',

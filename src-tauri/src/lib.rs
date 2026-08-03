@@ -197,15 +197,36 @@ pub fn logs_dir() -> std::path::PathBuf {
 }
 
 /// The `--child-reaper` subprocess body (see `platform::supervisor`).
-/// A no-op on Windows, where the job object covers orphan cleanup and the
-/// flag is never passed.
+/// Every platform supplies one — a no-op where the OS already covers orphan
+/// cleanup (Windows' job object, Linux's `PR_SET_PDEATHSIG`) and the flag is
+/// never passed — so this call needs no `cfg`.
 pub fn run_child_reaper() {
-    #[cfg(target_os = "macos")]
-    platform::supervisor::run_reaper();
+    platform::run_reaper();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // **embral is an X11 application on Linux.** Ask GTK for the X11 backend
+    // before anything initialises it, so a Wayland session runs us through
+    // Xwayland rather than as a native Wayland client.
+    //
+    // This is a deliberate narrowing, not a workaround for one bug. Wayland
+    // withholds three things this app is built on, by design and from every
+    // ordinary client: positioning your own windows (the notice belongs
+    // bottom-right, and a compositor put it top-left instead), synthesising
+    // keystrokes (dictation's auto-paste), and asking which window has focus.
+    // Supporting both meant three degraded paths and a settings surface
+    // apologising for them; running on X11 everywhere means one path that
+    // works. Xwayland ships with every Wayland desktop, so this costs users
+    // nothing but honesty in the docs.
+    //
+    // The one residue: on a Wayland session, auto-paste reaches X11 and
+    // Xwayland targets but not windows that are natively Wayland — XTEST
+    // cannot see them. Recording, transcription, notes and search are
+    // unaffected either way.
+    #[cfg(target_os = "linux")]
+    std::env::set_var("GDK_BACKEND", "x11");
+
     // Default to `info`: a clean recording emits only the standardized
     // per-session spine (connect → ready → ~20s heartbeat → finish) plus any
     // warn/error. The per-message/per-frame firehose lives at `trace` — opt in
@@ -553,6 +574,7 @@ macro_rules! app_handler_with {
             commands::open_notes_folder,
             commands::list_audio_devices,
             commands::mic_permission,
+            commands::update_needs_authentication,
             commands::request_mic_permission,
             commands::accessibility_permission,
             commands::request_accessibility_permission,

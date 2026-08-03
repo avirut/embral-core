@@ -29,3 +29,28 @@ pub fn accessibility_permission() -> crate::platform::types::PermissionState {
 pub fn request_accessibility_permission() -> crate::platform::types::PermissionState {
     crate::platform::permissions::request_accessibility()
 }
+
+/// Whether installing an update will ask for the root password.
+///
+/// A `.deb` or `.rpm` update is applied by the package manager, so
+/// `tauri-plugin-updater` escalates (pkexec → zenity/kdialog → sudo) and the
+/// user meets an authentication dialog. An AppImage swaps itself in place and
+/// asks nothing; Windows and macOS never do either.
+///
+/// The AppImage runtime exports `$APPIMAGE` (the path of the running image),
+/// which is the reliable discriminator — the alternative is guessing from the
+/// executable's location, and a `.deb` and a hand-copied AppImage can sit in
+/// the same directory. Absent that variable on Linux, we are running from a
+/// package. Lives beside the permission checks because it answers the same
+/// shape of question: what will the OS demand of the user.
+#[tauri::command]
+pub fn update_needs_authentication() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("APPIMAGE").is_none()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}

@@ -4,7 +4,8 @@
     import { Check, PenLine, RotateCcw } from "lucide-svelte";
     import * as Dialog from "$lib/components/ui/dialog";
     import { modelsStore } from "$lib/stores/models.svelte";
-    import { isMac } from "$lib/platform";
+    import { isLinux, isMac } from "$lib/platform";
+    import { disableApp, enableApp, isAppEnabled } from "$lib/utils/allowlist";
     import TranscriptionBlock from "./TranscriptionBlock.svelte";
     import HotkeyCapture from "./HotkeyCapture.svelte";
     import type {
@@ -78,20 +79,28 @@
         { key: "chrome", match: "chrome" },
         { key: "edge", match: isMac ? "edge" : "msedge" },
         ...(isMac ? [{ key: "safari", match: "safari" } as const] : []),
+        // Linux-only row. Match strings should agree with that platform's
+        // `default_auto_detect_apps` (embral-types) so a fresh install shows
+        // the boxes it is actually detecting with.
+        ...(isLinux ? [{ key: "chromium", match: "chromium" } as const] : []),
         { key: "firefox", match: "firefox" },
         { key: "slack", match: "slack" },
         { key: "discord", match: "discord" },
         { key: "webex", match: "webex" },
     ];
 
+    // Both read the allowlist the way the detector does (bidirectional
+    // substring), not by exact equality — otherwise a covering entry the grid
+    // has no checkbox for survives an uncheck and keeps the app detected
+    // while the box shows off. See utils/allowlist.ts.
     function appChecked(match: string): boolean {
-        return draft.auto_detect_apps.includes(match);
+        return isAppEnabled(draft.auto_detect_apps, match);
     }
 
     function toggleApp(match: string) {
         draft.auto_detect_apps = appChecked(match)
-            ? draft.auto_detect_apps.filter((a) => a !== match)
-            : [...draft.auto_detect_apps, match];
+            ? disableApp(draft.auto_detect_apps, match)
+            : enableApp(draft.auto_detect_apps, match);
     }
 
 

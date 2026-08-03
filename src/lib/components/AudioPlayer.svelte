@@ -1,5 +1,6 @@
 <script lang="ts">
   import { convertFileSrc } from '@tauri-apps/api/core';
+  import { isLinux } from '$lib/platform';
   import { Pause, Play, Star } from 'lucide-svelte';
   import type { MeetingStar } from '$lib/types';
   import { formatTime } from '$lib/utils/meetingFormat';
@@ -33,7 +34,50 @@
   // Cursor position over the track, for the time tooltip.
   let hoverRatio = $state<number | null>(null);
 
-  const src = $derived(audioPath ? convertFileSrc(audioPath) : null);
+  const assetUrl = $derived(audioPath ? convertFileSrc(audioPath) : null);
+
+  // On Linux the asset URL cannot feed a media element directly. WebKitGTK
+  // plays media through GStreamer, which does not go through WebKit's custom
+  // URI scheme handlers — measured in the live webview: the same file errors
+  // with MEDIA_ERR_SRC_NOT_SUPPORTED as `asset://localhost/…` and plays as a
+  // blob URL, while `fetch()` of the asset URL works either way. Fetching the
+  // bytes ourselves and handing over a blob sidesteps the media path entirely.
+  // (The blob keeps whatever Content-Type the asset protocol sent — GStreamer
+  // typefinds from the bytes, so the type does not matter.)
+  //
+  // Only Linux pays for it: Windows and macOS keep the streaming asset URL, so
+  // nothing there starts buffering whole meetings into memory. The blob is
+  // revoked when the path changes or the player goes away.
+  let blobUrl = $state<string | null>(null);
+
+  $effect(() => {
+    if (!isLinux || !assetUrl) return;
+    let revoked = false;
+    let created: string | null = null;
+    void (async () => {
+      try {
+        const res = await fetch(assetUrl);
+        if (!res.ok) throw new Error(`asset fetch failed: ${res.status}`);
+        created = URL.createObjectURL(await res.blob());
+        if (revoked) {
+          URL.revokeObjectURL(created);
+          return;
+        }
+        blobUrl = created;
+      } catch (e) {
+        // Leave `blobUrl` null: `src` stays null on Linux, so the player
+        // renders its "no audio" state rather than a broken element.
+        console.error('audio blob failed', e);
+      }
+    })();
+    return () => {
+      revoked = true;
+      if (created) URL.revokeObjectURL(created);
+      blobUrl = null;
+    };
+  });
+
+  const src = $derived(isLinux ? blobUrl : assetUrl);
   const progress = $derived(duration > 0 ? (currentTime / duration) * 100 : 0);
 
   function activateStar(star: MeetingStar, index: number) {

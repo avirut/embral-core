@@ -56,6 +56,11 @@ pub fn kill_children_with_us() {
     }
 }
 
+/// The `--child-reaper` subprocess body. Nothing to do on Windows: the job
+/// object covers orphan cleanup, so the flag is never passed and this never
+/// runs. Present so the caller needs no `cfg` (`platform/mod.rs`).
+pub fn run_reaper() {}
+
 /// Job membership is assigned after spawn ([`watch_child`]) — nothing
 /// to do on the command.
 pub fn prepare_spawn(_cmd: &mut std::process::Command) {}

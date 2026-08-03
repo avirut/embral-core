@@ -9,8 +9,9 @@
 // Adding a second locale converts this one file to `.svelte.ts` holding a
 // `$state.raw` catalog behind per-surface getters; nothing else changes.
 
-import { isMac } from '../platform';
+import { platform } from '../platform';
 import { en } from './en';
+import { linux } from './en/linux';
 import { mac } from './en/mac';
 import { overlay } from './overlay';
 import type { Widen } from './types';
@@ -27,5 +28,7 @@ void _schema;
 
 // The platform overlay applies at the same swap point a second locale will:
 // wording that is Windows-specific ("Ctrl+K", "Windows accent") reads
-// correctly on macOS without forking the catalog.
-export const copy = isMac ? overlay(en, mac) : en;
+// correctly on macOS and Linux without forking the catalog. `en` is the
+// Windows shape, so that platform needs no overlay at all.
+export const copy =
+  platform === 'macos' ? overlay(en, mac) : platform === 'linux' ? overlay(en, linux) : en;

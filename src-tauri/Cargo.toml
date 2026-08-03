@@ -1,6 +1,6 @@
 [package]
 name = "embral"
-version = "26.8.1"
+version = "26.8.2"
 description = "Meeting transcription and notes, on your machine."
 authors = ["avirut"]
 edition = "2021"
@@ -43,17 +43,58 @@ cpal = "0.15"
 hound = "3.5"
 rubato = "0.15"
 mp3lame-encoder = "0.2"
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+# rustls, not the platform TLS stack. `embral-engine` and `embral-notes`
+# already link rustls, so the default `native-tls` here was the odd one out
+# — and on Linux it means OpenSSL, i.e. a `libssl3` the AppImage would have
+# to find on the host. Everything reqwest's defaults gave us is listed
+# explicitly so the only thing that changes is the TLS backend.
+#
+# **Native roots, not just webpki.** Plain `rustls-tls` means bundled
+# Mozilla roots alone, and asking for it here would have quietly narrowed
+# what Windows and macOS trust: `default-tls` used to feed the whole
+# workspace's reqwest through schannel / Security.framework, so a machine
+# carrying a corporate root CA or sitting behind a TLS-inspecting proxy
+# verified fine and would have started failing every model download and
+# cloud call — on a build that passes every check.
+#
+# The two root sets add rather than replace (reqwest extends the store with
+# webpki's, then the OS store's), and `embral-engine` / `embral-notes` still
+# ask for `rustls-tls`, so webpki stays the floor and the OS store is what
+# this flag restores on top. Linux pays nothing for it: `rustls-native-certs`
+# reads the cert files instead of linking OpenSSL, so the AppImage still
+# needs no `libssl3`.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "stream",
+    "charset",
+    "http2",
+    "macos-system-configuration",
+    "rustls-tls-native-roots",
+] }
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+# rustls too, and the same system roots as reqwest above. The relay this
+# talks to is embral's own backend on a public CA, so bundled roots would
+# reach it — but a proxy that terminates TLS sits in front of every host
+# equally, and one connection failing where the rest succeed is the harder
+# bug to read.
+tokio-tungstenite = { version = "0.21", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-native-roots",
+] }
 async-trait = "0.1"
 futures-util = "0.3"
 url = "2"
 base64 = "0.22"
-arboard = { version = "3", default-features = false }
+# `wayland-data-control` adds the wlr protocol arboard needs to reach a
+# pure-Wayland session's clipboard; without it the Linux build only talks
+# X11 and rides XWayland's bridge, which a Wayland-only session has no
+# reason to be running. Inert on Windows and macOS.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
 
 # The Windows platform layer (src/platform/windows/). The macOS build must
@@ -102,3 +143,29 @@ objc2-core-graphics = { version = "0.3.2", features = ["CGEvent", "CGEventTypes"
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSDictionary", "NSProcessInfo", "NSUserDefaults", "NSString"] }
 # Vision, for the in-box OCR engine (platform/macos/ocr.rs).
 objc2-vision = { version = "0.3.2", features = ["VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
+
+# The Linux platform layer (src/platform/linux/). Kept deliberately small:
+# every capability here is either a plain syscall, a freedesktop D-Bus
+# interface, or the PulseAudio protocol — no desktop-environment SDKs.
+[target.'cfg(target_os = "linux")'.dependencies]
+# PR_SET_PDEATHSIG + uname (platform/linux/supervisor.rs, os_build.rs).
+libc = "0.2.189"
+# The XDG settings portal, for the shell theme + accent
+# (platform/linux/theme.rs). Pure Rust — no glib main loop to integrate.
+zbus = "5"
+# The PulseAudio protocol, for the three audio jobs (platform/linux/pulse.rs,
+# mic_users.rs, audio_apps.rs, and loopback.rs from Phase 3). Served by
+# PipeWire's pulse layer everywhere that matters; one API covers legacy
+# PulseAudio for free.
+libpulse-binding = "2.28"
+# The blocking record-stream API, for the monitor-source capture lane
+# (platform/linux/loopback.rs). A dedicated thread already owns that lane, so
+# a blocking read loop is the right shape — no second mainloop to pump.
+libpulse-simple-binding = "2.28"
+# X11, for dictation's paste chord (XTEST) and the focused-window query
+# (platform/linux/input.rs). Pure Rust; only the extensions named here.
+x11rb = { version = "0.13", features = ["xtest"] }
+# GTK, for the notice window's never-activate hints
+# (platform/linux/notice.rs). Version-locked to what Tauri itself links, so
+# `gtk_window()`'s type matches.
+gtk = "0.18"

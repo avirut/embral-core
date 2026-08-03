@@ -7,13 +7,16 @@
 //! separately: the overlay ignores cursor events on every platform, so it
 //! can never be clicked into activation.)
 
-use std::ffi::c_void;
-
-/// Apply the macOS panel behaviors to the overlay's NSWindow. Must run on
-/// the main thread (the caller uses the window's main-thread hook).
-pub fn style_overlay(ns_window: *mut c_void) {
+/// Apply the macOS panel behaviors to the overlay's NSWindow. Takes the
+/// Tauri window and extracts the native handle here, so the caller needs no
+/// `cfg` (`platform/mod.rs`). Must run on the main thread — the caller uses
+/// the window's main-thread hook.
+pub fn style_overlay(window: &tauri::WebviewWindow) {
     use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
 
+    let Ok(ns_window) = window.ns_window() else {
+        return;
+    };
     if ns_window.is_null() {
         return;
     }

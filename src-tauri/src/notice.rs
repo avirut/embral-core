@@ -136,7 +136,16 @@ fn show_notice(app: &AppHandle, payload: NoticePayload) -> Result<(), AppError> 
             .always_on_top(true)
             .skip_taskbar(true)
             .focused(false)
-            .resizable(false)
+            // **Resizable, despite nothing being able to resize it.** On GTK,
+            // `resizable(false)` makes the window take the webview's *natural*
+            // size and drops the size hints entirely — measured: the notice
+            // came out 360x200 while asking for 360x56, and neither
+            // `min_inner_size` nor `max_inner_size` could pull it back. The
+            // same window with resizing left on honours its size, exactly as
+            // the main window honours its 840x560 minimum. Nothing here is
+            // draggable (no decorations, never focused), so this costs no
+            // affordance — it is the only way to be the size we asked for.
+            .resizable(true)
             .visible(false)
             .build()
             .map_err(|e| format!("notice window failed: {e}"))?;
@@ -146,14 +155,7 @@ fn show_notice(app: &AppHandle, payload: NoticePayload) -> Result<(), AppError> 
             {
                 let styled = window.clone();
                 let _ = window.run_on_main_thread(move || {
-                    #[cfg(windows)]
-                    if let Ok(hwnd) = styled.hwnd() {
-                        crate::platform::style_notice(hwnd.0);
-                    }
-                    #[cfg(target_os = "macos")]
-                    if let Ok(ns_window) = styled.ns_window() {
-                        crate::platform::style_notice(ns_window);
-                    }
+                    crate::platform::style_notice(&styled);
                 });
             }
             window
@@ -161,6 +163,10 @@ fn show_notice(app: &AppHandle, payload: NoticePayload) -> Result<(), AppError> 
     };
 
     let _ = window.set_size(tauri::LogicalSize::new(w, h));
+
+    // Bottom-right of the current monitor. Verified on X11 by screenshot —
+    // the logical form places it correctly, and an earlier "it lands at
+    // x=3088" reading was `wmctrl -lG` being misread, not a real bug.
     if let Ok(Some(monitor)) = window.current_monitor() {
         let scale = monitor.scale_factor();
         let screen = monitor.size().to_logical::<f64>(scale);
@@ -172,6 +178,15 @@ fn show_notice(app: &AppHandle, payload: NoticePayload) -> Result<(), AppError> 
     }
     let _ = app.emit_to(NOTICE, "notice-payload", &payload);
     window.show().map_err(|e| e.to_string())?;
+
+    // Kept at info: the notice is chrome-less, so there is no frame to eyeball
+    // and a platform override reads as a design mistake rather than what it is.
+    tracing::info!(
+        asked = ?(w, h),
+        inner = ?window.inner_size(),
+        scale = ?window.scale_factor(),
+        "notice geometry"
+    );
     Ok(())
 }
 

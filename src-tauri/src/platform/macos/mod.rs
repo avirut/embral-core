@@ -32,7 +32,9 @@ pub use mic_users::processes_using_microphone;
 pub use os_build::os_build;
 pub use power::power_source;
 pub use proc::{exe_name, find_cli, hide_console, hide_console_tokio};
-pub use supervisor::{kill_children_with_us, prepare_spawn, prepare_spawn_tokio, watch_child};
+pub use supervisor::{
+    kill_children_with_us, prepare_spawn, prepare_spawn_tokio, run_reaper, watch_child,
+};
 pub use theme::{theme_snapshot, watch_theme};
 
 /// The idle menu-bar icon is a template image: the system recolors it from

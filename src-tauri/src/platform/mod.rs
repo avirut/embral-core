@@ -16,15 +16,19 @@
 //!   chord into the focused app) and `focused_app() -> Option<AppId>`.
 //! - `theme.rs` — the OS shell theme + accent the tray icons follow, and
 //!   a change watcher.
-//! - `supervisor.rs` — children die with this process however it dies.
+//! - `supervisor.rs` — children die with this process however it dies,
+//!   plus `run_reaper()` for the `--child-reaper` subprocess body (a no-op
+//!   where the OS already covers orphan cleanup).
 //! - `proc.rs` — spawn decoration (`hide_console`), executable naming
 //!   (`exe_name`), CLI resolution (`find_cli`).
 //! - `mcp_paths.rs` — where AI clients keep their MCP configs.
-//! - `overlay.rs` — `style_overlay(native_window)`: extra panel behaviors
+//! - `overlay.rs` — `style_overlay(&WebviewWindow)`: extra panel behaviors
 //!   for the dictation overlay (macOS joins Spaces; Windows no-op).
-//! - `notice.rs` — `style_notice(native_window)`: the notice window's
-//!   never-activate styling (Windows `WS_EX_NOACTIVATE`; macOS no-op —
-//!   the window never exists there).
+//! - `notice.rs` — `style_notice(&WebviewWindow)`: the notice window's
+//!   never-activate styling (Windows `WS_EX_NOACTIVATE`; macOS swaps the
+//!   window's class to a non-activating `NSPanel`). Both take the Tauri
+//!   window, not a raw handle: extracting `hwnd()` / `ns_window()` is
+//!   itself platform-specific and belongs on this side of the seam.
 //! - `power.rs` — `power_source() -> PowerSource`: wall power vs battery,
 //!   read once per recording by the provider policy
 //!   ([transcription.md](../../../docs/transcription.md)).
@@ -35,9 +39,25 @@
 //!   above the seam ([storage.md](../../../docs/storage.md)).
 //! - `os_build()` — the OS version string telemetry reports.
 //!
-//! Stub rule: a platform that lacks a capability returns the inert value
-//! (`None`, empty vec, no-op) — callers already degrade gracefully and
-//! must never need `cfg` at the call site.
+//! ## Stub rule
+//!
+//! A platform that lacks a capability returns the inert value (`None`,
+//! empty vec, no-op). Callers already degrade gracefully, so no caller ever
+//! branches on the OS to decide *what to do*: `paste_keystroke` returning
+//! `Err` is handled the same way everywhere, and nothing above this seam
+//! asks "am I on Linux?" before choosing a path.
+//!
+//! **That is a rule about capabilities, not about the token `cfg`.** A
+//! `#[cfg]` that plumbs a genuinely per-OS *type* — three window handles
+//! really are three different types — is ordinary code, not a leak, and
+//! hiding it behind machinery is usually worse than writing one branch per
+//! OS in the one place it matters. Prefer moving such a thing behind the
+//! seam only when the knowledge itself is platform knowledge and the seam is
+//! its natural home (as with `style_notice` / `style_overlay`, which take
+//! the Tauri window because "which handle does this OS use" is exactly the
+//! sort of fact that belongs in here). Do not go hunting for `cfg` to
+//! delete: an earlier reading of this paragraph as a blanket ban sent a
+//! refactor through two shipping platforms to avoid a single branch.
 //!
 //! [260725-macos-port.md]: ../../docs/plans/260725-macos-port.md
 
@@ -60,3 +80,9 @@ pub use windows::*;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::*;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::*;
+

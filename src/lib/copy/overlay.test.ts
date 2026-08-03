@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { en } from './en';
+import { linux } from './en/linux';
 import { mac } from './en/mac';
 import { overlay } from './overlay';
 
@@ -47,5 +48,36 @@ describe('overlay', () => {
       }
     };
     walk(mac, 'mac');
+    walk(linux, 'linux');
+  });
+
+  it('applies the Linux overlay onto the catalog', () => {
+    const merged = overlay(en, linux);
+    // The two keys that genuinely differ from the Windows base.
+    expect(merged.settings.general.appearance.indicator.accent).toBe('System accent');
+    expect(merged.settings.mcp.missingServer).not.toContain('.exe');
+    // And the ones that deliberately do not: Linux shares Windows' modifier
+    // dialect and its window chrome, so a Ctrl chord or "Close to tray"
+    // appearing in the overlay would be a mistake.
+    expect(merged.shell.titleBar.commandBar.shortcut).toBe('Ctrl+K');
+    expect(merged.meetings.recording.star).toContain('Ctrl+S');
+    expect(merged.shell.titleBar.close).toBe(en.shell.titleBar.close);
+  });
+
+  it('the Linux overlay is a subset of what macOS needed to change', () => {
+    // Not a style rule — a check that Linux has not quietly picked up a
+    // macOS-shaped key. Every path Linux overrides must also be one macOS
+    // overrides, because macOS diverges from the Windows base in strictly
+    // more places (modifiers and titlebar on top of these two).
+    const paths = (node: unknown, prefix = ''): string[] => {
+      if (typeof node !== 'object' || node === null) return [prefix];
+      return Object.entries(node).flatMap(([k, v]) =>
+        paths(v, prefix ? `${prefix}.${k}` : k)
+      );
+    };
+    const macPaths = new Set(paths(mac));
+    for (const path of paths(linux)) {
+      expect(macPaths, `${path} is overridden on Linux but not macOS`).toContain(path);
+    }
   });
 });

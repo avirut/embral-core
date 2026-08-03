@@ -618,14 +618,42 @@ fn default_llm_idle_minutes() -> u32 {
 /// the macOS list says "edge"/"safari" where Windows says "msedge".
 #[cfg(windows)]
 fn default_auto_detect_apps() -> Vec<String> {
-    ["zoom", "ms-teams", "teams", "chrome", "msedge", "firefox", "slack", "discord", "webex"]
+    // `ms-teams` used to sit beside `teams` here. It was redundant — `teams`
+    // matches `ms-teams.exe` by substring — and worse than redundant: the
+    // settings grid has only a `teams` checkbox, so the extra entry survived
+    // an uncheck and kept Teams detected. Removed, and
+    // `no_token_is_redundant` below keeps it from coming back.
+    ["zoom", "teams", "chrome", "msedge", "firefox", "slack", "discord", "webex"]
         .map(String::from)
         .to_vec()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn default_auto_detect_apps() -> Vec<String> {
     ["zoom", "teams", "chrome", "edge", "safari", "firefox", "slack", "discord", "webex"]
+        .map(String::from)
+        .to_vec()
+}
+
+/// Linux reports bare process names, so the tokens are the Windows ones
+/// without `.exe` — Edge is `msedge` again, not macOS's `edge`. Two
+/// differences from both siblings:
+///
+/// - **No `safari`**: there is no Safari for Linux. This arm exists largely
+///   because the previous `cfg(not(windows))` fallthrough handed Linux the
+///   macOS list and Safari with it.
+/// - **`chromium` is its own entry**: the matcher's substring test is
+///   bidirectional, but neither "chrome" nor "chromium" contains the other,
+///   so `chrome` genuinely does not cover it.
+///
+/// Deliberately *not* here: `teams-for-linux`, the Linux Teams client's
+/// binary name. `teams` already matches it by substring, and an entry with
+/// no checkbox in the settings grid cannot be unchecked — the grid tests
+/// exact membership. (Windows' `ms-teams` is exactly that wart; not
+/// reproducing it here.) Every token below has a matching checkbox.
+#[cfg(target_os = "linux")]
+fn default_auto_detect_apps() -> Vec<String> {
+    ["zoom", "teams", "chrome", "chromium", "msedge", "firefox", "slack", "discord", "webex"]
         .map(String::from)
         .to_vec()
 }
@@ -961,4 +989,92 @@ pub fn index_path(base: &Path) -> PathBuf {
 
 pub fn config_path(base: &Path) -> PathBuf {
     base.join("config.json")
+}
+
+#[cfg(test)]
+mod detect_default_tests {
+    use super::*;
+
+    /// Properties every platform's list must hold. There were no tests over
+    /// these lists at all before the Linux arm existed, which is how the
+    /// `cfg(not(windows))` fallthrough quietly handed Linux the macOS list.
+    #[test]
+    fn the_default_list_is_well_formed() {
+        let apps = default_auto_detect_apps();
+        assert!(!apps.is_empty(), "an empty list detects nothing");
+        for app in &apps {
+            assert_eq!(app, &app.to_lowercase(), "{app} must be lowercase");
+            assert!(!app.contains(".exe"), "{app} carries an extension");
+            assert_eq!(app.trim(), app, "{app} has stray whitespace");
+            assert!(!app.is_empty(), "an empty token matches everything");
+        }
+        let mut sorted = apps.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), apps.len(), "the list repeats a token");
+    }
+
+    /// The regression that motivated splitting the arms: Linux used to fall
+    /// through to the macOS list, Safari included, and would have shipped
+    /// watching for a browser that does not exist there.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_does_not_inherit_the_macos_list() {
+        let apps = default_auto_detect_apps();
+        assert!(!apps.iter().any(|a| a == "safari"), "no Safari on Linux");
+        // Edge's Linux process is `msedge`, as on Windows — not macOS's bare
+        // `edge`, which came from a bundle id.
+        assert!(apps.iter().any(|a| a == "msedge"));
+        assert!(!apps.iter().any(|a| a == "edge"));
+        // Chromium needs its own token: the matcher is bidirectional, but
+        // neither brand name is a substring of the other.
+        assert!(apps.iter().any(|a| a == "chromium"));
+        assert!(!"chromium".contains("chrome"));
+        assert!(!"chrome".contains("chromium"));
+        // `teams` covers `teams-for-linux` by substring, so the client's own
+        // binary name must not be a separate entry — an entry with no
+        // checkbox in the settings grid could never be turned off.
+        assert!(apps.iter().any(|a| a == "teams"));
+        assert!(!apps.iter().any(|a| a == "teams-for-linux"));
+        assert!("teams-for-linux".contains("teams"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_keeps_its_bundle_id_vocabulary() {
+        let apps = default_auto_detect_apps();
+        assert!(apps.iter().any(|a| a == "safari"));
+        assert!(apps.iter().any(|a| a == "edge"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_keeps_its_exe_vocabulary() {
+        let apps = default_auto_detect_apps();
+        assert!(apps.iter().any(|a| a == "msedge"));
+        assert!(!apps.iter().any(|a| a == "safari"));
+    }
+
+    /// No default token may be covered by another. The matcher's test is
+    /// bidirectional substring, so a covered token detects nothing its
+    /// coverer would not — and it is worse than dead weight: the settings
+    /// grid has one checkbox per app, so an extra entry the grid cannot name
+    /// survives an uncheck and keeps the app detected while the box reads
+    /// off. That is exactly what Windows' `ms-teams` beside `teams` did.
+    #[test]
+    fn no_token_is_redundant() {
+        let apps = default_auto_detect_apps();
+        for (i, a) in apps.iter().enumerate() {
+            for (j, b) in apps.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    !(a.contains(b.as_str()) || b.contains(a.as_str())),
+                    "{a:?} and {b:?} cover each other — one of them cannot be \
+                     switched off from the settings grid"
+                );
+            }
+        }
+    }
 }
